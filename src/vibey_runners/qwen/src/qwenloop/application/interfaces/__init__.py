@@ -13,16 +13,23 @@ from qwenloop.application.interfaces.backend_selection_interface import (
     BackendSelectorInterface,
 )
 from qwenloop.application.interfaces.class_contracts import AutonomousRunnerInterface
+from qwenloop.application.interfaces.clock_interface import ClockInterface
 from qwenloop.application.interfaces.desktop_notifier_interface import DesktopNotifierInterface
-from qwenloop.domain.model import ChatChunk, ChatMessage, ModelProfile, ServerInfo
+from qwenloop.application.interfaces.ollama_probe_interface import OllamaProbeInterface
+from qwenloop.application.interfaces.turn_dispatch_interface import TurnDispatcherInterface
+from qwenloop.domain.interfaces import ChatChunkInterface, FollowUpInterface
+from qwenloop.domain.model import ChatMessage, ModelProfile, ServerInfo
 
 __all__ = [
     "AutonomousRunnerInterface",
     "BackendSelectorInterface",
+    "ClockInterface",
     "DesktopNotifierInterface",
     "InferenceServer",
+    "OllamaProbeInterface",
     "RunStore",
     "ToolExecutor",
+    "TurnDispatcherInterface",
 ]
 
 
@@ -33,7 +40,7 @@ class InferenceServer(Protocol):
     async def health(self, info: ServerInfo) -> bool: ...
     def chat_stream(
         self, info: ServerInfo, messages: Sequence[ChatMessage]
-    ) -> AsyncIterator[ChatChunk]: ...
+    ) -> AsyncIterator[ChatChunkInterface]: ...
     async def stop(self, info: ServerInfo) -> None: ...
 
 
@@ -42,6 +49,9 @@ class RunStore(Protocol):
     def append_event(self, run_id: str, event: dict[str, object]) -> None: ...
     def write_snapshot(self, run_id: str, snapshot: dict[str, object]) -> None: ...
     def read_control(self, run_id: str) -> list[dict[str, object]]: ...
+    def take_prompts(self, run_id: str) -> Sequence[FollowUpInterface]:
+        """Pending follow-ups, oldest first; each is taken once and never offered again."""
+        ...
 
 
 class ToolExecutor(Protocol):

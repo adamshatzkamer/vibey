@@ -16,14 +16,17 @@ from vibey.application.interfaces.azure import (
     AzureDiscoveryResult,
     AzureExecutionResult,
     AzureResourceStatus,
+    CloudClientPort,
     DeploymentConsentStore,
     DeploymentSpecStore,
 )
+from vibey.application.interfaces.blob import BlobPort
 from vibey.application.interfaces.budget_source_interface import (
     LedgerBudgetSourceInterface,
 )
 from vibey.application.interfaces.build import (
     BudgetSource,
+    BuildCheckpoint,
     BuildProvisioner,
     BuildWorktrees,
     GateResult,
@@ -36,6 +39,8 @@ from vibey.application.interfaces.build import (
     VerifyWorktrees,
     WorkPlanProducer,
 )
+from vibey.application.interfaces.bus import BusPort
+from vibey.application.interfaces.cache import CachePort
 from vibey.application.interfaces.class_contracts import (
     BuildDecomposeHandlerInterface,
     BuildImplementHandlerInterface,
@@ -60,6 +65,7 @@ from vibey.application.interfaces.class_contracts import (
     VerifyIndependencePolicyInterface,
     VibeySkillsContextCompilerInterface,
 )
+from vibey.application.interfaces.config_store import ConfigStorePort
 from vibey.application.interfaces.design import (
     DesignProvider,
     DesignQuestionProvider,
@@ -68,6 +74,14 @@ from vibey.application.interfaces.design import (
     ResearchProvider,
     SpecSynthesizer,
 )
+from vibey.application.interfaces.docs import DocsPort
+from vibey.application.interfaces.driver import (
+    DriverFailoverServiceInterface,
+    DriverLedgerPort,
+    DriverWorkspacePort,
+    ProcessPort,
+)
+from vibey.application.interfaces.email import EmailPort
 from vibey.application.interfaces.engines import (
     EngineAdapter,
     EngineHealthRepository,
@@ -76,7 +90,14 @@ from vibey.application.interfaces.engines import (
     EngineSelectorInterface,
     RotationCursorRepository,
 )
+from vibey.application.interfaces.failover import (
+    EngineFailoverServiceInterface,
+    FailoverEventStore,
+)
+from vibey.application.interfaces.files import FilesPort
+from vibey.application.interfaces.gate_answer import GateAnswerServiceInterface
 from vibey.application.interfaces.gates import (
+    GateLookup,
     HumanGateRepository,
 )
 from vibey.application.interfaces.ledger import (
@@ -84,6 +105,7 @@ from vibey.application.interfaces.ledger import (
     BuildLedger,
     DesignLedger,
     HandoffStore,
+    LedgerRangeReader,
     LedgerReader,
     LedgerSearch,
     LedgerShardStore,
@@ -101,6 +123,13 @@ from vibey.application.interfaces.ledger_publication_interface import (
     ShardHeaderInterface,
     ShardHoldingInterface,
 )
+from vibey.application.interfaces.local_install import (
+    DependencyInstaller,
+    LocalStackFactory,
+    LocalStackInstallerInterface,
+)
+from vibey.application.interfaces.loops import LoopCatalogInterface
+from vibey.application.interfaces.messaging import MessagingPort
 from vibey.application.interfaces.observability import (
     Logger,
     NotificationSink,
@@ -115,7 +144,14 @@ from vibey.application.interfaces.preflight_interface import (
     RunFeasibilityEvaluatorInterface,
     StartupPreflightReportInterface,
 )
+from vibey.application.interfaces.project_budget import (
+    OpenGateReader,
+    ProjectBudgetServiceInterface,
+    ProjectBudgetStore,
+)
 from vibey.application.interfaces.projects import (
+    ProjectLookup,
+    ProjectReader,
     ProjectStore,
     ProjectTransitioner,
 )
@@ -130,13 +166,36 @@ from vibey.application.interfaces.queue import (
     Park,
     Success,
 )
+from vibey.application.interfaces.queue_priority import (
+    CallerIdentity,
+    JobPriorityStore,
+    PriorityGrantReader,
+    QueuePriorityServiceInterface,
+)
+from vibey.application.interfaces.queue_reap import (
+    BusDeadLetterGateInterface,
+    BusDeadLetterHandlerInterface,
+    BusInspectorPort,
+    DeliveryExhaustedGateInterface,
+    QueueReaperInterface,
+    QueueReapStore,
+)
 from vibey.application.interfaces.review import (
     AutomatedFinding,
     AutomatedReviewRunner,
     ReviewArtifactWriter,
 )
+from vibey.application.interfaces.sabbath import SabbathGateInterface
+from vibey.application.interfaces.secrets import SecretsPort
+from vibey.application.interfaces.siem import SiemPort
+from vibey.application.interfaces.sms import SmsPort
 from vibey.application.interfaces.system import (
     Clock,
+)
+from vibey.application.interfaces.tracker import IssueTrackerPort
+from vibey.application.interfaces.ultra_control import (
+    UltraControlServiceInterface,
+    UltraControlStore,
 )
 from vibey.application.interfaces.visual import (
     VisualInventoryProducer,
@@ -154,7 +213,11 @@ __all__ = [
     "TelemetryTracer",
     "AutomatedFinding",
     "AutomatedReviewRunner",
+    "DependencyInstaller",
+    "LocalStackFactory",
+    "LocalStackInstallerInterface",
     "AzureClientPort",
+    "CloudClientPort",
     "DeploymentConsentStore",
     "DeploymentSpecStore",
     "AzureDiscoveryResult",
@@ -170,6 +233,7 @@ __all__ = [
     "SkillsContextResult",
     "BuildLedger",
     "BuildProvisioner",
+    "BuildCheckpoint",
     "BuildWorktrees",
     "Clock",
     "ConductorPreflightInterface",
@@ -193,17 +257,29 @@ __all__ = [
     "GateResult",
     "GateRunner",
     "HandoffStore",
+    "GateLookup",
     "HumanGateRepository",
     "IntegrationBranch",
     "IntegrationLock",
     "JobHandler",
     "JobHandlerFactory",
     "JobRecordInterface",
+    "CallerIdentity",
+    "JobPriorityStore",
+    "PriorityGrantReader",
     "JobReadyNotifier",
     "JobRepository",
+    "QueuePriorityServiceInterface",
+    "BusDeadLetterGateInterface",
+    "BusDeadLetterHandlerInterface",
+    "BusInspectorPort",
+    "DeliveryExhaustedGateInterface",
+    "QueueReaperInterface",
+    "QueueReapStore",
     "LedgerExporterInterface",
     "InvalidLedgerShardInterface",
     "LedgerBudgetSourceInterface",
+    "LedgerRangeReader",
     "LedgerReader",
     "LedgerSearch",
     "LedgerShardInterface",
@@ -211,10 +287,25 @@ __all__ = [
     "LedgerSiteBuilderInterface",
     "LedgerSitePlanInterface",
     "LedgerSiteWriter",
+    "LoopCatalogInterface",
     "MergeOutcome",
     "Outcome",
     "Park",
     "PhaseLedger",
+    "OpenGateReader",
+    "ProjectBudgetServiceInterface",
+    "GateAnswerServiceInterface",
+    "ProjectBudgetStore",
+    "DriverFailoverServiceInterface",
+    "DriverLedgerPort",
+    "DriverWorkspacePort",
+    "EngineFailoverServiceInterface",
+    "FailoverEventStore",
+    "ProcessPort",
+    "UltraControlServiceInterface",
+    "UltraControlStore",
+    "ProjectLookup",
+    "ProjectReader",
     "ProjectStore",
     "ProjectRecordInterface",
     "ProjectTransitioner",
@@ -226,6 +317,7 @@ __all__ = [
     "RotationCursorInterface",
     "RotationRecordingHandlerInterface",
     "RunOutcomeInterface",
+    "SabbathGateInterface",
     "SearchTokenizerInterface",
     "SelectingEngineProviderInterface",
     "SelectionInputsInterface",
@@ -247,4 +339,16 @@ __all__ = [
     "DeployReviewTriageHandlerInterface",
     "DeploySynthesizeHandlerInterface",
     "EnqueueRequestInterface",
+    "IssueTrackerPort",
+    "DocsPort",
+    "SecretsPort",
+    "FilesPort",
+    "EmailPort",
+    "SmsPort",
+    "MessagingPort",
+    "ConfigStorePort",
+    "CachePort",
+    "BusPort",
+    "BlobPort",
+    "SiemPort",
 ]

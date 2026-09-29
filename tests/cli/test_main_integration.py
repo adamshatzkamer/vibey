@@ -61,6 +61,35 @@ def test_new_project_creates_and_enqueues_design(tmp_path: Path) -> None:
     assert lines[1].startswith("design job ")
 
 
+def test_new_project_seeds_issue_intake_in_design_ledger(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "new",
+            "issue-1222",
+            "--repo",
+            str(tmp_path),
+            "--intake",
+            "GitHub issue #1222: custom system-1 model",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    project_id = UUID(result.output.splitlines()[0].removeprefix("project "))
+    events = asyncio.run(_design_events(project_id))
+    assert any(
+        event.kind.value == "TranscriptRecorded"
+        and event.payload["source"] == "github-issue"
+        and event.payload["text"] == "GitHub issue #1222: custom system-1 model"
+        for event in events
+    )
+
+
+async def _design_events(project_id: UUID):
+    async with build_app() as resources:
+        return await resources.design_ledger.all_for_project(project_id)
+
+
 def test_full_design_flow_through_the_real_cli(tmp_path: Path) -> None:
     created = runner.invoke(app, ["new", "widget", "--repo", str(tmp_path)])
     assert created.exit_code == 0, created.output
@@ -69,7 +98,7 @@ def test_full_design_flow_through_the_real_cli(tmp_path: Path) -> None:
     interview_job_id = UUID(job_line.removeprefix("design job "))
 
     for number in range(1, 8):
-        worked = runner.invoke(app, ["work", str(project_id)])
+        worked = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         assert worked.exit_code == 0, worked.output
         assert "processed one job" in worked.output
 
@@ -80,10 +109,10 @@ def test_full_design_flow_through_the_real_cli(tmp_path: Path) -> None:
 
     # Interview finalizes and enqueues research/synthesize/spec (5 more jobs).
     for _ in range(6):
-        worked = runner.invoke(app, ["work", str(project_id)])
+        worked = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         assert worked.exit_code == 0, worked.output
 
-    idle = runner.invoke(app, ["work", str(project_id)])
+    idle = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
     assert idle.exit_code == 0, idle.output
     assert "no ready job" in idle.output
 
@@ -129,14 +158,14 @@ def test_design_accept_visual_opts_into_visual_design(tmp_path: Path) -> None:
     interview_job_id = UUID(job_line.removeprefix("design job "))
 
     for number in range(1, 8):
-        worked = runner.invoke(app, ["work", str(project_id)])
+        worked = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         assert worked.exit_code == 0, worked.output
         gate_id = asyncio.run(_latest_gate_id(interview_job_id))
         answered = runner.invoke(app, ["answer", str(gate_id), f"q-{number}=answer-{number}"])
         assert answered.exit_code == 0, answered.output
 
     for _ in range(6):
-        worked = runner.invoke(app, ["work", str(project_id)])
+        worked = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         assert worked.exit_code == 0, worked.output
 
     accepted = runner.invoke(app, ["design", "accept", str(project_id), "--visual"])
@@ -152,14 +181,14 @@ def test_full_visual_design_flow_through_the_real_cli(tmp_path: Path) -> None:
     interview_job_id = UUID(job_line.removeprefix("design job "))
 
     for number in range(1, 8):
-        worked = runner.invoke(app, ["work", str(project_id)])
+        worked = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         assert worked.exit_code == 0, worked.output
         gate_id = asyncio.run(_latest_gate_id(interview_job_id))
         answered = runner.invoke(app, ["answer", str(gate_id), f"q-{number}=answer-{number}"])
         assert answered.exit_code == 0, answered.output
 
     for _ in range(6):
-        worked = runner.invoke(app, ["work", str(project_id)])
+        worked = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         assert worked.exit_code == 0, worked.output
 
     accepted = runner.invoke(app, ["design", "accept", str(project_id), "--visual"])
@@ -168,11 +197,11 @@ def test_full_visual_design_flow_through_the_real_cli(tmp_path: Path) -> None:
 
     # visual.inventory, then visual.plan
     for _ in range(2):
-        worked = runner.invoke(app, ["work", str(project_id)])
+        worked = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         assert worked.exit_code == 0, worked.output
         assert "processed one job" in worked.output
 
-    idle = runner.invoke(app, ["work", str(project_id)])
+    idle = runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
     assert idle.exit_code == 0, idle.output
     assert "no ready job" in idle.output
     assert (tmp_path / ".vibey/context/visual/screen-inventory.md").exists()
@@ -190,14 +219,14 @@ def test_visual_waive_also_reaches_build(tmp_path: Path) -> None:
     interview_job_id = UUID(job_line.removeprefix("design job "))
 
     for number in range(1, 8):
-        runner.invoke(app, ["work", str(project_id)])
+        runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
         gate_id = asyncio.run(_latest_gate_id(interview_job_id))
         runner.invoke(app, ["answer", str(gate_id), f"q-{number}=answer-{number}"])
     for _ in range(6):
-        runner.invoke(app, ["work", str(project_id)])
+        runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
     runner.invoke(app, ["design", "accept", str(project_id), "--visual"])
     for _ in range(2):
-        runner.invoke(app, ["work", str(project_id)])
+        runner.invoke(app, ["work", str(project_id), "--provider", "scripted"])
 
     settled = runner.invoke(app, ["visual", "waive", str(project_id)])
     assert settled.exit_code == 0, settled.output
@@ -375,6 +404,56 @@ def test_new_project_stores_runtime_observability_tables(tmp_path: Path) -> None
         "webhooks": [{"url": "https://example.test/hook", "secret": "secret"}],
     }
     assert config["telemetry"] == {"enabled": False}
+
+
+def test_new_project_stores_the_declared_gate_and_engine_environments(tmp_path: Path) -> None:
+    """`[gates]` and `[engine_environment]` are declared in vibey.toml and reach the
+    project record, so nobody hand-edits the record's JSON to give a gate its toolchain
+    or an engine its credential."""
+    (tmp_path / "vibey.toml").write_text(
+        '[gates]\ntimeout_seconds = 600\nenv_allow = ["JAVA_HOME", "GRADLE_*"]\n\n'
+        '[engine_environment]\nallow = ["JAVA_HOME"]\n\n'
+        "[engine_environment.engines]\n"
+        'codexloop = ["OPENROUTER_API_KEY"]\n'
+        'agyloop = ["GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG"]\n'
+    )
+
+    result = runner.invoke(app, ["new", "declared-env-proj", "--repo", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+
+    async def load():  # type: ignore[no-untyped-def]
+        async with build_app() as resources:
+            project = await resources.projects.get_latest()
+            assert project is not None
+            return project.config
+
+    config = asyncio.run(load())
+    assert config["gates"] == {"timeout_seconds": 600, "env_allow": ["JAVA_HOME", "GRADLE_*"]}
+    assert config["engine_environment"] == {
+        "allow": ["JAVA_HOME"],
+        "engines": {
+            "codexloop": ["OPENROUTER_API_KEY"],
+            "agyloop": ["GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG"],
+        },
+    }
+
+
+def test_new_project_refuses_a_forbidden_declaration_before_creating_anything(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "vibey.toml").write_text('[engine_environment]\nallow = ["VIBEY_PG_URL"]\n')
+
+    result = runner.invoke(app, ["new", "forbidden-env-proj", "--repo", str(tmp_path)])
+
+    assert result.exit_code != 0
+    assert "VIBEY_PG_URL can never be passed" in result.output
+
+    async def latest():  # type: ignore[no-untyped-def]
+        async with build_app() as resources:
+            return await resources.projects.get_latest()
+
+    assert asyncio.run(latest()) is None
 
 
 def test_new_project_rejects_unknown_skills_context_mode(tmp_path: Path) -> None:

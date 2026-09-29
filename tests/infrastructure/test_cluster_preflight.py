@@ -12,9 +12,11 @@ from pathlib import Path
 import asyncpg
 import pytest
 
+from tests.db_roles import TestDatabaseRoles
 from vibey.bootstrap import build_app, migrations_dir
 from vibey.domain.engine import EngineId
 from vibey.infrastructure.cluster_preflight import (
+    ENGINE_API_KEY_ENVS,
     ClusterCheck,
     ClusterPreflight,
     EngineAuthCheck,
@@ -105,7 +107,7 @@ def test_workspace_unwritable_reports_the_reason(tmp_path: Path) -> None:
 
 
 def test_the_default_chart_install_passes_although_every_engine_ships() -> None:
-    """The regression this check had after ADR-0037: the one wheel puts all four
+    """The regression this check had after ADR-0037: the one wheel puts all five
     paid engines on PATH, so a default install (`--provider scripted`, no
     `worker.engines`, no keys) -- the install CI deploys -- reported FAIL for
     engines the worker was never asked to use."""
@@ -134,6 +136,18 @@ def test_without_an_allow_list_the_verdict_names_what_can_and_cannot_authenticat
 
 def test_without_an_allow_list_every_key_present_names_no_gap() -> None:
     check = EngineAuthCheck(which=_every_binary).check(_EVERY_KEY)
+    assert check.ok
+    assert "API key present: agyloop, claudeloop, codexloop, cursorloop" in check.detail
+    assert "without one" not in check.detail
+
+
+def test_without_an_allow_list_a_deployment_supplied_key_map_is_honoured() -> None:
+    """The port stays generic: a deployment may name its own credential for an engine."""
+    api_key_envs = {**ENGINE_API_KEY_ENVS, EngineId.AGYLOOP: ("AGYLOOP_MOUNTED_KEY",)}
+    environ = {k: v for k, v in _EVERY_KEY.items() if not k.startswith(("GOOGLE", "GEMINI"))}
+    check = EngineAuthCheck(which=_every_binary, api_key_envs=api_key_envs).check(
+        {**environ, "AGYLOOP_MOUNTED_KEY": "mounted"}
+    )
     assert check.ok
     assert "API key present: agyloop, claudeloop, codexloop, cursorloop" in check.detail
     assert "without one" not in check.detail
@@ -409,10 +423,32 @@ async def test_full_preflight_against_a_live_database(tmp_path: Path) -> None:
     async with build_app(url=_test_dsn()):
         pass
     # Every engine on PATH and no key: the default chart install on the
-    # ADR-0037 image, which must pass the whole sweep.
-    preflight = ClusterPreflight(engine_auth=EngineAuthCheck(which=_every_binary))
+    # ADR-0037 image, which must pass the whole sweep. The sweep connects as the
+    # application role, as the chart's workloads do (ADR-0055); whether the server
+    # admits a password-less owner depends on the machine, so that probe is stubbed.
+    from vibey.infrastructure.cluster_preflight import DatabaseSecurityChecks
+    from vibey.infrastructure.db.local_auth import AuthVerdict, LocalAuthFinding
+
+    class _Refused:
+        def endpoints(self, app_url: str) -> tuple[tuple[str, int], ...]:
+            return ()
+
+        async def probe(self, app: object, app_url: str) -> LocalAuthFinding:
+            return LocalAuthFinding(AuthVerdict.PASS, "refused")
+
+    # A test earlier on this worker may have dropped `public` and rebuilt it as the owner,
+    # which takes the application role's grants with it (tests/db_roles.py, `restore`). This
+    # test runs the sweep as that role, so it puts them back first, as every test that runs as
+    # the application role after one of those must. Without it, the test passed or failed on
+    # which tests xdist happened to schedule before it on the same worker.
+    await TestDatabaseRoles.from_environ(os.environ).restore(_test_dsn(), migrations_dir())
+    app_dsn = os.environ.get("VIBEY_TEST_APP_DATABASE_URL", _test_dsn())
+    preflight = ClusterPreflight(
+        engine_auth=EngineAuthCheck(which=_every_binary),
+        database_security=DatabaseSecurityChecks(probe=_Refused()),
+    )
     checks = await preflight.run(
-        dsn=_test_dsn(),
+        dsn=app_dsn,
         workspace=tmp_path,
         migrations_dir=migrations_dir(),
         environ={},
@@ -426,6 +462,8 @@ async def test_full_preflight_against_a_live_database(tmp_path: Path) -> None:
         "engine-auth",
         "database",
         "migrations",
+        "ledger-guard",
+        "local-auth",
     }
 
 

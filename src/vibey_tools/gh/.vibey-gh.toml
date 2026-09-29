@@ -23,13 +23,23 @@ trusted_authors = ["adammatthewsteinberger", "claude[bot]", "github-actions[bot]
 [pr_automation]
 enabled = true
 scan_workflows = ["CI", "Provenance", "CodeQL", "Docs", "Conventional Commits", "API drift (Cloud Agents OpenAPI)"]
-ignored_checks = ["PR automation / gate", "gate", "Merge train / merge"]
+ignored_checks = ["PR evaluate / gate", "PR review / gate", "PR automation / gate", "gate", "Merge train / merge"]
 max_repair_attempts = 3
 model = "claude-sonnet-5"
 review_untrusted_authors = true
 repair_untrusted_authors = true
 replace_fork_prs = true
 retain_schedule_backstop = true
+# No paid review is declared (sub-doctrine 8.b: a paid counterparty is declared-only). The
+# operator's instruction, 2026-09-24: "Wire this up so that it uses the sovereign lanes
+# instead of ANTHROPIC_API_KEY", and "make this honest". So the sovereign lane answers the
+# whole review, and a pull request it cannot review is told it needs a human.
+paid_review = false
+# Repair and conflict resolution call the paid model too, so they are declared the same way,
+# and by the same instruction are not: undeclared, neither job is scheduled, and a failing
+# scan or a merge conflict is reported as needing a human.
+paid_repair = false
+paid_conflict_resolution = false
 
 [pr_automation.observability]
 sanitized_progress = true
@@ -53,7 +63,7 @@ allow_private_full_output = false
 # resolves, which is the correct direction to fail.
 enabled      = true
 runner_label = "vibey-local-gh"
-model        = "qwen2.5-coder:14b"
+model        = "gpt-oss:20b"
 trusted_only = true
 
 # 600 timed out in production on this repository's own PR #140: a ~700-line diff, the 14B
@@ -198,7 +208,8 @@ required_checks = [
   "CodeQL",
   "Documentation contract",
   "MCP, API, CLI, SDK, and webhook parity",
-  "PR automation / gate",
+  "PR evaluate / gate",
+  "PR review / gate",
 ]
 bypass_actors = ["RepositoryRole:5"]
 

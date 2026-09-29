@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "vibey-skills"
 dynamic = ["version"]
-description = "Agent Skills for vibe engineering — 710 evidence-grounded practitioner references as a Claude Code plugin marketplace"
+description = "Agent Skills for vibe engineering — 728 evidence-grounded practitioner references as a Claude Code plugin marketplace"
 readme = "README.md"
 requires-python = ">=3.12"
 
@@ -80,11 +80,10 @@ docs = [
   "mkdocs-literate-nav>=0.6",
 ]
 
-# Empty, and kept rather than deleted. Its one entry was `vibey-gh`, which is no longer a
-# distribution on any index (ADR-0037) -- it is a sibling in this tree, installed from
-# `src/vibey_tools/gh`, and a requirement on it by name would resolve nowhere. The key
-# stays so `pip install -e ".[dev]"` keeps working wherever it is already written.
-dev = []
+# The package stays dependency-free at runtime. Tests import pytest directly, however,
+# and the CI tenant matrix installs the package before running its unittest discovery;
+# keeping pytest here makes that declared test environment complete on every Python floor.
+dev = ["pytest>=8"]
 
 # `vibey-skills` is the CLI. `vibe-skills` (the short alias from the vibe-engineering-skills
 # era) is kept as a deprecated entry point that prints one warning line and delegates; the
@@ -99,7 +98,7 @@ vibe-skills = "vibey_skills.cli:deprecated_alias_main"
 # otherwise be implicit rather than recorded for this tenant.
 #
 # `include` is the other half, and it is not decoration. Without it ruff discovers Markdown
-# and format-checks the Python fences inside all 710 SKILL.md -- files that are the product,
+# and format-checks the Python fences inside all 728 SKILL.md -- files that are the product,
 # verified byte-for-byte against the documents they were split from.
 [tool.ruff]
 line-length = 100
@@ -120,7 +119,7 @@ packages = ["src/vibey_skills"]
 
 # The plugins tree must stay at the repo root — Claude Code requires
 # .claude-plugin/marketplace.json there with `source: ./plugins/<name>`. Rather than
-# duplicating 710 skill files into src/, the wheel maps the root tree in at build time,
+# duplicating 728 skill files into src/, the wheel maps the root tree in at build time,
 # so there is exactly one source of truth on disk.
 [tool.hatch.build.targets.wheel.force-include]
 "plugins" = "vibey_skills/plugins"

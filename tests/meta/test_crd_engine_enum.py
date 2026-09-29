@@ -1,10 +1,8 @@
 # Made with ❤️ by [Vibey](https://the-vibey-project.github.io/vibey/), Developed by [Adam Matthew Steinberger](https://vibewithadam.matthewsteinberger.com/) ([@adammatthewsteinberger](https://github.com/adammatthewsteinberger/)).
 """The `VibeyProject` CRD accepts exactly the engine ids vibey has.
 
-The chart's `spec.engines` enum was written when there were four engines and stayed
-there: `qwenloop` joined the tree and the CRD never learned it, so a cluster could not
-name the one engine sub-doctrine 8.a prefers. A hand-kept list beside an enum in code
-drifts; this is the check that it has not.
+The chart's `spec.engines` enum is a deployment-facing copy of the engine vocabulary.
+A hand-kept list beside an enum in code drifts; this is the check that it has not.
 """
 
 from __future__ import annotations
@@ -24,3 +22,12 @@ def test_the_crd_engine_enum_is_every_engine_id() -> None:
     assert match is not None, f"no spec.engines enum found in {CRD.name}"
     declared = [name.strip() for name in match.group(1).split(",") if name.strip()]
     assert sorted(declared) == sorted(engine.value for engine in EngineId)
+
+
+def test_the_crd_declares_the_child_environment_objects_the_handler_copies() -> None:
+    """`spec.gates` and `spec.engineEnvironment` are copied into the project record by
+    `infrastructure/operator/handlers.py`; a field the CRD does not declare is pruned by
+    the API server before the operator ever sees it."""
+    text = CRD.read_text(encoding="utf-8")
+    for field in ("gates:", "engineEnvironment:", "env_allow:", "isolate_python_env:"):
+        assert re.search(rf"^\s+{field}\n", text, re.MULTILINE), field

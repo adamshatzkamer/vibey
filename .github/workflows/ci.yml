@@ -14,6 +14,29 @@ on:
   # (ADR-0036).
   merge_group:
 
+# A superseded pull-request run is measurement nobody will ever read. Over the hundred CI
+# runs before this line was written, thirteen kept going after a newer commit replaced
+# them -- 181 minutes of wall clock, every one of it spent deciding something about a
+# commit that no longer existed. The cost is not only the machine: a dead run holds
+# concurrency slots, so the live run queues behind work that has already been abandoned,
+# and the person waiting pays for both (sub-doctrine 12.g, ADR-0050).
+#
+# What must never be cancelled is named here rather than left to a default, because 12.g's
+# bound is that speed is never bought with what a check measures:
+#
+#   - `push` (main, develop): every push to develop is a distinct pull request the merge
+#     train just landed, and it publishes its own dev build. Cancel one and a merged
+#     commit carries no green CI at all -- the check did not get faster, it stopped
+#     existing. Those 27 runs are not waste; they are the record.
+#   - `merge_group`: a cancelled queue run is a check that never reports, which ADR-0036
+#     records as the thing that ejects a pull request from the queue.
+#
+# Measured, not assumed: all thirteen superseded runs were `pull_request` events, so this
+# condition covers the whole of what was found and provably reaches nothing else.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   uv-lock:
     name: uv.lock is in sync with pyproject.toml
@@ -37,6 +60,10 @@ jobs:
           POSTGRES_USER: vibey
           POSTGRES_PASSWORD: vibey
           POSTGRES_DB: vibey_test
+          # scram-sha-256 for every connection, local and remote -- never trust,
+          # never md5 (sub-doctrine 10.j, ADR-0061).
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
         ports:
           - 5432:5432
         options: >-
@@ -44,10 +71,32 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # The chart's own broker, pinned by the same digest (values.yaml), so the queue
+      # reaper's broker tests run against what ships (ADR-0056, #1108 review):
+      # tests/infrastructure/bus/test_rabbitmq_live.py skips without it.
+      rabbitmq:
+        image: rabbitmq:4-management-alpine@sha256:b839b492a91788a1d9406ef3ec0e1d8a8448032c48148a54a9e0c68ed66cde9b
+        env:
+          RABBITMQ_DEFAULT_USER: vibey
+          RABBITMQ_DEFAULT_PASS: vibey
+        ports:
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
     env:
       VIBEY_TEST_DATABASE_URL: postgresql://vibey:vibey@localhost:5432/vibey_test
+      VIBEY_TEST_RABBITMQ_URL: http://localhost:15672
+      VIBEY_TEST_RABBITMQ_USER: vibey
+      VIBEY_TEST_RABBITMQ_PASSWORD: vibey
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The paper's history figures are recomputed from the full log at their pinned
+          # revision (tests/meta/test_paper_figures.py); a shallow clone cannot check them.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
@@ -59,6 +108,9 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --extra dev
+
+      - name: Gate 0 - governance corpus index
+        run: uv run vibey-gh corpus-index --check
 
       - name: Gate 1 - ruff check
         run: uv run ruff check .
@@ -91,7 +143,9 @@ jobs:
         run: uv run bandit -q -r src/vibey
 
       - name: Gate 7 - pip-audit
-        run: uv run pip-audit
+        # The workspace contains editable unpublished packages; audit the
+        # resolvable third-party environment without querying PyPI for them.
+        run: uv run pip-audit --skip-editable
 
   # The definition of done says "No-loss property suite green over 10,000 adversarial
   # examples" (docs/plans/implementation-plan.md); `gates` runs the same tests at
@@ -112,6 +166,10 @@ jobs:
           POSTGRES_USER: vibey
           POSTGRES_PASSWORD: vibey
           POSTGRES_DB: vibey_test
+          # scram-sha-256 for every connection, local and remote -- never trust,
+          # never md5 (sub-doctrine 10.j, ADR-0061).
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
         ports:
           - 5432:5432
         options: >-
@@ -156,6 +214,10 @@ jobs:
           POSTGRES_USER: vibey
           POSTGRES_PASSWORD: vibey
           POSTGRES_DB: vibey_test
+          # scram-sha-256 for every connection, local and remote -- never trust,
+          # never md5 (sub-doctrine 10.j, ADR-0061).
+          POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+          POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=scram-sha-256
         ports:
           - 5432:5432
         options: >-
@@ -244,7 +306,7 @@ jobs:
           - package: vibey-skills
             dir: src/vibey_tools/skills
             python: "3.12"
-            install: 'pip install -e .'
+            install: 'pip install -e ".[dev]"'
             test: 'python3 tools/validate_manifests.py && python3 tools/check_links.py && PYTHONPATH=src python3 -m unittest discover -s tests'
             # Its own `docs` job, verbatim: --strict is what makes 700-odd generated pages
             # trustworthy, and the counts prove every plugin and skill produced one.
@@ -261,12 +323,12 @@ jobs:
           - package: vibey-skills
             dir: src/vibey_tools/skills
             python: "3.13"
-            install: 'pip install -e .'
+            install: 'pip install -e ".[dev]"'
             test: 'python3 tools/validate_manifests.py && python3 tools/check_links.py && PYTHONPATH=src python3 -m unittest discover -s tests'
           - package: vibey-skills
             dir: src/vibey_tools/skills
             python: "3.14"
-            install: 'pip install -e .'
+            install: 'pip install -e ".[dev]"'
             test: 'python3 tools/validate_manifests.py && python3 tools/check_links.py && PYTHONPATH=src python3 -m unittest discover -s tests'
           # vibey-bootstrap's nested CI never ran a static gate at all. Its own pre-commit
           # hook did, and these are that hook's commands, verbatim: its configured
@@ -711,9 +773,212 @@ jobs:
           raise SystemExit("root automation drift: " + "; ".join(problems) if not ok else 0)
           PY
 
+  krypton-app:
+    # krypton-app (clients/krypton-app, sub-doctrine 9.e, ADR-0069): the apps' package. It is
+    # outside the uv workspace and publishes from krypton-app.yml; this job runs its suite and
+    # static checks on every change, as every client and package here is run by CI.
+    name: krypton-app
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/krypton-app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the checkers
+        run: python -m pip install --quiet pytest ruff mypy
+      - name: Lint and format
+        run: |
+          ruff check .
+          ruff format --check .
+      - name: Type-check
+        run: mypy src
+      - name: Unit tests
+        run: PYTHONPATH=src python -m pytest -q tests
+
+  vibey-core:
+    # @vibey/core (packages/vibey-core, ADR-0067): the pure TypeScript every krypton client
+    # shares. It is built with no platform types at all, and held to 100% of lines, branches,
+    # functions and statements, as the extension's core was before it moved there.
+    name: "@vibey/core"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/vibey-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install the npm workspace from its one lockfile
+        working-directory: .
+        run: npm ci
+      - name: No known high-severity advisory in any dependency
+        working-directory: .
+        run: npm audit --audit-level=high
+      - name: Build with no platform types, and type-check the tests
+        run: |
+          npm run build
+          npm run typecheck
+      - name: Unit tests, at 100% of lines, branches, functions and statements
+        run: npm run coverage
+
+  app:
+    # Krypton for iOS, Android and the web (clients/app, ADR-0068): one Expo app over the hub. It
+    # keeps its own lockfile, outside the npm workspace, so Expo's tree never enters the
+    # extension's or @vibey/core's install; it reads @vibey/core and the design tokens from
+    # source. Its core is held to 100%; the screens run under React Native Testing Library;
+    # the web build (react-native-web) is exported to prove it bundles. Native builds are EAS,
+    # declared only (eas.json).
+    name: Krypton app (mobile and web)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: clients/app/package-lock.json
+      - name: Install from the app's own lockfile
+        run: npm ci
+      - name: No known high-severity advisory in any dependency
+        run: npm audit --audit-level=high
+      - name: Type-check, strict
+        run: npm run typecheck
+      - name: Unit and screen tests, with the core at 100% of lines, branches, functions and statements
+        run: npm run coverage
+      - name: The web build bundles
+        run: npm run export:web
+
+  vscode-extension:
+    # The VS Code extension (clients/vscode, ADR-0059): its own Node toolchain and checks. It
+    # has no runtime dependency, and none of it enters the image: @vibey/core travels inside
+    # the .vsix, copied into out/node_modules at compile (ADR-0067). Both rows are required
+    # checks in .vibey-gh.toml since they ran green on develop (ADR-0059, #290).
+    name: VS Code extension (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: clients/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install the npm workspace from its one lockfile
+        working-directory: .
+        run: npm ci
+      - name: No known high-severity advisory in any dependency
+        working-directory: .
+        run: npm audit --audit-level=high
+      - name: Type-check the extension and its tests
+        run: npm run typecheck
+      - name: Compile, and package.json still agrees with the one command table
+        run: |
+          npm run compile
+          git diff --exit-code -- package.json
+      - name: Unit tests, with the core at 100% of lines, branches, functions and statements
+        run: npm run coverage
+      - name: Smoke test in a real VS Code (Linux, on a virtual display)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run smoke
+      - name: Smoke test in a real VS Code
+        if: runner.os != 'Linux'
+        run: npm run smoke
+      - name: Package the .vsix, and it carries @vibey/core
+        run: |
+          npx vsce package --no-dependencies --out vibey-${{ matrix.os }}.vsix
+          unzip -l vibey-${{ matrix.os }}.vsix | grep -q 'extension/out/node_modules/@vibey/core/dist/packages/vibey-core/src/index.js'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibey-vscode-${{ matrix.os }}
+          path: clients/vscode/vibey-${{ matrix.os }}.vsix
+          if-no-files-found: error
+
+  desktop:
+    # Krypton desktop (clients/desktop): C17 on GTK 4 + libadwaita, built with Meson. The
+    # pure-C core (libkryptondesktop) is tested with GLib's test framework under ASan and
+    # UBSan, and its coverage is gated with gcovr; the GTK views are compiled with
+    # -Werror on every distribution here. Not a required check yet: it becomes one once it
+    # has run green on develop (the same rule as vscode-extension).
+    name: Krypton desktop (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: ubuntu
+            container: ''
+          - distro: arch
+            container: archlinux:latest
+    defaults:
+      run:
+        working-directory: clients/desktop
+    steps:
+      - name: Toolchain and libraries (Ubuntu)
+        if: matrix.distro == 'ubuntu'
+        working-directory: .
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ninja-build gcovr pkg-config \
+            libglib2.0-dev libjson-glib-dev libsoup-3.0-dev libgtk-4-dev libadwaita-1-dev \
+            libavahi-client-dev libavahi-glib-dev desktop-file-utils appstream
+      - name: Toolchain and libraries (Arch)
+        if: matrix.distro == 'arch'
+        working-directory: /
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git meson ninja pkgconf glib2 json-glib \
+            libsoup3 gtk4 libadwaita avahi desktop-file-utils appstream
+      - uses: actions/checkout@v4
+      - name: Build everything under ASan and UBSan, warnings as errors
+        run: |
+          meson setup build -Db_sanitize=address,undefined -Dgui=enabled \
+            -Dhub_transport=enabled -Ddiscovery=enabled
+          meson compile -C build
+      - name: The core's GLib tests, under the sanitizers
+        env:
+          # LeakSanitizer needs ptrace, which a container job does not get.
+          ASAN_OPTIONS: detect_leaks=${{ matrix.distro == 'ubuntu' && '1' || '0' }}:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: meson test -C build --print-errorlogs
+      - name: The nightly channel builds beside stable, under its own app id
+        run: |
+          meson setup build-nightly -Dchannel=nightly -Dgui=enabled
+          meson compile -C build-nightly
+          grep -q 'io.github.the_vibey_project.Krypton.Nightly' build-nightly/src/app/*.desktop
+      - name: The desktop entry and AppStream metadata validate
+        run: |
+          desktop-file-validate build/src/app/io.github.the_vibey_project.Krypton.desktop
+          appstreamcli validate --no-net --explain build/src/app/io.github.the_vibey_project.Krypton.metainfo.xml
+      - name: Core coverage, gated (gcovr)
+        if: matrix.distro == 'ubuntu'
+        run: |
+          meson setup build-coverage -Db_coverage=true -Dbuildtype=debug -Dgui=disabled \
+            -Dhub_transport=enabled -Ddiscovery=enabled
+          meson test -C build-coverage --print-errorlogs
+          # The mDNS backends need a daemon a runner does not have: they are compiled and
+          # warning-free above, and left out of the measured core.
+          gcovr --root . --filter 'src/core/' --exclude 'src/core/kr-discovery-(avahi|dnssd)\.c' \
+            --fail-under-line 95 --fail-under-branch 80 --print-summary build-coverage
+
   image:
     name: Container image (amd64 + arm64)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -735,7 +1000,9 @@ jobs:
           load: true
           tags: vibey:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # The image remains valid when GitHub's cache service evicts a layer while
+          # exporting it; cache acceleration is optional, image correctness is not.
+          cache-to: type=gha,mode=max,ignore-error=true
 
       # Every claim the Dockerfile makes in prose is asserted here, one
       # `Image contract - ...` step each. Prose does not survive a refactor:
@@ -798,7 +1065,7 @@ jobs:
             *) echo "::error::codex --version printed '$out'; the Dockerfile pins $want"; exit 1 ;;
           esac
 
-      # One distribution, eleven console scripts (ADR-0037). That is the new product
+      # One distribution, twelve console scripts (ADR-0037, ADR-0064). That is the new product
       # contract, and it is the one the Dockerfile's COPY list can break silently: a
       # package root that never reaches the build context does not fail the build, it
       # just is not there. tests/meta/test_shipped_trees_are_reachable.py catches the
@@ -808,7 +1075,7 @@ jobs:
           docker run --rm --entrypoint sh vibey:ci -c '
             status=0
             for tool in vibey vibey-gh vibey-skills vibe-skills vibey-bootstrap \
-                        azbootstrap claudeloop codexloop cursorloop agyloop qwenloop; do
+                        azbootstrap claudeloop codexloop cursorloop agyloop gptossloop qwenloop; do
               if command -v "$tool" >/dev/null 2>&1; then
                 echo "ok      $tool"
               else
@@ -829,7 +1096,9 @@ jobs:
           push: false
           tags: vibey:ci-arm64
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # The image remains valid when GitHub's cache service evicts a layer while
+          # exporting it; cache acceleration is optional, image correctness is not.
+          cache-to: type=gha,mode=max,ignore-error=true
 
   # Render-only, so it needs neither a cluster nor the image: it lints the chart
   # and compares its render under every profile in deploy/helm/golden/render.sh
@@ -855,11 +1124,14 @@ jobs:
   cluster-smoke:
     name: Helm install on minikube
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - uses: medyagh/setup-minikube@latest
+        with:
+          cpus: 4
+          memory: 10240m
 
       - uses: azure/setup-helm@v5
 
@@ -878,7 +1150,41 @@ jobs:
       - name: helm install
         run: |
           helm install vibey deploy/helm/vibey \
-            -n vibey --create-namespace --wait --timeout 8m
+            -n vibey --create-namespace --wait --timeout 20m
+
+      # Every sovereign operational surface deployed by the chart must become
+      # Available. A degraded or crash-looping surface is a broken install.
+      - name: Contract - all sovereign surface deployments become Available
+        run: |
+          for dep in \
+            vibey-vibey-plane-api \
+            vibey-vibey-plane-worker \
+            vibey-vibey-plane-beat \
+            vibey-vibey-plane-web \
+            vibey-vibey-bookstack-mariadb \
+            vibey-vibey-bookstack \
+            vibey-vibey-openbao \
+            vibey-vibey-nextcloud \
+            vibey-vibey-postfix \
+            vibey-vibey-kannel \
+            vibey-vibey-synapse \
+            vibey-vibey-infisical \
+            vibey-vibey-redis \
+            vibey-vibey-rabbitmq \
+            vibey-vibey-garage \
+            vibey-vibey-wazuh-indexer \
+            vibey-vibey-wazuh-manager \
+            vibey-vibey-wazuh-dashboard \
+            vibey-vibey-gitea \
+            vibey-vibey-registry \
+            vibey-vibey-keycloak \
+            vibey-vibey-loki \
+            vibey-vibey-uptime-kuma \
+            vibey-vibey-prometheus \
+            vibey-vibey-grafana; do
+            echo "asserting deployment/$dep is available..."
+            kubectl wait --for=condition=available "deployment/$dep" -n vibey --timeout=5m
+          done
 
       # A fresh install into an empty namespace has no project. The worker
       # must park and poll, not exit -- exiting is a restart loop that ends
@@ -901,8 +1207,13 @@ jobs:
           test "$restarts" = "0"
 
       - name: Contract - the worker picks up a project created in-cluster
+        # The smoke fixture declares the Sabbath off for this one process
+        # (VIBEY_SABBATH_ENABLED=false): without it `vibey new` lawfully declines
+        # with exit 75 every Friday evening to Saturday evening, and the contract
+        # below would fail on a schedule rather than on a defect.
         run: |
           kubectl exec -n vibey deploy/vibey-vibey-worker -- \
+            env VIBEY_SABBATH_ENABLED=false \
             vibey new demo --repo /work/demo --max-cycles 1
           for _ in $(seq 1 24); do
             kubectl logs -n vibey deployment/vibey-vibey-worker > /tmp/log 2>&1 || true
@@ -911,6 +1222,65 @@ jobs:
           done
           cat /tmp/log
           grep -q "worker started: project=demo" /tmp/log
+
+      # ADR-0055: the ledger is append-only by the database. The `migrate` init
+      # container ran as the owner and reported the guard in force; the role every
+      # workload connects as is refused any rewrite by privilege; the owner itself is
+      # refused by the triggers; and the worker's own doctor agrees.
+      - name: Contract - the worker's role cannot rewrite the ledger
+        run: |
+          kubectl logs -n vibey deployment/vibey-vibey-worker -c migrate > /tmp/migrate.log 2>&1 || true
+          cat /tmp/migrate.log
+          grep -q "ledger guard in force: vibey_app" /tmp/migrate.log
+          # Local connections authenticate with scram-sha-256 too (sub-doctrine 10.j,
+          # ADR-0061), so psql inside the pod needs a password. The smoke install uses the
+          # chart's dev defaults, where each role's password is its own name.
+          as() {
+            kubectl exec -n vibey statefulset/vibey-vibey-postgres -- \
+              env PGPASSWORD="$1" psql -U "$1" -d vibey -v ON_ERROR_STOP=1 -c "$2" 2>&1 || true
+          }
+          test "$(as vibey 'SELECT count(*) > 0 FROM event' | grep -c ' t$')" = "1"
+          for sql in "UPDATE event SET digest = 'forged'" "DELETE FROM event" "TRUNCATE event"; do
+            as vibey_app "$sql" | tee /tmp/app.out
+            grep -q "permission denied" /tmp/app.out
+            as vibey "$sql" | tee /tmp/owner.out
+            grep -q "the ledger is append-only" /tmp/owner.out
+          done
+          as vibey_app "ALTER TABLE event DISABLE TRIGGER event_append_only" | tee /tmp/ddl.out
+          grep -q "must be owner" /tmp/ddl.out
+          kubectl exec -n vibey deploy/vibey-vibey-worker -- vibey doctor --cluster > /tmp/doctor 2>&1 || true
+          cat /tmp/doctor
+          grep -q "PASS ledger-guard" /tmp/doctor
+          grep -Eq "(PASS|FAIL|UNKNOWN) local-auth" /tmp/doctor
+
+      # ADR-0056. The broker loads the consumer_timeout the chart declares. The value alone
+      # proves nothing -- the chart's default is the image's own (#1108 review finding 3)
+      # -- so the node must list the chart's conf.d file among the files it loaded, and
+      # hold the value the chart rendered. Then the queue reaper, run in the worker pod with
+      # only the environment the chart gives it, reconciles both of its policies (quorum
+      # and classic) and reads them back, which is also the check that the pinned image
+      # accepts those policy definitions.
+      - name: Contract - the broker enforces the declared consumer timeout and the reaper's policy
+        run: |
+          set -euo pipefail
+          kubectl exec -n vibey deploy/vibey-vibey-rabbitmq -- \
+            rabbitmq-diagnostics status > /tmp/rabbit-status.txt
+          sed -n '/Config files/,/^$/p' /tmp/rabbit-status.txt
+          grep -q '/etc/rabbitmq/conf.d/20-vibey-reap.conf' /tmp/rabbit-status.txt
+          want=$(helm get values vibey -n vibey --all -o json \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["surfaces"]["rabbitmq"]["consumerTimeoutMs"])')
+          got=$(kubectl exec -n vibey deploy/vibey-vibey-rabbitmq -- \
+            rabbitmqctl eval 'application:get_env(rabbit, consumer_timeout).' | tr -d '[:space:]')
+          echo "consumer_timeout on the running node: $got (declared: $want)"
+          test "$got" = "{ok,$want}"
+          kubectl exec -n vibey deploy/vibey-vibey-worker -- vibey queue reap --json > /tmp/reap.json
+          cat /tmp/reap.json
+          python3 -c 'import json; r = json.load(open("/tmp/reap.json")); assert r["ok"] and r["policy"]["verified"], r'
+          kubectl exec -n vibey deploy/vibey-vibey-rabbitmq -- \
+            rabbitmqctl list_policies -p / --formatter json > /tmp/policies.json
+          cat /tmp/policies.json
+          grep -q '"vibey-reap"' /tmp/policies.json
+          grep -q '"vibey-reap-classic"' /tmp/policies.json
 
       # KEDA's operator runs in its own namespace and dials Postgres
       # itself, so it is the only thing here that exercises the DSN from

@@ -16,7 +16,7 @@ import shutil
 import stat
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from vibey_gh import dependabot
 from vibey_gh.automation_bootstrap import AutomationBootstrapGate
@@ -36,7 +36,7 @@ HOOKS_DIR = ".githooks"
 GITATTRIBUTES = ".gitattributes"
 UNION_MARKER = "# vibey-gh: append-only files merge instead of conflicting"
 # What a repository without its own copy of the tooling installs it from. `vibey_gh` is a
-# PACKAGE inside the `vibey` distribution, never a project of its own (ADR-0037), so the
+# PACKAGE inside the `vibey-engine` package, never a project of its own (ADR-0037), so the
 # fallback names the distribution and gets `vibey-gh` on PATH out of it. The version that
 # may be pinned to it is that distribution's -- never `vibey_gh.__version__`, which
 # numbers the package and names no release any index can serve.
@@ -46,7 +46,7 @@ UNION_MARKER = "# vibey-gh: append-only files merge instead of conflicting"
 # fallback and the pre-push hook's recovery advice render from that one key: they used to
 # be two literals in two files, and the hook went on naming a retired distribution for as
 # long as nobody happened to read it.
-FALLBACK_DISTRIBUTION = "vibey"
+FALLBACK_DISTRIBUTION = "vibey-engine"
 FALLBACK_PLACEHOLDER = "__VIBEY_GH_FALLBACK_PACKAGE__"
 FALLBACK_INSTALL = f"python -m pip install --quiet {FALLBACK_DISTRIBUTION}\n"
 
@@ -135,6 +135,37 @@ def _favicon_links(spec: str) -> str:
     )
     uri = "data:image/svg+xml," + _up.quote(svg)
     return f'<link rel="icon" href="{uri}"><link rel="apple-touch-icon" href="{uri}">'
+
+
+def _site_root_files_block(paths: tuple[str, ...]) -> str:
+    """Shell lines copying declared files by basename into the Pages root.
+
+    The placeholder stands alone on its own indented line in the template, so the
+    first emitted line inherits that indent and the join below supplies the same
+    ten spaces to every following line; body lines carry only their own two extra
+    spaces. Paths are shell-quoted at render time;
+    `load_config` has already refused anything outside the repository or carrying
+    whitespace or shell metacharacters. A declared file missing from the checkout
+    fails the deploy: verification that silently stops being served is worse than
+    a red build.
+    """
+    indent = " " * 10
+    if not paths:
+        return "# No documentation.site_root_files declared; nothing to copy."
+    lines = []
+    for path in paths:
+        name = PurePosixPath(path).name
+        quoted = shlex.quote(path)
+        lines.append(f"if [ -f {quoted} ]; then")
+        lines.append(f"  cp {quoted} pages/")
+        lines.append(f"  echo {shlex.quote(f'site root: published {name}')}")
+        lines.append("else")
+        lines.append(
+            f"  echo {shlex.quote('::error::documentation.site_root_files names ' + path + ' which is not in this checkout; refusing to publish without it.')}"
+        )
+        lines.append("  exit 1")
+        lines.append("fi")
+    return f"\n{indent}".join(lines)
 
 
 def _strip_trailing_space(text: str) -> str:
@@ -256,11 +287,37 @@ def render_workflow(source: Path, cfg: GhConfig, *, fallback_pin: FallbackPin | 
     wanted = wanted.replace(
         "__VIBEY_GH_FALLBACK_TRUSTED_ONLY__", "true" if fallback.trusted_only else "false"
     )
+    # The paid declarations (8.b), each a literal `true`/`false`: at the head of its paid
+    # job's `if:` -- review, repair, conflict resolution -- so an undeclared repository's
+    # workflow never schedules the paid call at all, and in the steps that report what
+    # that leaves to a person.
+    for marker, declared in (
+        ("__VIBEY_GH_PAID_REVIEW__", cfg.pr_automation.paid_review),
+        ("__VIBEY_GH_PAID_REPAIR__", cfg.pr_automation.paid_repair),
+        ("__VIBEY_GH_PAID_CONFLICT_RESOLUTION__", cfg.pr_automation.paid_conflict_resolution),
+    ):
+        wanted = wanted.replace(marker, "true" if declared else "false")
+    # One quoted scalar: the step word-splits it, and config has already refused any entry
+    # that is not a plain repository-relative path.
+    wanted = wanted.replace(
+        "__VIBEY_GH_FALLBACK_CONTEXT_PATHS__", json.dumps(" ".join(fallback.context_paths))
+    )
     wanted = wanted.replace("__VIBEY_GH_FALLBACK_RUNNER_LABEL__", fallback.runner_label)
     wanted = wanted.replace("__VIBEY_GH_FALLBACK_MODEL__", fallback.model)
     wanted = wanted.replace("__VIBEY_GH_FALLBACK_BASE_URL__", fallback.base_url)
     wanted = wanted.replace("__VIBEY_GH_FALLBACK_MAX_DIFF_CHARS__", str(fallback.max_diff_chars))
+    wanted = wanted.replace(
+        "__VIBEY_GH_FALLBACK_MAX_DOCUMENT_CHARS__", str(fallback.max_document_chars)
+    )
     wanted = wanted.replace("__VIBEY_GH_FALLBACK_TIMEOUT_SECONDS__", str(fallback.timeout_seconds))
+    # The model's declared window (#1090): what a local request is sized to fit, and refused
+    # over, rather than a number compiled into the sizer.
+    wanted = wanted.replace("__VIBEY_GH_FALLBACK_CONTEXT_WINDOW__", str(fallback.context_window))
+    wanted = wanted.replace(
+        "__VIBEY_GH_FALLBACK_REASONING_RESERVE__", str(fallback.reasoning_reserve_tokens)
+    )
+    wanted = wanted.replace("__VIBEY_GH_FALLBACK_CHARS_PER_TOKEN__", str(fallback.chars_per_token))
+    wanted = wanted.replace("__VIBEY_GH_FALLBACK_THINK__", fallback.think)
     wanted = wanted.replace(
         "__VIBEY_GH_SANITIZED_PROGRESS__",
         "true" if cfg.pr_automation.observability.sanitized_progress else "false",
@@ -376,6 +433,15 @@ def render_workflow(source: Path, cfg: GhConfig, *, fallback_pin: FallbackPin | 
     wanted = wanted.replace("__VIBEY_GH_DOC_TWITTER_CREATOR__", docs.twitter_creator)
     wanted = wanted.replace("__VIBEY_GH_DOC_KEYWORDS__", ",".join(docs.keywords))
     wanted = wanted.replace("__VIBEY_GH_DOC_AUTHOR__", docs.author)
+    # The paper's provenance: who to write to, where they are, where they publish. These
+    # three become arguments of a shell command in the rendered workflow, so each is
+    # quoted for the shell here; an affiliation such as O'Reilly must neither break the
+    # command nor be able to add to it. The markers therefore stand bare in the template.
+    wanted = wanted.replace("__VIBEY_GH_DOC_AUTHOR_EMAIL__", shlex.quote(docs.author_email))
+    wanted = wanted.replace(
+        "__VIBEY_GH_DOC_AUTHOR_AFFILIATION__", shlex.quote(docs.author_affiliation)
+    )
+    wanted = wanted.replace("__VIBEY_GH_DOC_AUTHOR_URL__", shlex.quote(docs.author_url))
     wanted = wanted.replace("__VIBEY_GH_DOC_FUNDING_BITCOIN__", docs.funding_bitcoin)
     wanted = wanted.replace("__VIBEY_GH_DOC_FUNDING_MONERO__", docs.funding_monero)
     wanted = wanted.replace("__VIBEY_GH_DOC_FUNDING_ETHEREUM__", docs.funding_ethereum)
@@ -383,6 +449,9 @@ def render_workflow(source: Path, cfg: GhConfig, *, fallback_pin: FallbackPin | 
     wanted = wanted.replace("__VIBEY_GH_DOC_THEME_COLOR__", docs.theme_color)
     wanted = wanted.replace("__VIBEY_GH_DOC_LOCALE__", docs.locale)
     wanted = wanted.replace("__VIBEY_GH_DOC_SITE_VERIFICATION__", docs.google_site_verification)
+    wanted = wanted.replace(
+        "__VIBEY_GH_DOC_SITE_ROOT_FILES__", _site_root_files_block(docs.site_root_files)
+    )
     wanted = wanted.replace(
         "__VIBEY_GH_DOC_SITE_VERIFICATION_TAG__",
         (
@@ -401,6 +470,7 @@ def render_workflow(source: Path, cfg: GhConfig, *, fallback_pin: FallbackPin | 
         ("__VIBEY_GH_DOC_LLMS__", cfg.documentation.generate_llms_txt),
         ("__VIBEY_GH_DOC_LLMS_FULL__", cfg.documentation.generate_llms_full_txt),
         ("__VIBEY_GH_DOC_JSON_LD__", cfg.documentation.generate_json_ld),
+        ("__VIBEY_GH_DOC_COOKIE_CONSENT__", cfg.documentation.cookie_consent),
         ("__VIBEY_GH_DOC_BOOK__", cfg.documentation.generate_book),
         ("__VIBEY_GH_DOC_PAPER__", cfg.documentation.generate_paper),
         ("__VIBEY_GH_DOC_MATH__", cfg.documentation.math),
@@ -412,6 +482,10 @@ def render_workflow(source: Path, cfg: GhConfig, *, fallback_pin: FallbackPin | 
     ):
         wanted = wanted.replace(marker, "true" if enabled else "false")
     wanted = wanted.replace("__VIBEY_GH_RELEASE_TAG_PREFIX__", cfg.github_release.tag_prefix)
+    # The announcement webhook's secret NAME, rendered inside `${{ secrets.… }}` and in the
+    # step's own "no secret" line. `AnnounceConfig` has refused anything that is not a bare
+    # secret identifier, so this can neither close the expression nor extend the command.
+    wanted = wanted.replace("__VIBEY_GH_ANNOUNCE_WEBHOOK_SECRET__", cfg.announce.webhook_secret)
     wanted = wanted.replace("__VIBEY_GH_SELF_SOURCE__", cfg.self_source)
     # The workflow templates spell the DEFAULT distribution literally rather than
     # carrying a placeholder, so the shipped YAML stays readable and greppable and the
@@ -433,7 +507,7 @@ def render_workflow(source: Path, cfg: GhConfig, *, fallback_pin: FallbackPin | 
     # every plugin-loading job makes at `automation/`, as an absolute path, which is the
     # form the action passes to Claude Code as a local marketplace.
     #
-    # Applied to EVERY template, not just pr-automation.yml. It was scoped to that one file
+    # Applied to EVERY template, not just pr-evaluate.yml. It was scoped to that one file
     # while the other four hard-coded `github.com/the-vibey-project/vibey-skills.git`, a
     # repository that no longer exists -- so their rendered jobs failed loading plugins
     # before they could answer. Scoping the substitution to one file is also how a
@@ -447,7 +521,7 @@ def render_workflow(source: Path, cfg: GhConfig, *, fallback_pin: FallbackPin | 
     wanted = wanted.replace("__VIBEY_GH_PLUGIN_MARKETPLACES__", indent.join(marketplaces))
     wanted = wanted.replace("__VIBEY_GH_PLUGINS__", indent.join(cfg.pr_automation.plugins))
     wanted = AutomationBootstrapGate().render(wanted, cfg)
-    if source.name != "pr-automation.yml":
+    if source.name != "pr-evaluate.yml":
         return _strip_trailing_space(wanted)
     workflows = json.dumps(list(cfg.pr_automation.scan_workflows))
     schedule = (

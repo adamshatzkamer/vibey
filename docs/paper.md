@@ -10,7 +10,8 @@ scheduling event rather than a loss of state. Work items are claimed from a Post
 queue with `FOR UPDATE SKIP LOCKED` under renewable leases; a handoff between engines
 is admitted only by a pure, model-free no-loss predicate; and delivery proceeds
 through a six-phase state machine whose four human gates each require an explicit
-recorded verdict. Beneath the orchestrator, five session runners share one bounded,
+recorded verdict. Beneath the orchestrator, five session-runner packages expose seven
+selectable engine identities and share one bounded,
 never-blocking core that never gives a credit balance a clock and lets a capacity
 verdict outrank a completion claim. Above it, an exact-head release calculus binds
 every automated verdict to the revision it evaluated and terminates within a bounded
@@ -21,7 +22,14 @@ model and deadline fixed, successful throughput stayed between 0.99 and 2.00
 generations per minute while offered concurrency rose sixteen-fold. The regularity
 yields a zero-shortfall time-to-completion as a testable prediction. We state what
 would falsify it and what it does not cover, and we argue from the same records that
-the scarce inputs were governance and correct judgment, not production.
+the scarce inputs were governance and correct judgment, not production. For the 3.0.0
+release we add the database's own enforcement of the ledger invariant, with what it
+does not cover; a priority lane, derived rather than remembered, that orders both
+queues without preempting or admitting past any gate; an engine environment built from
+an allow-list; and a local reviewer that refuses a verdict on a prompt it did not read
+in full. We also report an audit of a local storm in which one model slot took 96.7%
+of lane time and no lane reached the integration branch without a human step, and in
+which adversarial verifiers refuted 16 of the audit's 18 leading claims.
 
 *Artifacts.* This paper is typeset from `docs/paper.md` and published as
 [PDF](https://the-vibey-project.github.io/vibey/main/paper.pdf),
@@ -33,9 +41,21 @@ documentation is published as a book:
 [EPUB](https://the-vibey-project.github.io/vibey/main/book.epub) and
 [print HTML](https://the-vibey-project.github.io/vibey/main/book-print.html). Every
 empirical figure in the section on production rate is recomputed from tracked sources
-by `scripts/paper_evidence.py`. The conceptual visual atlas is authored as
-deterministic TikZ in this source, so the PDF, its labels and its operational diagrams
-are reviewable and reproducible rather than screenshots detached from the model.
+by `scripts/paper_figures.py`. The visual atlas holds forty-five figures: thirty
+drawn from the model as deterministic TikZ in this source, and fifteen computed from
+tracked repository records, so the PDF, its labels and its diagrams are reviewable and
+reproducible rather than screenshots detached from the system. Every section closes
+with a box headed *In plain words* that restates it for a reader who is not a
+specialist; the boxes add nothing the formal text does not say, and a specialist may
+skip them.
+
+```latex
+\begin{plainwords}[The paper in plain words]
+Computers can now write computer programs. But one robot programmer working alone is not enough to finish a real project. It forgets everything when it crashes. It runs out of its allowance in the middle of a job. And it does not know when a person needs to make a decision. Vibey fixes this with three ideas. First, a notebook that nobody can erase: every decision, every finding and every handoff is written in the notebook before it counts, so a new helper can pick up exactly where the old one stopped. Second, a queue with rules: jobs wait in line, a helper borrows a job for a short time and must keep renewing it, and a job that a crashed helper dropped goes back in the line by itself. Third, six checkpoints, and at four of them a person must say ``yes'' out loud before the work moves on. We also measured how fast one small computer can do this kind of work. It produced a steady one or two finished pieces per minute, and it did not get faster just because we asked for more at once. The slow part was never the typing. It was deciding well.
+\end{plainwords}
+```
+
+<!-- vibey:provenance -->
 
 ## Introduction
 
@@ -48,21 +68,135 @@ decisions must occur at defined points, not wherever a session happens to stall;
 (iii) exhaustion of one vendor's capacity must not lose work.
 
 The system that answers these constraints is one repository holding a family of
-packages: the orchestrator `vibey`; five session runners, `claudeloop`, `codexloop`,
-`cursorloop`, `agyloop` and the local `qwenloop`; `vibey-gh`, which owns provenance,
+packages: the orchestrator `vibey`; five session-runner packages for `claudeloop`,
+`codexloop`, `cursorloop`, `agyloop` and the dual-engine local runner that exposes
+`gptossloop` and `qwenloop`; `vibey-gh`, which owns provenance,
 merging and release; `vibey-skills`, a retrieval engine over a skill library; and
 `vibey-bootstrap`, a bootstrap layer for cloud workloads. Each package once carried its
-own paper. This paper consolidates them. Its contributions are:
+own paper. This paper consolidates them. [Fig. 1](#fig:family-tree) shows the family as
+one distribution, with the Python floor each tenant keeps. Its contributions are:
 
-- the ledger invariant, the no-loss handoff gate, the queue semantics and the gated six-phase machine, with their soundness arguments;
-- a session-runner core shared by five engines, whose capacity taxonomy never gives a credit balance a clock and whose completion rule a capacity verdict outranks;
-- the exact-head release calculus, with a termination bound and a recorded production counterexample;
+- the ledger invariant, the no-loss handoff gate, the queue semantics and the gated six-phase machine, with their soundness arguments, and the database's enforcement of the first, stated with what it does not cover;
+- a priority lane shared by both queues whose contents are derived rather than remembered, which orders work without preempting it or admitting it past any gate, and reapers that decide a hang by measurement;
+- a session-runner core shared by five runner packages and seven selectable engine
+  identities, whose capacity taxonomy never gives a credit balance a clock and whose
+  completion rule a capacity verdict outranks, and an environment every engine starts
+  from by allow-list;
+- the exact-head release calculus, with a termination bound and a recorded production counterexample, and its extension from the revision a verdict evaluated to the input the evaluating model actually read;
 - Convergence-Driven Development (CDD), an enclosing loop above Specification-Driven
   Development and Test-Driven Development that measures convergence at nested delivery
   scopes, models project atoms and chemical structures, and recognizes a suite of
   suites as alive in the digital realm when its organism-level signals converge;
 - deterministic, fail-closed retrieval and bootstrap components built on the same append-before-act discipline;
-- a measured production-rate regularity, its modulators, the time-to-completion prediction it enables, and the observations that would falsify it.
+- Biodigitology, a name for the study of digital life, with operational criteria
+  that distinguish software organisms from biological organisms or sentient minds;
+- a measured production-rate regularity, its modulators, the time-to-completion prediction it enables, and the observations that would falsify it;
+- an audit of a local storm that locates its binding constraint, its conversion losses and its unenforced controls, and a factual account of merges that ran ahead of review, both read as evidence that the scarce input is judgment.
+
+```latex
+\begin{figure*}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  run/.style={minimum width=2.45cm,minimum height=1.15cm},
+  tool/.style={minimum width=5cm,minimum height=1.15cm}]
+  % ---------------------------------------------------------------- the distribution
+  \node[vibeycore,minimum width=5.4cm,minimum height=.95cm] (dist) at (8.875,0)
+    {pip install vibey-engine\\\mdseries engine family; apps ship as krypton-app};
+  \node[vibeytag,anchor=west] at ($(dist.east)+(0.18,0)$) {ADR-0037};
+  % ---------------------------------------------------------------- orchestrator
+  \node[vibeybox,minimum width=2.8cm,minimum height=1.15cm] (vibey) at (1.65,-4.0)
+    {\textbf{vibey}\\six-phase conductor\\queue on PostgreSQL};
+  \node[vibeypill] at (vibey.south) {Python 3.12+};
+  % ---------------------------------------------------------------- session runners
+  \node[vibeysoft,run] (r1) at (5.125,-2.55)  {\textbf{claudeloop}\\paid tier};
+  \node[vibeysoft,run] (r2) at (7.775,-2.55)  {\textbf{codexloop}\\paid tier};
+  \node[vibeysoft,run] (r3) at (10.425,-2.55) {\textbf{cursorloop}\\paid tier};
+  \node[vibeysoft,run] (r4) at (5.125,-4.2)   {\textbf{agyloop}\\paid tier};
+  \node[vibeytealbox,minimum width=5.1cm,minimum height=1.15cm] (r5) at (9.1,-4.2)
+    {\textbf{local runner package}\\gptossloop default $\cdot$ qwenloop opt-in};
+  \node[vibeypill] at (r1.south) {Python 3.12+};
+  \node[vibeypill] at (r2.south) {Python 3.12+};
+  \node[vibeypill] at (r3.south) {Python 3.12+};
+  \node[vibeypill] at (r4.south) {Python 3.12+};
+  \node[vibeypill] at (r5.south) {Python 3.12+};
+  \node[vibeybox,minimum width=7.75cm,minimum height=.7cm] (bar) at (7.775,-5.75)
+    {\textbf{vibey-runners-common}\quad shared by all five runner packages};
+  \node[vibeypill] at (bar.south) {Python 3.12+};
+  % ---------------------------------------------------------------- tools
+  \node[vibeyvioletbox,tool] (t1) at (15.0,-2.55)
+    {\textbf{vibey-gh}\\provenance, merge train,\\promotion, release, governance canon};
+  \node[vibeyvioletbox,tool] (t2) at (15.0,-4.15)
+    {\textbf{vibey-skills}\\retrieval engine over\\728 skill documents in 136 plugins};
+  \node[vibeyvioletbox,tool] (t3) at (15.0,-5.75)
+    {\textbf{vibey-bootstrap}\\fail-closed bootstrap,\\outbox, audit chain};
+  \node[vibeypill] at (t1.south) {Python 3.12+};
+  \node[vibeypill] at (t2.south) {Python 3.12+};
+  \node[vibeypill] at (t3.south) {Python 3.12+};
+  % ---------------------------------------------------------------- lanes
+  \coordinate (p1t) at (1.65,-1.5);   \coordinate (p1b) at (1.65,-6.5);
+  \coordinate (p2t) at (7.775,-1.5);  \coordinate (p2b) at (7.775,-6.5);
+  \coordinate (p3t) at (15.0,-1.5);   \coordinate (p3b) at (15.0,-6.5);
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit=(vibey)(p1t)(p1b)] (L1) {};
+    \node[vibeylane,fit=(r1)(r3)(r4)(r5)(bar)(p2t)(p2b)] (L2) {};
+    \node[vibeylane,fit=(t1)(t3)(p3t)(p3b)] (L3) {};
+  \end{scope}
+  \node[vibeylanelabel] at (L1.north west) {Orchestrator};
+  \node[vibeylanelabel] at (L2.north west) {Session runners};
+  \node[vibeylanelabel] at (L3.north west) {Tools};
+  % ---------------------------------------------------------------- one package, three groups
+  \draw[vibeyflow,rounded corners=3pt] (dist.south) |- (1.65,-0.85) -- (L1.north);
+  \draw[vibeyflow] (dist.south) -- (dist.south |- L2.north);
+  \draw[vibeyflow,rounded corners=3pt] (dist.south) |- (15.0,-0.85) -- (L3.north);
+  % ---------------------------------------------------------------- notes
+  \node[vibeynote,anchor=west,align=left] at (0,-7.15)
+    {each tenant keeps its own pyproject, version, test suite and gates (ADR-0022), absorbed into one tree with history preserved (ADR-0021)};
+\end{tikzpicture}
+\caption{The two-package publication surface and the engine family. The dark box names the engine distribution; the apps publish separately as \texttt{krypton-app}. Beneath it sit the orchestrator, five runner packages on their shared library, and three tools. Every tenant requires Python 3.12 or newer. The teal package exposes \texttt{gptossloop}, the sovereign default on GPT-OSS 20B, and opt-in \texttt{qwenloop}; \texttt{claudeloop-local} supplies the seventh selectable identity.}
+\label{fig:family-tree}
+\end{figure*}
+```
+
+The orchestrator itself is an onion of four layers with dependencies pointing inward
+only ([Fig. 2](#fig:layer-map)): a pure `domain` with no I/O, no clock and no network;
+an `application` layer of services; an `infrastructure` layer that talks to PostgreSQL,
+the bus and telemetry; and the `cli` and `tui` shells. A single composition root,
+`bootstrap.py`, wires them. The rule is enforced by `import-linter` in CI, and four of
+the five layers fail the build under 100% branch coverage.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \draw[draw=vibeyline,fill=vibeymist,rounded corners=8pt,line width=.5pt] (0,0) rectangle (8.2,5.9);
+  \draw[draw=vibeyblue!35,fill=vibeywash,rounded corners=7pt,line width=.5pt] (0.5,0.5) rectangle (7.7,4.85);
+  \draw[draw=vibeyblue!55,fill=vibeyblue!9,rounded corners=6pt,line width=.5pt] (1.0,1.0) rectangle (7.2,3.8);
+  \node[vibeycore,minimum width=3.6cm,minimum height=1.1cm] (domain) at (4.1,2.55) {domain\\pure: no I/O, no clock, no network};
+  \node[vibeylanelabel] at (0.05,5.9) {cli and tui};
+  \node[vibeylanelabel] at (0.55,4.85) {infrastructure};
+  \node[vibeylanelabel] at (1.05,3.8) {application};
+  \node[vibeypill,anchor=north east] at (8.15,5.85) {3,159 + 590 lines $\cdot$ cli 100\% floor $\cdot$ tui exempt};
+  \node[vibeypill,anchor=north east] at (7.65,4.8) {16,842 lines $\cdot$ 100\% branch floor};
+  \node[vibeypill,anchor=north east] at (7.15,3.75) {10,562 lines $\cdot$ 100\% branch floor};
+  \node[vibeypill,anchor=north] at (4.1,1.85) {9,296 lines $\cdot$ 100\% branch floor};
+  \node[vibeynote,anchor=west,align=left] at (1.1,4.35) {PostgreSQL, the bus, telemetry};
+  \node[vibeynote,anchor=west,align=left] at (1.6,3.3) {services, handoff, wind-down};
+  \node[vibeynote,anchor=west,align=left] at (0.6,5.4) {the command line and the terminal UI};
+  \draw[vibeyflow] (0.3,2.55) -- (domain.west) node[midway,above,vibeynote,text=vibeyblue,align=center,yshift=1pt] {imports point\\inward only};
+  \node[vibeybox,minimum width=4.2cm] (boot) at (4.1,-0.75) {bootstrap.py\\the one composition root};
+  \draw[vibeyarrow] (boot.north) -- (4.1,0);
+  \node[vibeynote,anchor=west,align=left] at (6.35,-0.75) {enforced by\\import-linter in CI};
+\end{tikzpicture}
+\caption{The orchestrator is an onion. Code may only depend on the layers inside it, and the pure domain at the centre never touches a database, a clock or the network. One file, bootstrap.py, wires the layers together from outside, and four of the five layers must keep every branch of their code tested.}
+\label{fig:layer-map}
+\end{figure}
+```
+
+```latex
+\begin{plainwords}
+Think of a team of robot helpers, each from a different company. Any of them can quit halfway through a job. Vibey is the team captain. It keeps one shared notebook, hands out jobs one at a time, and stops at the right moments to ask a person. The rest of this paper explains each part, and then checks the whole design against real records from the project's own history.
+\end{plainwords}
+```
 
 ## The ledger invariant
 
@@ -74,16 +208,101 @@ pure $f$, independent of any vendor session.
 \end{invariant}
 ```
 
-The invariant is enforced, not conventional: the event relation carries database
-rules that turn every `UPDATE` and `DELETE` into a no-op, and the per-project sequence
-number is claimed inside the same transaction as the insert, so every ledger range
-has a well-defined digest. Corrections are new events that supersede prior ones. The
-function $f$ is a set of pure projections (open items, the decision log, the cost
-report) computed from the event sequence alone.
+The per-project sequence number is claimed inside the same transaction as the insert,
+so every ledger range has a well-defined digest. Corrections are new events that
+supersede prior ones. The function $f$ is a set of pure projections (open items, the
+decision log, the cost report) computed from the event sequence alone.
+
+**Enforcement, and what it does not cover.** Until 3.0.0 the invariant held against
+vibey's own queries and against little else. It rested on two `DO INSTEAD NOTHING`
+rules on the partitioned parent `event`, and ADR-0055 records what a scratch database
+with every migration applied (PostgreSQL 18) did on 2026-09-24 when addressed as the
+role vibey connected as: an `UPDATE` of `event` changed nothing, silently; an `UPDATE`
+and a `DELETE` addressed to the default partition changed and deleted rows, because a
+rule on a partitioned parent does not fire for a statement addressed to a partition;
+`TRUNCATE event` emptied the ledger, because rules never fire on `TRUNCATE`; and after
+`DISABLE RULE` an update went through. That role owned the table, and in the Helm
+chart it was also the image's superuser. The same DSN had reached every engine session
+(see *What an engine may see*), so a session steered by text a model read held the
+means to erase the ledger unrecorded.
+
+The fix (#1100, ADR-0055) has two parts, because neither alone is a boundary. First,
+triggers replace the rules (migration 0016): a `BEFORE UPDATE OR DELETE` row trigger
+and a `BEFORE TRUNCATE` statement trigger refuse every rewrite, the owner's included,
+with an error rather than a silent no-op. PostgreSQL clones the row trigger onto every
+partition, present and future, but not the statement trigger, so a function attaches
+the `TRUNCATE` guard to every partition on every migration run. Second, the roles
+split. The owner's DSN runs migrations and nothing else; the application role, which
+every worker, command, operator and scaler connects as, owns nothing and holds on
+`event` only `SELECT` and `INSERT`, with no `DELETE` or `TRUNCATE` anywhere. The grants
+are declared in code, derived from the application's own queries, and reconciled on
+every migration run, so a grant added by hand does not survive the next migration run. An
+install still on one role is reported rather than stranded: `vibey doctor` fails its
+`ledger-guard` check, the worker says so on every start, and `vibey migrate` exits 1.
+The whole test suite now runs as a restricted application role; its first run found
+35 failures, none a missing grant in application code: all were test setup doing
+owner-only work, or tests that had asserted the old silent no-op (#1100).
+
+The guard's reach is narrower than the word *append-only* suggests, and we state it.
+As the application role, the independent review of #1100 tried updates, deletes and
+truncations of the parent and of partitions, disabling, re-enabling as replica and
+dropping the triggers, detaching and attaching partitions, and switching the session
+to replica mode, and every one was refused (review probes of 2026-09-24; the merged
+tests pin the same refusals). The triggers refuse the owner's rewrites of rows, not
+the owner's schema changes: the owner can still disable a trigger, drop a partition,
+detach one and delete from it, or truncate a partition created since the last
+`vibey migrate`, so the owner's DSN is the thing to guard. Event triggers that would
+refuse such schema changes are future work, because installing them needs a
+superuser. A superuser can do anything. The application role cannot rewrite what is
+there, but it can still insert into `event` directly, so it can forge an event's
+provenance, sequence number or production time, and it can update the sequence
+counter `event_seq`; an append function running with the owner's rights, as the only
+write path, would close that, and it is the next step, not a done one (ADR-0055,
+*Not closed*). And the split protects the ledger only once the owner and every
+superuser need a password: a local PostgreSQL that trusts its socket, the common
+developer default, lets any process running as the right operating-system user
+connect as a superuser with no DSN at all. ADR-0055 records exactly that on the
+operator's machine, and #1100 shipped with a `local-auth` check in `vibey doctor`
+that fails when such a connection is let in, passes only when every attempt is
+refused and the authentication rules read clean, and otherwise reports unknown,
+never a pass; changing the server's authentication rules is left to the operator
+(`SECURITY.md` §7). Same user, same authority: no grant separates processes of one
+operating-system account.
+
+The same review found the design sound and five defects in its first implementation,
+two of them rated high, and #1100 had merged while it said *not yet* (#1112's
+description). #1112 closed all five and merged at 15:18Z on 2026-09-24 (ADR-0055, its
+amendment; `CHANGELOG.md`). The worst: where the application role may create objects in
+the `public` schema, the PostgreSQL 14 default and that of any database upgraded from
+it, it could plant an operator that the owner's unqualified catalog query resolved
+during `vibey migrate`, run code as the owner, and leave a backdoor that erased the
+ledger while `migrate` reported the guard in force; ADR-0055, as first merged, had
+judged that privilege harmless to the ledger. Now migration 0017 pins both guard
+functions to `search_path = pg_catalog, pg_temp`, the owner's session is pinned the
+same way and names every catalog operator by schema, `vibey migrate` takes `CREATE` on
+`public` away from every role but its owner before any migration runs, and
+`ledger-guard` fails when the application role may create objects, owns any, may call
+a `SECURITY DEFINER` function that runs as the owner or a superuser, or may set
+`session_replication_role`. The second: the owner's DSN reached any process whose
+shell exported it, because `build_app()` read it and the README exported it; now only
+`vibey migrate` reads it, given for that one command. The other three: the Helm chart
+gave the owner's credentials to Plane and Infisical, which now connect as roles of
+their own; an install with an existing Secret could be stranded on upgrade, and is now
+unchanged until it names an owner key; and concurrent reconciles failed, and now take
+the migration lock. Migration 0017 is new rather than an edit of 0016, because a
+migration that may already have been applied is never rewritten. #1112's description
+promised an independent re-review before the operator's merge; no verdict on the
+merged result is recorded in a tracked source, so we report the fix, not a review of it.
 
 Crash recovery and engine handoff follow as corollaries: a successor engine
 re-derives context from the ledger alone, so a credit exhaustion on $e_i$ between
 turns of an item reschedules the item onto $e_j$ with the open-question set intact.
+
+```latex
+\begin{plainwords}
+The ledger is a diary written in pen. You can add a page, but you can never tear one out or rub anything out. If you made a mistake, you write a new page that says so. Because the diary is the only source of truth, any helper can read it and know exactly what is going on, even a helper that has never seen the project before. For a long time the promise that pages could not be torn out was kept by good manners: anyone holding the main key could still tear them out. Now the database itself refuses, the helpers are given a key that can only read and add pages, and the one key that could switch the refusal off is kept away from them. A helper holding the add-only key can still add a page that lies about who wrote it, and closing that is the next job. It is still not magic: someone logged in as the owner of the computer can do almost anything, and the paper says so.
+\end{plainwords}
+```
 
 ## The no-loss handoff gate
 
@@ -118,44 +337,68 @@ into the receiving worktree and the seed prompt names it, so in this mode comple
 rests on the successor reading that file, not on the gate. Inlining the range into the
 seed, or keeping the closure rules enabled until it is inlined, is open work. Further
 failure parks the item on a *human* gate; a fourth, *forced* mode is reserved for an
-explicit operator override. A handoff that fails the gate is therefore a retry, an
-escalation, or a human decision, never a silent partial.
+explicit operator override. As illustrated in [Fig. 3](#fig:ledger-handoff), a handoff
+that fails the gate is therefore a retry, an escalation, or a human decision, never a silent partial.
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeybox,minimum width=2.2cm] (intent) at (-5.1,0.8)
-    {specification\\or finding};
-  \node[vibeycore,minimum width=2.2cm] (ledger) at (-2.25,0.8)
-    {append-only\\ledger};
-  \node[vibeysoft,minimum width=2.2cm] (queue) at (0.6,0.8)
-    {queue + lease\\SKIP LOCKED};
-  \node[vibeysoft,minimum width=2.2cm] (engine) at (3.45,0.8)
-    {engine\\turns};
-  \node[vibeybox,minimum width=2.2cm] (brief) at (-0.8,-1.15)
-    {handoff brief\\digest + open sets};
-  \node[vibeywarn,minimum width=2.2cm] (gate) at (2.05,-1.15)
-    {no-loss gate\\R1--R10};
-  \node[vibeycore,minimum width=2.2cm] (successor) at (4.85,-1.15)
-    {successor\\or human gate};
-  \draw[vibeyarrow] (intent) -- (ledger);
-  \draw[vibeyarrow] (ledger) -- (queue);
-  \draw[vibeyarrow] (queue) -- (engine);
-  \draw[vibeyarrow] (engine.south) -- (brief.north);
-  \draw[vibeyarrow] (brief) -- (gate);
-  \draw[vibeyarrow] (gate) -- (successor);
-  \draw[vibeydashed,-{Latex[length=2mm]}] (gate.north) -- ++(0,0.9) -| (ledger.south);
-  \node[font=\tiny,align=center,text=vibeygray] at (-3.65,-0.05)
-    {record before\\effect};
-  \node[font=\tiny,align=center,text=vibeyred] at (3.45,-2.0)
-    {failure = retry, escalation, or park\\never silent loss};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  every node/.append style={minimum width=3.3cm,minimum height=.95cm},
+  lbl/.style={vibeynote,font=\sffamily\scriptsize,minimum width=0pt,minimum height=0pt,inner sep=1.5pt},
+  ok/.style={lbl,font=\sffamily\scriptsize\bfseries,text=vibeygreen!85!black},
+  bad/.style={lbl,text=vibeyred}]
+  % ---- lane 1: append before act
+  \node[vibeybox]     (intent) at (2.0,5.8)  {Durable intent\\specification or finding};
+  \node[vibeycore]    (ledger) at (6.6,5.8)  {Append-only ledger\\$\mathrm{state}(t)=f(\mathrm{ledger}_{\le t})$};
+  \node[vibeysoft]    (queue)  at (11.2,5.8) {PostgreSQL queue\\FOR UPDATE SKIP LOCKED};
+  \node[vibeytealbox] (engine) at (15.8,5.8) {Engine session\\autonomous turns};
+  % ---- lane 2: no-loss handoff (flows right to left, under the engine)
+  \node[vibeybox]     (brief)  at (15.8,2.4) {Handoff brief $\beta$\\digest of $\rho$ + open sets};
+  \node[vibeysoft,line width=.8pt,double,double distance=1.1pt] (gate) at (11.2,2.4) {No-loss gate\\rules R1--R10};
+  \node[vibeytealbox] (succ)   at (6.6,2.4)  {Successor engine\\seeded fresh session};
+  % ---- outside both lanes: the human
+  \node[vibeygate]    (human)  at (2.0,2.4)  {Human gate\\parked job, a person decides};
+  % ---- lanes on the background layer
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit={(intent)(ledger)(queue)(engine)(2.0,7.3)}] (lane1) {};
+    \node[vibeylane,fit={(succ)(gate)(brief)(6.6,3.35)(6.6,0.75)}] (lane2) {};
+  \end{scope}
+  \node[vibeylanelabel,minimum width=0pt,minimum height=0pt] at (lane1.north west) {Append before act};
+  \node[vibeylanelabel,minimum width=0pt,minimum height=0pt] at (lane2.north west) {No-loss handoff};
+  % ---- lane 1 edges
+  \draw[vibeyflow] (intent) -- (ledger);
+  \draw[vibeyflow] (ledger) -- (queue);
+  \draw[vibeyflow] (queue)  -- (engine);
+  \draw[vibeyflow] (engine.north) .. controls ($(engine.north)+(0,0.8)$) and ($(ledger.north)+(0,0.8)$) .. (ledger.north)
+    node[pos=.5,above=1pt,lbl] {each turn appends its events first};
+  % ---- engine runs dry: down into the handoff lane
+  \draw[vibeyflow] (engine.south) -- (brief.north)
+    node[pos=.5,anchor=east,xshift=-3pt,lbl,align=right] {CreditsExhausted\\exit code 75};
+  % ---- the ledger feeds the gate and the successor
+  \draw[vibeydashed,-{Stealth[length=1.6mm,width=1.3mm,round]}]
+    ($(ledger.south)+(0.7,0)$) |- (10.4,4.15) -- ($(gate.north)+(-0.8,0)$);
+  \node[lbl,anchor=south] at (8.85,4.23) {open sets, digest\\recomputed from $\rho$};
+  \draw[vibeydashed,-{Stealth[length=1.6mm,width=1.3mm,round]}]
+    ($(ledger.south)+(-0.7,0)$) -- ($(succ.north)+(-0.7,0)$);
+  \node[lbl,anchor=east,align=right] at (5.75,4.3) {full ledger $\rho$\\in the worktree};
+  % ---- lane 2 edges
+  \draw[vibeyflow] (brief) -- (gate);
+  \draw[vibeyflow] (gate) -- (succ) node[pos=.5,above=1pt,ok] {\ding{51} pass};
+  \draw[vibeyback] ($(gate.south)+(0.9,0)$) .. controls ($(gate.south)+(0.9,-0.7)$) and ($(brief.south)+(-0.9,-0.7)$) .. ($(brief.south)+(-0.9,0)$);
+  \node[bad,anchor=north] at (13.5,1.32) {\ding{55} fail: regenerate with the violations,\\$\le 3$ strict attempts, then full-transcript};
+  \draw[vibeyback] ($(gate.south)+(-0.9,0)$) -- ++(0,-0.7) -| (human.south);
+  \node[bad,anchor=north] at (7.2,1.15) {still failing: park the item};
 \end{tikzpicture}
-\caption{The append-before-act path. Durable intent enters the ledger before the
-queue, engine, handoff or delivery effect; the no-loss gate checks completeness and
-the digest before a successor may act.}
+\caption{Append before act. Every intent and engine turn is written to the ledger before anything acts on it. When an engine exhausts its credits, a handoff brief is checked against that ledger by the no-loss gate; only a passing brief seeds the next engine. A failing brief is retried, escalated, or parked for a person, never silently dropped.}
 \label{fig:ledger-handoff}
 \end{figure*}
+```
+
+```latex
+\begin{plainwords}
+When one helper hands a job to another, it writes a short note: what the job is, what is done, what is left, and which questions are still open. Before the new helper may start, a strict checker compares the note with the diary. If the note forgot an open question, the checker says no and asks for a better note, up to three times. After that it tells the new helper to read the whole diary instead. If even that fails, a person is asked. Nothing is ever quietly lost.
+\end{plainwords}
 ```
 
 ## Queue semantics
@@ -171,14 +414,156 @@ which yields two properties without any global lock: *mutual exclusion per item*
 worker never waits on a peer's claim, so throughput scales as
 $\min(|Q|, |\mathrm{workers}|)$).
 
-Within a project, claims are ordered by priority descending, then by the earliest
-permitted run time, then by id, and they exclude items whose dependencies have not
-succeeded. Within one priority class an item can be bypassed only while it is held,
-and every hold is bounded by a lease: a claim sets the lease expiry to
-$\mathrm{now} + L$, a live worker renews it, and a reaper returns any expired lease to
-the ready state. A crashed worker therefore costs at most $L$ of delay and never a
-lost item. Across priority classes the discipline is strict priority, not arrival
-order. Because workers die and leases expire, every job is idempotent under replay.
+Within a project, claims exclude items whose dependencies have not succeeded, and are
+ordered first by the priority lane described below, then by the earliest permitted run
+time, then by id. (A `priority` column keeps its place in the order, but since 3.0.0
+no request can set it, so it is zero for every job and orders nothing; ADR-0054.) An
+item can be bypassed only while it is held, and every hold is bounded by a lease: a
+claim sets the lease expiry to $\mathrm{now} + L$, a live worker renews it, and a reaper
+returns an expired lease to the ready state while the item's attempts remain, and parks
+it for a person once they are spent (ADR-0056). A crashed worker therefore costs at most
+$L$ of delay and never a lost item, and an item that crashes every worker it reaches is
+bounded rather than retried forever. Because workers die and leases expire, every job is
+idempotent under replay.
+
+**The priority lane.** The operator asked that an item pushed into the queue run next
+rather than wait behind the work in front of it, and that both of the family's queues
+do so: vibey's PostgreSQL job queue and the storm's lane queue
+(`docs/plans/qwenstorm-3.0.0/tools/storm_queue.py`). ADR-0054 states one contract for
+both (#1089 and #1092 for the storm, #1091 and #1095 for the job queue, with follow-ups
+#1102, #1103, #1111 and #1122). *Next* means next after whatever is running: a bump
+never preempts a claimed or leased item and never touches its lease, as 8.c requires. It
+never admits either. Phases, human gates, admission, a capacity deferral, the budget
+brake and the handoff gate still decide whether an item may run; a bump decides only
+which runnable item runs first, and it never makes an item runnable before its
+dependencies finish. The lane's contents are not remembered but derived.
+
+```latex
+\begin{invariant}[Derived priority lane]
+Let $B$ be the unfinished items bumped, or enqueued prioritised, by name and not since
+un-bumped. The lane is exactly $B$ together with every unfinished transitive dependency
+of a member of $B$, ordered first-in-first-out by when each item first entered the lane.
+Un-bumping $x$ removes $x$ from $B$, and is refused, naming them, while another member
+of $B$ depends on $x$.
+\end{invariant}
+```
+
+A named item that ends cancelled or failed therefore leaves $B$ by the derivation
+itself, since only an unfinished named item is live. The one exception to the
+invariant is a job this vibey cannot write, because a newer vibey wrote its phase or its
+state: it is left in the lane unwritten, together with every job it still needs, and
+named in the request's record rather than cleared, and an un-bump is refused while such
+a job needs its target, as it is while a named item does (ADR-0054, item 6).
+
+The derived form replaced a first rule, *un-bump undoes what that bump moved*, after an
+independent review of #1091 found it could leave an orphan: with $x$, $d$, and $a$ and
+$b$ both needing $d$, bumping $a$ and $b$ and then un-bumping both left $d$ in the lane
+with nothing needing it. Under the invariant nothing this vibey can write remains that
+no named item needs: every admitted request re-derives the lane and sweeps what is no
+longer derived, including what a named job left behind when it was cancelled or failed
+(#1103), while a refused request changes nothing but its own record. In the job queue
+the lane is a column set from a sequence drawn at the bump, not a timestamp, because one
+bump moves several rows in one transaction and `now()` is a single instant for all of
+them (10.g), and not a large priority value, because first-in-first-out would then need
+a counter disguised as a weight.
+
+Only two callers may bump or un-bump: the operator, meaning the operating-system
+account that owns the queue's reviewed declaration, checked by the process's user id
+against that file's owner rather than by a name typed on a command line; and an
+automation that names itself with a source the reviewed declaration lists, running as
+that same account, since a declared name is not a credential. Nothing reads the forge
+to decide priority, so no label, issue or comment from anyone can move work forward
+(12.j). The grant separates operating-system accounts, not the processes of the
+operator's own account, and ADR-0054 says so: a process running as that account
+reaches the queue below the grant whenever it can reach the database. Since #1093 an
+engine's own environment no longer carries the means, but a process of that account can
+still reach a local server that trusts its socket (see *What an engine may see*). Every
+request is recorded whatever became of it, whether it moved something, moved nothing or
+was refused, and authorisation comes before any lookup, so a stranger asking about any
+item, real or not, is refused and recorded without learning anything about it. In vibey
+the record is a ledger event written in the same transaction as the row change. In the
+storm it is an append-only priority log whose replay is the lane order, and after its
+post-merge review (#1092, #1102) that log is loss-evident, not tamper-evident
+(`storm_queue.py`, lines 343--376): a witness outside the log records its length, and a
+log found shorter than its witness, or a witness that is empty or corrupt, makes the
+order *unknown* rather than silently falling back to no priority. A refused request can
+no longer append to such a log and re-witness the loss as normal, and a deliberate reset
+keeps the old file under an abandoned name rather than deleting it. The same account can
+still rewrite the log and its witness together, and the code says so.
+
+The rule was tested adversarially as well as by unit tests. A Hypothesis state machine
+runs random, overlapping bumps and un-bumps with jobs finishing, failing or being
+cancelled part-way, and moved into phases and states a newer vibey wrote, and asserts
+after every step that the stored lane equals the derivation, except the jobs this vibey
+cannot write and what they still need, and that un-bumping every named job clears the
+rest; breaking the derivation on purpose makes it fail (#1095, #1103). In the job queue,
+five workers claiming at once under `SKIP LOCKED` take exactly the first five in order
+(the merged repository tests). The reviewers' own probes, which are review records
+rather than tracked tests, found no double claim with five workers claiming while three
+reorderers made 450 random bumps and un-bumps against a real database (review of
+#1095), and no false *order unknown* in more than 9,000 concurrent reads of the storm's
+log (review of #1102).
+
+**Reapers by measured rule.** The lease reaper is the queue's oldest reaper; 3.0.0
+extends the idea on the rule that a hang is decided by measurement and that evidence
+is kept before anything is killed. The motivating incident: one pre-push test run of
+the storm sat at 0% CPU for 39 minutes, every worker asleep, while it held the storm's
+shared push lock, and every other push queued behind it; a human-approved kill released
+it, and nothing recorded which test had hung (#1105; `CHANGELOG.md`). The push-gate
+reaper now acts only on one of three measured conditions: the lock's holder and its
+process group are gone; the holder's own process group used less than a declared number
+of CPU-seconds over a declared window, measured from samples kept across passes and
+never from a single snapshot, with an unreadable process table reported as unknown
+rather than idle; or the push has held the lock past a declared ceiling. Holds and idle
+windows are counted in awake time, with the boot identifier, so a laptop's sleep is
+never taken for a hang (#1120). Before it signals anything it writes the owner record,
+the decision, the process tree, the log's tail and the stacks to an evidence directory,
+and it appends one line per reap to an append-only log. It is designed to signal only
+the push's own process group, but that is not yet what it guarantees: for a lock taken
+without an owner record, which #1107 traces to its push by process, the independent
+re-review of #1120 found that a reap can signal processes other than the push. Inside
+the suite, `pytest-timeout` with a `faulthandler` dump makes a hung test dump every
+thread's stack and then fail by name, so the next such hang names itself. Wall time
+alone is not the rule, because a slow test that is still computing is not a hung one.
+The reaper's own schedule and the trace of locks without an owner record (#1107) and
+the fixes from its first independent review (#1120) are merged. The re-review of #1120
+then found seven more defects, the ownerless-lock signal the worst, and at the cutoff
+their fixes were saved on a branch and not merged
+(`docs/architecture/evidence/release-gate-2026-09-24.md`).
+
+The same rule now covers everything a queue guards (#1108, with the post-merge review
+fixes of #1119; ADR-0056, whose status is *proposed*). ADR-0056 began with an inventory
+at its commit. The bus port was wired but idle, and it acknowledges a message as it is
+taken, so a consumer that dies after taking one loses it; no reaper can recover that,
+and the record states it rather than fixing it. Plane's task broker on the same RabbitMQ
+was live. The RabbitMQ job-queue dispatch and loop-service queues of ADR-0044 were
+declared and not wired. And the PostgreSQL job queue was live, with a reaper that
+re-readied an expired lease forever. Five conditions are each a measurement against a
+declared threshold, judged alike for both backends: a hung handler, meaning a delivery
+held past the broker's consumer timeout (30 minutes broker-wide, six hours by policy on
+vibey's own queues) or a lease past its expiry, which is requeued; work held with
+nobody holding it, which is surfaced; a poison item, handed out as often as its limit
+allows (by default seven attempts in PostgreSQL, and a delivery limit of 20 set by
+policy on the broker), which is parked behind a person's gate with one attempt
+refunded; ready work nobody has taken for 900 s, which is surfaced; and a dead letter on
+a queue vibey owns, which becomes a parked job and a gate whose answer replays or
+dismisses it, and is never deleted, while one on a queue vibey does not own is only
+surfaced. Every reap is a `QueueReaped` ledger event, and a lease reap writes it in the
+same transaction as the row it moves. The requirement behind this, that everything a
+queue holds has a reaper, is conduct, so ADR-0056 owes a sub-doctrine; the text it
+proposes had not been ratified at the cutoff. Nor had the second independent review of
+#1108 and #1119 been answered. At the cutoff its findings were open: one bad lease row
+halts every reap, and the broker policy is reported as verified when it is not in force,
+both rated high; the reaper also ignores `enabled = false`, a gate lookup breaks the
+BUILD budget loop, and a password can reach a log (the review record, not tracked;
+`docs/architecture/evidence/release-gate-2026-09-24.md`). No commit after #1119 changed
+the reaper's code on `develop` up to `6c38daf9`.
+
+```latex
+\begin{plainwords}
+Jobs wait in a line inside a database. A helper takes the job at the front and gets a timer with it, like a library book with a due date. A working helper keeps renewing the timer. If a helper crashes, the timer runs out and the job goes back into the line, so it is never lost, and a job that has crashed its helpers too many times goes to a person instead of round and round. Helpers never wait for each other, so adding helpers makes the line move faster. The owner can now also say ``do this one next''. That job goes to the front, together with anything it needs done first, but it never pulls a job out of a helper's hands and never skips a checkpoint, and only the owner, or a helper the owner has named in writing, may ask. Every such request is written down, even the refused ones. And when a job seems stuck, a caretaker measures whether it is really doing nothing before stepping in, and writes down what it saw first. Some of those caretakers still have known faults, and this paper lists them.
+\end{plainwords}
+```
 
 ## The six-phase machine
 
@@ -218,40 +603,68 @@ $V$ may be inserted between $D$ and $B$ on explicit opt-in; it is human-gated on
 same terms, exiting only when the visual plan is accepted or explicitly waived. The
 deployment triple $\langle D_d, D_e, D_r \rangle$ is entered only on an explicit
 opt-in recorded in the ledger; declining records a successful local completion.
+The complete state topology is depicted in [Fig. 4](#fig:six-phase-machine).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeybox,minimum width=1.65cm] (design) at (-5.2,0) {DESIGN\\human gate};
-  \node[vibeybox,minimum width=1.65cm] (visual) at (-3.1,0) {VISUAL\\DESIGN\\optional};
-  \node[vibeysoft,minimum width=1.65cm] (build) at (-0.9,0) {BUILD\\unattended};
-  \node[vibeybox,minimum width=1.65cm] (review) at (1.3,0) {REVIEW\\human gate};
-  \node[vibeybox,minimum width=1.65cm] (deployd) at (3.45,0) {DEPLOY\\DESIGN};
-  \node[vibeysoft,minimum width=1.65cm] (deployx) at (5.6,0) {DEPLOY\\EXECUTE};
-  \node[vibeycore,minimum width=1.65cm] (done) at (3.45,-1.45) {DEPLOY\\REVIEW / DONE};
-  \draw[vibeyarrow] (design) -- (visual);
-  \draw[vibeyarrow] (visual) -- (build);
-  \draw[vibeyarrow] (build) -- (review);
-  \draw[vibeyarrow] (review) -- (deployd);
-  \draw[vibeyarrow] (deployd) -- (deployx);
-  \draw[vibeyarrow] (deployx) -- (done);
-  \draw[vibeyarrow] (review.south) -- ++(0,-0.65) -| (done.west);
-  \node[font=\tiny,align=center,text=vibeygray] at (-4.15,-1.15)
-    {acceptance\\criteria};
-  \node[font=\tiny,align=center,text=vibeygray] at (0.2,-1.15)
-    {leases +\\ledger};
-  \node[font=\tiny,align=center,text=vibeygray] at (2.25,0.85)
-    {consent\\required};
-  \node[vibeywarn,minimum width=2.2cm] at (-0.9,-1.45)
-    {open findings\\loop back};
-  \draw[vibeydashed,-{Latex[length=2mm]}] (review.south) -- (build.south);
+\begin{tikzpicture}[x=1cm,y=1cm,
+  ph/.style={minimum width=2.3cm,minimum height=.95cm},
+  lab/.style={font=\sffamily\scriptsize,text=vibeygray,inner sep=1.5pt,align=center},
+  onlab/.style={lab,fill=white},
+  redlab/.style={font=\sffamily\scriptsize,text=vibeyred,fill=white,inner sep=1.5pt,align=center}]
+  % ------------------------------------------------ local delivery lane (top)
+  \node[vibeygate,ph] (D)  at (1.7,0)   {\textbf{Design} $D$\\human gate};
+  \node[vibeygate,ph,densely dashed] (V) at (5.35,0) {\textbf{Visual design} $V$\\optional human gate};
+  \node[vibeysoft,ph] (B)  at (9.0,0)   {\textbf{Build} $B$\\unattended};
+  \node[vibeygate,ph] (R)  at (12.65,0) {\textbf{Review} $R$\\human gate};
+  \node[vibeygood,ph] (DL) at (16.3,0)  {\textbf{Done}\\local completion};
+  % ------------------------------------------------ deployment lane (bottom)
+  \node[vibeygate,ph] (Dd) at (5.35,-3.1)  {\textbf{Deploy design} $D_d$\\human gate};
+  \node[vibeysoft,ph] (De) at (9.0,-3.1)   {\textbf{Deploy execute} $D_e$\\unattended};
+  \node[vibeygate,ph] (Dr) at (12.65,-3.1) {\textbf{Deploy review} $D_r$\\human gate};
+  \node[vibeygood,ph] (DD) at (16.3,-3.1)  {\textbf{Done}\\deployed};
+  % headroom for lane labels, footroom for the bypass
+  \coordinate (pad1)  at ($(D.north west)+(0,0.38)$);
+  \coordinate (pad1b) at ($(D.south west)+(0,-0.38)$);
+  \coordinate (pad2)  at ($(Dd.north west)+(-0.6,0.38)$);
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit=(D)(DL)(pad1)(pad1b)] (L1) {};
+    \node[vibeylane,fit=(Dd)(DD)(pad2)] (L2) {};
+  \end{scope}
+  \node[vibeylanelabel] at (L1.north west) {Local delivery};
+  \node[vibeylanelabel] at (L2.north west) {Deployment (opt-in)};
+  % ------------------------------------------------ forward flow
+  \draw[vibeyflow] (D) -- (V);
+  \draw[vibeyflow] (V) -- (B);
+  \draw[vibeyflow] (B) -- (R);
+  \draw[vibeyflow] (R) -- (DL) node[lab,midway,above=1pt] {declined};
+  \draw[vibeyflow,rounded corners=3pt] ([xshift=10pt]D.south) |- ($([xshift=-10pt]B.south)+(0,-0.38)$) -- ([xshift=-10pt]B.south);
+  \path ($(D.south)+(0.35,-0.38)$) -- ($([xshift=-10pt]B.south)+(0,-0.38)$) node[lab,fill=vibeymist,midway] {no visual opt-in};
+  \draw[vibeyflow] (Dd) -- (De);
+  \draw[vibeyflow] (De) -- (Dr);
+  \draw[vibeyflow] (Dr) -- (DD);
+  % opt-in into the deployment lane
+  \coordinate (optin) at ($(Dd.north)+(0.3,0.95)$);
+  \draw[vibeyflow,rounded corners=3pt] (R.south) |- (optin) -- ([xshift=8.5pt]Dd.north);
+  \path (R.south |- optin) -- (optin) node[onlab,midway] {opt-in recorded};
+  % ------------------------------------------------ loop-backs from review
+  \draw[vibeyback,rounded corners=3pt] ([xshift=-8pt]R.north) |- ($(B.north)+(0,0.95)$) -- (B.north);
+  \path ($(R.north)+(-0.28,0.95)$) -- ($(B.north)+(0,0.95)$) node[redlab,midway] {open finding};
+  \draw[vibeyback,rounded corners=3pt] ([xshift=8pt]R.north) |- ($(D.north)+(0,1.5)$) -- ([xshift=10pt]D.north);
+  \path ($(R.north)+(0.28,1.5)$) -- ($(D.north)+(0.35,1.5)$) node[redlab,midway] {finding needs clarification, or strict loop-back};
+  % ------------------------------------------------ notes
+  \node[vibeynote] at (15.2,-1.65) {a gate parks the item and frees the worker;\\the human's answer arrives as a ledger row};
 \end{tikzpicture}
-\caption{The six-phase delivery machine. DESIGN, REVIEW, DEPLOY-DESIGN and
-DEPLOY-REVIEW are human-gated; BUILD and DEPLOY-EXECUTE remain unattended, and
-open findings route back rather than disappearing into a transcript.}
+\caption{The six-phase delivery machine. Gold boxes are human gates, where the item is parked until a person answers; blue boxes run unattended. Review sends open findings back to Build, or to Design when a finding needs clarification, so nothing is lost in a transcript. Deployment is a separate, opt-in lane; declining it is still a successful local completion.}
 \label{fig:six-phase-machine}
 \end{figure*}
+```
+
+```latex
+\begin{plainwords}
+Every job moves through six steps: plan it, build it, check it, and then, only if the person wants, plan the launch, launch it, and check the launch. Four of the six steps are gates where a person must say yes. Saying nothing is not the same as saying yes. And when the person is busy, the job simply waits in the notebook while the helpers work on other jobs.
+\end{plainwords}
 ```
 
 ## Convergence-Driven Development
@@ -298,30 +711,66 @@ diverges through a broken language boundary, or the project diverges because
 the result cannot be shipped. Thus a CDD report records direction at all four
 scopes; missing parent context is `unknown`, never invented. “Lower energy” is
 the operational metaphor for a lower unresolved-work distance at every scope,
-not a physical claim or a substitute for evidence.
+not a physical claim or a substitute for evidence, as depicted in [Fig. 5](#fig:cdd-orbits).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
 \begin{tikzpicture}[x=1cm,y=1cm]
-  \draw[draw=vibeyblue!70,thick] (0,0) ellipse (6.15 and 2.65);
-  \draw[draw=vibeyteal!75,thick] (0,0) ellipse (5.05 and 2.15);
-  \draw[draw=vibeygreen!80,thick] (0,0) ellipse (3.85 and 1.62);
-  \draw[draw=vibeygold!85,thick] (0,0) ellipse (2.65 and 1.08);
-  \node[font=\scriptsize\bfseries,text=vibeyblue] at (-4.35,2.15) {project vision};
-  \node[font=\scriptsize\bfseries,text=vibeyteal] at (3.35,1.78) {phase / milestone};
-  \node[font=\scriptsize\bfseries,text=vibeygreen] at (-2.65,1.30) {feature set / epic};
-  \node[font=\scriptsize\bfseries,text=vibeygold] at (2.05,0.78) {feature / unit / story};
-  \filldraw[draw=vibeyink,fill=vibeyink] (0,0) circle (0.86);
-  \node[align=center,text=white,font=\scriptsize\bfseries] at (0,0)
-    {CORE\\software};
-  \draw[vibeyarrow] (3.4,-2.05) arc[start angle=-32,end angle=32,x radius=3.4,y radius=2.05];
-  \node[align=center,font=\scriptsize,text=vibeyink] at (4.8,-1.15)
-    {CDD pulls every\\scope toward\\lower unresolved work};
+  % ---- the four nested orbits (outer to inner) ------------------------
+  \draw[vibeyorbit, draw=vibeysilver] (0,0) ellipse [x radius=5.05, y radius=3.1];
+  \draw[vibeyorbit, draw=vibeysilver] (0,0) ellipse [x radius=3.9,  y radius=2.4];
+  \draw[vibeyorbit, draw=vibeysilver] (0,0) ellipse [x radius=2.75, y radius=1.7];
+  \draw[vibeyorbit, draw=vibeysilver] (0,0) ellipse [x radius=1.6,  y radius=1.0];
+
+  % ---- the distance (energy) measure ----------------------------------
+  \draw[vibeylink] (0,-0.66) -- (0,-3.1);
+  \node[vibeynote, anchor=north] at (0,-3.22) {$D$ = unresolved work (the orbit's energy)};
+
+  % ---- scope names on the rings ---------------------------------------
+  \node[vibeypill] at (0,1.0) {story};
+  \node[vibeypill] at (0,1.7) {epic};
+  \node[vibeypill] at (0,2.4) {phase};
+  \node[vibeypill] at (0,3.1) {project};
+
+  % ---- the nucleus ----------------------------------------------------
+  \node[vibeynucleus, minimum size=1.3cm, inner sep=1pt] (core) at (0,0) {confirmed\\core\\$D=0$};
+
+  % ---- story: converging (pulled inward) ------------------------------
+  \coordinate (ps) at ({1.6*cos(35)},{1.0*sin(35)});
+  \draw[vibeyarrow, draw=vibeygreen] (ps) -- ($(ps)!0.45cm!(0,0)$);
+  \fill[vibeygreen] (ps) circle (2.2pt);
+
+  % ---- epic: neutral (moves along its ring) ---------------------------
+  \coordinate (pe) at ({2.75*cos(200)},{1.7*sin(200)});
+  \draw[vibeyarrow, draw=vibeygray, line width=.6pt] (pe) arc[start angle=200, end angle=232, x radius=2.75, y radius=1.7];
+  \fill[vibeygray] (pe) circle (2.2pt);
+
+  % ---- phase: unknown (parent context missing) ------------------------
+  \node[vibeyghost, circle, minimum size=.42cm, minimum height=.42cm, inner sep=0pt,
+        font=\sffamily\tiny\bfseries] at ({3.9*cos(-35)},{2.4*sin(-35)}) {?};
+
+  % ---- project: diverging (pushed outward) ----------------------------
+  \coordinate (pp) at ({5.05*cos(155)},{3.1*sin(155)});
+  \draw[vibeyback] (pp) -- ($(pp)!-0.6cm!(0,0)$);
+  \fill[vibeyred] (pp) circle (2.2pt);
+
+  % ---- the CDD report: direction at every scope -----------------------
+  \node[vibeywarn,  anchor=west, text width=5.5cm, align=left] (r1) at (6.2, 1.95)
+    {\textbf{Project} -- diverging\\ \textcolor{vibeygray}{result cannot be shipped, so $D$ grows}};
+  \node[vibeyghost, anchor=west, text width=5.5cm, align=left] (r2) at (6.2, 0.65)
+    {\textbf{Phase} -- unknown\\ parent context missing; never invented};
+  \node[vibeybox,   anchor=west, text width=5.5cm, align=left] (r3) at (6.2,-0.65)
+    {\textbf{Epic} -- neutral\\ \textcolor{vibeygray}{evidence gathered, $D$ unchanged}};
+  \node[vibeygood,  anchor=west, text width=5.5cm, align=left] (r4) at (6.2,-1.95)
+    {\textbf{Story} -- converging\\ \textcolor{vibeygray}{unit test passes, $D$ falls}};
+  \coordinate (labspace) at ($(r1.north west)+(0,0.36)$);
+  \begin{scope}[on background layer]
+    \node[vibeylane, fit=(r1)(r4)(labspace)] (lane) {};
+  \end{scope}
+  \node[vibeylanelabel] at (lane.north west) {CDD report};
 \end{tikzpicture}
-\caption{Convergence-Driven Development as nested digital orbitals. The nucleus is
-the confirmed working core; the four orbitals are active scopes whose direction is
-measured independently and whose energy is the unresolved-work distance.}
+\caption{Convergence-Driven Development as nested orbits. The dark nucleus is the confirmed working core; each ring is one scope of the same product, from a single story out to the whole project. A scope's distance from the core is its unresolved work, $D$. Every ring is measured on its own, so a converging story cannot hide a diverging project.}
 \label{fig:cdd-orbits}
 \end{figure*}
 ```
@@ -329,37 +778,64 @@ measured independently and whose energy is the unresolved-work distance.}
 The orbit metaphor is a control surface, not decoration: each scope can move in a
 different direction, and an apparently healthy inner orbit cannot conceal a
 diverging outer one. The smallest useful report therefore names the current
-distance, evidence and next reconvergence move at every level.
+distance, evidence and next reconvergence move at every level. The closed-loop
+control trajectory is shown in [Fig. 6](#fig:cdd-loop).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeybox,minimum width=2.25cm] (ground) at (-4.8,0.65)
-    {ground in\\actual repository};
-  \node[vibeybox,minimum width=2.25cm] (map) at (-1.6,0.65)
-    {map criteria\\to code and tests};
-  \node[vibeybox,minimum width=2.25cm] (build) at (1.6,0.65)
-    {implement\\smallest slice};
-  \node[vibeybox,minimum width=2.25cm] (check) at (4.8,0.65)
-    {run gates,\\inspect diff};
-  \draw[vibeyarrow] (ground) -- (map);
-  \draw[vibeyarrow] (map) -- (build);
-  \draw[vibeyarrow] (build) -- (check);
-  \draw[vibeyarrow] (check.south) -- ++(0,-0.55) -| (ground.south);
-  \node[vibeycore,minimum width=2.25cm] (deliver) at (1.6,-1.35)
-    {commit, review,\\publish evidence};
-  \draw[vibeyarrow] (check.south) -- (deliver.north);
-  \node[vibeywarn,minimum width=2.8cm] (diverge) at (-2.0,-1.35)
-    {DIVERGENCE?\\bound it or scrap it};
-  \draw[vibeydashed,-{Latex[length=2mm]}] (check.south) -- (diverge.north);
-  \draw[vibeyarrow] (diverge.west) |- (map.south);
-  \node[font=\tiny\bfseries,text=vibeyred,align=center] at (4.55,-1.35)
-    {evidence\\beats activity};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  cddstep/.style={vibeybox,minimum width=2.3cm,minimum height=.9cm},
+  outcome/.style={minimum height=.9cm},
+  outlabel/.style={font=\sffamily\tiny,align=center,inner sep=1.5pt}]
+  % ---- one iteration: four unattended steps, then the classification gate
+  \node[cddstep] (ground)    at (1.15,0) {\textbf{Ground}\\tracked repo};
+  \node[cddstep] (formulate) at (4.00,0) {\textbf{Formulate}\\criteria $\to$ tests};
+  \node[cddstep] (synth)     at (6.85,0) {\textbf{Synthesize}\\smallest slice};
+  \node[cddstep] (test)      at (9.70,0) {\textbf{Test, inspect}\\tests and diff};
+  \node[vibeygate,minimum width=1.7cm,minimum height=.9cm] (gate) at (12.25,0)
+    {\textbf{Classify}\\trajectory};
+  \node[vibeycore,font=\sffamily\scriptsize,minimum width=2.8cm] (deliver) at (16.1,0)
+    {\textbf{Deliver to nucleus}\\commit, review,\\publish evidence};
+  \coordinate (lanehead) at (1.15,.78);
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit=(ground)(formulate)(synth)(test)(gate)(lanehead)] (lane) {};
+    \node[vibeylanelabel] at (lane.north west) {one iteration};
+  \end{scope}
+
+  % ---- forward flow
+  \draw[vibeyflow] (ground) -- (formulate);
+  \draw[vibeyflow] (formulate) -- (synth);
+  \draw[vibeyflow] (synth) -- (test);
+  \draw[vibeyflow] (test) -- (gate);
+  \draw[vibeyflow,draw=vibeygreen] (gate) -- (deliver)
+    node[midway,above=1pt,outlabel,text=vibeygreen!85!black] {converging\\$\Delta d<0$};
+
+  % ---- outcomes that loop back
+  \node[vibeysoft,outcome,minimum width=4.9cm] (keep) at (8.85,-1.8)
+    {\textbf{Keep the work}\\bound and reconvergence step recorded};
+  \node[vibeywarn,outcome,minimum width=4.9cm] (discard) at (8.85,-3.15)
+    {\textbf{Discard the work}\\return to the last sound state};
+
+  \coordinate (kexit) at ([xshift=-.45cm]gate.south);
+  \coordinate (dexit) at ([xshift=.45cm]gate.south);
+  \draw[vibeyflow] (kexit) |- (keep.east);
+  \node[outlabel,anchor=east,text=vibeyblue] at ([xshift=-2pt,yshift=-.66cm]kexit)
+    {neutral or bounded, $\Delta d\ge 0$};
+  \draw[vibeyback] (dexit) |- (discard.east);
+  \node[outlabel,anchor=west,text=vibeyred] at ([xshift=2pt,yshift=-1.55cm]dexit)
+    {unbounded, $\Delta d>0$};
+
+  \draw[vibeyflow] (keep.west) -| ([xshift=.4cm]ground.south);
+  \node[font=\sffamily\scriptsize,text=vibeygray,anchor=south] at (3.9,-1.7) {next iteration};
+  \draw[vibeyback] (discard.west) -| ([xshift=-.4cm]ground.south);
+  \node[font=\sffamily\scriptsize,text=vibeyred,anchor=south] at (3.9,-3.05) {re-ground};
+
+  % ---- legend for the classification quantity
+  \node[font=\sffamily\scriptsize,text=vibeygray,align=left,anchor=north east] at (deliver.east |- 0,-2.55)
+    {$\Delta d$: change in the unresolved-work\\distance over the iteration};
 \end{tikzpicture}
-\caption{The CDD control loop. Discovery is allowed to be temporarily neutral or
-slightly divergent only when its bound and reconvergence step are explicit; an
-unbounded divergence is discarded and the work returns to the last sound state.}
+\caption{Each pass reads the tracked repository, turns criteria into tests, builds the smallest slice, runs the tests and classifies its trajectory. Converging work is delivered to the nucleus. Neutral or slightly divergent work continues only with a written bound and reconvergence step. Unbounded divergence is discarded and work resumes from the last sound state; activity alone is never evidence.}
 \label{fig:cdd-loop}
 \end{figure*}
 ```
@@ -372,29 +848,48 @@ with active orbitals is not nucleus-only, even when its nucleus is healthy.
 Nucleus-only is a terminal lifecycle state with exactly two meanings: the
 project is complete and needs no further change, or it is dead and no longer
 maintained over the long term. A maintained project with outstanding scope or
-evidence remains an atom with active orbitals and must continue the loop.
+evidence remains an atom with active orbitals and must continue the loop, as
+modeled in [Fig. 7](#fig:digital-atom).
 
 ```latex
-\begin{figure}[t]
+\begin{figure}[!t]
 \centering
 \begin{tikzpicture}[x=1cm,y=1cm]
-  \draw[draw=vibeyblue!70,thick] (0,0) ellipse (2.25 and 1.55);
-  \draw[draw=vibeyteal!75,thick] (0,0) ellipse (1.65 and 1.12);
-  \draw[draw=vibeygreen!80,thick] (0,0) ellipse (1.05 and 0.72);
-  \filldraw[draw=vibeyink,fill=vibeyink] (0,0) circle (0.52);
-  \node[align=center,text=white,font=\tiny\bfseries] at (0,0) {core\\software};
-  \node[font=\tiny,text=vibeyblue,align=center] at (0,1.37) {vision\\orbital};
-  \node[font=\tiny,text=vibeyteal,align=center] at (1.58,0.85) {milestone\\orbital};
-  \node[font=\tiny,text=vibeygreen,align=center] at (-1.45,-0.78) {epic /\\story orbital};
-  \node[vibeybox,anchor=west,minimum width=2.0cm] at (2.35,0.72)
-    {digital labels:};
-  \node[align=left,font=\tiny,anchor=north west] at (2.48,0.36)
-    {confirmed core\\open criteria\\tests and gates\\delivery evidence};
-  \draw[vibeyarrow] (2.2,0.15) -- (0.50,0.12);
+  % ---------------------------------------------------------- living atom
+  \coordinate (c) at (0,0);
+  \draw[vibeyorbit, draw=vibeyblue!30] (c) circle (2.2);
+  \draw[vibeyorbit, draw=vibeyblue!42] (c) circle (1.75);
+  \draw[vibeyorbit, draw=vibeyblue!55] (c) circle (1.3);
+  \draw[vibeyorbit, draw=vibeyblue!70] (c) circle (0.85);
+  \node[vibeynucleus, minimum size=1cm, inner sep=1pt] (core) at (c) {confirmed\\core};
+  \node[vibeypill, fill=vibeyblue!12, text=vibeyink, font=\sffamily\scriptsize, inner ysep=1.2pt] (o4) at (105:2.2) {project};
+  \node[vibeypill, fill=vibeyblue!12, text=vibeyink, font=\sffamily\scriptsize, inner ysep=1.2pt] (o3) at (255:1.75) {phase};
+  \node[vibeypill, fill=vibeyblue!12, text=vibeyink, font=\sffamily\scriptsize, inner ysep=1.2pt] (o2) at (90:1.3) {epic};
+  \node[vibeypill, fill=vibeyblue!12, text=vibeyink, font=\sffamily\scriptsize, inner ysep=1.2pt] (o1) at (300:0.85) {item};
+  \node[vibeynote, text=vibeygreen!60!black, anchor=north] (dl) at (-1.55,-2.02) {delivery merges\\work into core};
+  \draw[vibeyarrow, draw=vibeygreen!75!black] (dl.north) -- (core);
+
+  % ---------------------------------------------------------- nucleus-only
+  \node[vibeynucleus, minimum size=1cm, inner sep=1pt] (core2) at (4.85,0.55) {confirmed\\core};
+  \draw[vibeydashed] (4.85,0.55) circle (0.75);
+  \draw[vibeydashed] (4.85,0.55) circle (1.0);
+  \node[vibeynote] (tnote) at (4.85,-0.85) {no orbitals left:\\terminal};
+  \node[vibeypill, fill=vibeygreen!14, text=vibeygreen!55!black] (tc) at (4.85,-1.45) {complete};
+  \node[vibeypill, fill=vibeyred!10, text=vibeyred] (td) at (4.85,-1.9) {dead};
+
+  % ---------------------------------------------------------- lanes
+  \begin{pgfonlayer}{background}
+    \node[vibeylane, fit={(o4) (o3) (o2) (o1) (dl) (-2.2,0) (2.2,0) (0,-2.2) (0,2.2)}] (lane1) {};
+    \node[vibeylane, fit={(core2) (tnote) (tc) (td) (3.85,0.55) (5.85,0.55) (4.85,1.55) (lane1.north -| 3.85,0) (lane1.south -| 5.85,0)}] (lane2) {};
+  \end{pgfonlayer}
+  \node[vibeylanelabel] at (lane1.north west) {Living atom};
+  \node[vibeylanelabel] at (lane2.north west) {Nucleus-only};
+
+  % ---------------------------------------------------------- transition
+  \draw[vibeyarrow] (lane1.east |- core2) -- (3.85,0.55)
+    node[pos=0.45, above, vibeynote] {all orbitals\\delivered or\\abandoned};
 \end{tikzpicture}
-\caption{A project atom in the digital realm. The nucleus is the high-quality,
-confirmed core; active orbitals are the maintained scopes still seeking evidence,
-integration and delivery.}
+\caption{A project drawn as a digital atom. The dark nucleus is code already confirmed to work. Each ring is an orbital of open work (item, epic, phase, project), held until delivery pulls it into the core; outer rings carry more unresolved work. When every orbital has landed or been abandoned, the atom is nucleus-only: the project is finished or dead.}
 \label{fig:digital-atom}
 \end{figure}
 ```
@@ -406,33 +901,66 @@ of their features. Interfaces, dependencies, data ownership, security
 boundaries, release timing and operational contracts can lower or raise the
 molecule's unresolved-work energy. CDD therefore tests molecule-level
 convergence as well as each atom; an interaction that creates divergence needs
-a bounded reconvergence path or the composition is abandoned.
+a bounded reconvergence path or the composition is abandoned. The chemical bond
+topology is illustrated in [Fig. 8](#fig:software-molecule).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
 \begin{tikzpicture}[x=1cm,y=1cm]
-  \draw[vibeydashed] (-5.7,-2.05) rectangle (5.7,2.05);
-  \node[font=\scriptsize\bfseries,text=vibeyink] at (-4.6,1.72) {software molecule};
-  \node[vibeysoft,circle,minimum size=1.25cm] (a) at (-3.55,0.35) {project\\A};
-  \node[vibeysoft,circle,minimum size=1.25cm] (b) at (0,0.95) {project\\B};
-  \node[vibeysoft,circle,minimum size=1.25cm] (c) at (3.55,0.35) {project\\C};
-  \draw[vibeyarrow] (a) -- (b) node[midway,above,sloped,font=\tiny] {API contract};
-  \draw[vibeyarrow] (b) -- (c) node[midway,above,sloped,font=\tiny] {release timing};
-  \draw[vibeyarrow] (a) -- (c) node[midway,below,sloped,font=\tiny] {security boundary};
-  \node[vibeycore,minimum width=3.7cm] (emerge) at (0,-1.15)
-    {emergent properties\\not present in one atom};
-  \draw[vibeyarrow] (a.south) -- (emerge.west);
-  \draw[vibeyarrow] (b.south) -- (emerge.north);
-  \draw[vibeyarrow] (c.south) -- (emerge.east);
-  \node[vibeywarn,minimum width=2.5cm] at (-3.5,-1.28)
-    {data ownership\\can diverge};
-  \node[vibeybox,minimum width=2.6cm] at (3.55,-1.28)
-    {composition check\\must reconverge};
+  % ---------------------------------------------------------------- lanes
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit={(0.25,0.4) (9.75,6.55)}] (lane1) {};
+    \node[vibeylane,fit={(11.95,0.4) (17.45,6.55)}] (lane2) {};
+  \end{scope}
+  \node[vibeylanelabel] at (lane1.north west) {Software molecule};
+  \node[vibeylanelabel] at (lane2.north west) {Emergent properties};
+
+  % ---------------------------------------------------------------- atoms
+  \coordinate (cA) at (2.2,3.9);
+  \coordinate (cB) at (5.25,5.65);
+  \coordinate (cC) at (8.3,3.9);
+
+  % bonds first, so the atom discs hide their ends (bond = interaction contract)
+  \draw[double,double distance=1.6pt,line width=.7pt,draw=vibeyblue] (cA) -- (cB)
+    node[midway,above=3pt,sloped,font=\sffamily\scriptsize,text=vibeyblue] {API contract};
+  \draw[double,double distance=1.6pt,line width=.7pt,draw=vibeyblue] (cB) -- (cC)
+    node[midway,above=3pt,sloped,font=\sffamily\scriptsize,text=vibeyblue] {queue leases};
+  \draw[double,double distance=1.6pt,line width=.7pt,draw=vibeyblue] (cA) -- (cC)
+    node[midway,above=2pt,font=\sffamily\scriptsize,text=vibeyblue] {release train};
+
+  \foreach \c in {A,B,C}
+    \node[vibeyghost,circle,minimum size=1.8cm,inner sep=0pt] (d\c) at (c\c) {};
+  \node[vibeynucleus,minimum size=1.05cm,inner sep=1pt] (nA) at (cA) {$\mathcal{A}_1$\\conductor};
+  \node[vibeynucleus,minimum size=1.05cm,inner sep=1pt] (nB) at (cB) {$\mathcal{A}_2$\\runners};
+  \node[vibeynucleus,minimum size=1.05cm,inner sep=1pt] (nC) at (cC) {$\mathcal{A}_3$\\ledger};
+  \node[vibeynote,anchor=north east] at (9.7,6.5)
+    {atom = nucleus (confirmed core)\\+ orbitals (open criteria)};
+
+  % ---------------------------------------------------------------- strain and its two exits
+  \node[vibeywarn] (strain) at (2.8,1.7) {strain on $\mathcal{B}_{13}$\\schema drift};
+  \node[vibeygood] (fix) at (6.6,2.35) {bounded reconvergence\\fixed wire, strain $\to 0$};
+  \node[vibeyghost] (drop) at (6.6,1.05) {composition abandoned\\no bounded path};
+  \draw[vibeyback] (strain.north) to[out=70,in=250] (4.0,3.8);
+  \draw[vibeyarrow] (strain.east) to[out=0,in=180] (fix.west);
+  \draw[vibeyback] (strain.east) to[out=0,in=180] (drop.west);
+
+  % ---------------------------------------------------------------- emergence
+  \draw[vibeyflow] (10.05,3.85) -- (11.9,3.85)
+    node[midway,above=1pt,font=\sffamily\scriptsize,text=vibeyink] {$\mathcal{M}\neq\sum_i\mathcal{A}_i$};
+  \draw[decorate,decoration={brace,amplitude=4pt},vibeyedge,draw=vibeygray]
+    (12.35,1.35) -- (12.35,6.05);
+
+  \node[vibeybox,minimum width=4.8cm] (p1) at (15.05,5.6)
+    {\textbf{Composability}\\lossless alignment across atom boundaries};
+  \node[vibeybox,minimum width=4.8cm] (p2) at (15.05,4.45)
+    {\textbf{Systemic security}\\mutual attestation, zero-trust fences};
+  \node[vibeybox,minimum width=4.8cm] (p3) at (15.05,3.3)
+    {\textbf{Release coherence}\\one train, one invariant boundary};
+  \node[vibeybox,minimum width=4.8cm] (p4) at (15.05,1.95)
+    {\textbf{Unresolved-work energy}\\$E(\mathcal{M})=\sum_i E(\mathcal{A}_i)+\sum_{i<j}E_{\mathrm{strain}}(\mathcal{B}_{ij})$};
 \end{tikzpicture}
-\caption{A software molecule is a connected composition of project atoms. Bonds
-represent interaction contracts; the molecule has properties such as composability,
-security and release coherence that are not the sum of the atoms.}
+\caption{A software molecule: three project atoms (dark nucleus, dashed orbital scope) joined by bonds, which are interaction contracts. Strain in a bond, such as schema drift, needs a bounded path back to convergence or the composition is abandoned. The whole gains properties no single atom has: composability, security, release coherence and its own unresolved-work energy.}
 \label{fig:software-molecule}
 \end{figure*}
 ```
@@ -475,36 +1003,47 @@ feature / unit / story → project atom
 → digital ecology such as the Web.
 ```
 
+The layers of this model are diagrammed in [Fig. 9](#fig:digital-hierarchy).
+
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeybox,minimum width=2.25cm] (story) at (-5.2,0)
-    {feature / unit / story\\one acceptance slice};
-  \node[vibeysoft,minimum width=2.25cm] (atom) at (-2.6,0)
-    {project atom\\nucleus + orbitals};
-  \node[vibeysoft,minimum width=2.25cm] (molecule) at (0,0)
-    {product molecule\\interacting atoms};
-  \node[vibeysoft,minimum width=2.25cm] (organism) at (2.6,0)
-    {software organism\\suite of suites};
-  \node[vibeycore,minimum width=2.25cm] (ecology) at (5.2,0)
-    {digital ecology\\Web-scale field};
-  \draw[vibeyarrow] (story) -- (atom);
-  \draw[vibeyarrow] (atom) -- (molecule);
-  \draw[vibeyarrow] (molecule) -- (organism);
-  \draw[vibeyarrow] (organism) -- (ecology);
-  \node[font=\tiny,align=center,text=vibeygray] at (-3.9,-0.92)
-    {code + test +\\delivery evidence};
-  \node[font=\tiny,align=center,text=vibeygray] at (-1.3,-0.92)
-    {contracts +\\shared state};
-  \node[font=\tiny,align=center,text=vibeygray] at (1.3,-0.92)
-    {feedback +\\repair + memory};
-  \node[font=\tiny,align=center,text=vibeygray] at (3.9,-0.92)
-    {protocols +\\participants};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  leveltext/.style={font=\sffamily\scriptsize,text=vibeyink,align=center,text width=2.35cm}]
+  % ---- the five levels as nested regions, outermost first --------------
+  \begin{scope}[on background layer]
+    \draw[vibeylane, fill=vibeyblue!3]  (0,0)       rectangle (17.8,4.7);   % digital ecology
+    \draw[vibeylane, fill=vibeyblue!6]  (0.25,0.35) rectangle (14.35,4.25); % software organism
+    \draw[vibeylane, fill=vibeyblue!9]  (0.5,0.7)   rectangle (10.9,3.8);   % product molecule
+    \draw[vibeylane, fill=vibeyblue!12] (0.75,1.05) rectangle (7.45,3.35);  % project atom
+  \end{scope}
+  \node[vibeylanelabel] at (0,4.7)     {Digital ecology};
+  \node[vibeylanelabel] at (0.25,4.25) {Software organism};
+  \node[vibeylanelabel] at (0.5,3.8)   {Product molecule};
+  \node[vibeylanelabel] at (0.75,3.35) {Project atom};
+
+  % ---- the innermost slice of work --------------------------------------
+  \node[vibeybox, minimum width=3cm, minimum height=1.5cm, text width=2.5cm] (story) at (2.5,2.15)
+    {\textbf{Feature, unit or story}\\ one diff with its tests\\ \textbf{does the slice pass?}};
+
+  % ---- what each enclosing level adds, and the question it asks --------
+  \node[leveltext] (atom)     at (5.85,2.15)  {confirmed core plus\\ living orbitals\\ \textbf{is the core sound?}};
+  \node[leveltext] (molecule) at (9.25,2.15)  {atoms bonded by\\ interaction contracts\\ \textbf{do the bonds hold?}};
+  \node[leveltext] (organism) at (12.7,2.15)  {suites that sense,\\ repair and exchange\\ \textbf{is it alive?}};
+  \node[leveltext, text width=2.7cm] (ecology) at (16.15,2.15) {independent projects\\ sharing protocols\\ \textbf{does the field adapt?}};
+
+  % ---- composition: each level is built from the one inside it ---------
+  \draw[vibeyarrow, shorten <=1pt] (story.east)    -- (atom.west);
+  \draw[vibeyarrow, shorten <=1pt] (atom.east)     -- (molecule.west);
+  \draw[vibeyarrow, shorten <=1pt] (molecule.east) -- (organism.west);
+  \draw[vibeyarrow, shorten <=1pt] (organism.east) -- (ecology.west);
+
+  % ---- divergence outside re-opens the work inside ---------------------
+  \draw[vibeyback, rounded corners=5pt] (organism.south) |- (2.5,-0.5) -- (story.south);
+  \node[vibeycallout, anchor=north] at (7.6,-0.62)
+    {outer divergence re-opens the work: a pass inside a ring proves nothing about the ring around it};
 \end{tikzpicture}
-\caption{The proposed digital hierarchy. Each level preserves the lower level but
-adds interaction contracts and a new convergence question; a local success cannot
-prove convergence of its containing structure.}
+\caption{Nested levels of the digital hierarchy. A feature or story sits inside a project atom, which sits inside a product molecule, then a software organism, then a digital ecology such as the Web. Each level keeps its contents, adds contracts between parts and asks its own convergence question; a pass at one level never proves the level around it.}
 \label{fig:digital-hierarchy}
 \end{figure*}
 ```
@@ -522,32 +1061,46 @@ changes through releases and standards, adapts to faults, maintains memory,
 reproduces capabilities through links and packages, and reorganizes through
 its participants. It is not sentient, and no one repository can prove its
 health; organism-level evidence must be assembled from the interaction
-contracts and operating signals of the structures within it.
+contracts and operating signals of the structures within it, as captured in [Fig. 10](#fig:web-ecology).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeycore,minimum width=2.7cm] (web) at (0,0)
-    {WORLD WIDE WEB\\digital ecology};
-  \node[vibeysoft,minimum width=1.65cm] (browser) at (-4.0,1.55) {browsers};
-  \node[vibeysoft,minimum width=1.65cm] (dns) at (-1.55,2.05) {DNS};
-  \node[vibeysoft,minimum width=1.65cm] (tls) at (1.55,2.05) {TLS +\\certificates};
-  \node[vibeysoft,minimum width=1.65cm] (server) at (4.0,1.55) {servers};
-  \node[vibeysoft,minimum width=1.65cm] (cdn) at (-4.0,-1.55) {CDNs};
-  \node[vibeysoft,minimum width=1.65cm] (search) at (-1.55,-2.05) {search};
-  \node[vibeysoft,minimum width=1.65cm] (app) at (1.55,-2.05) {applications};
-  \node[vibeysoft,minimum width=1.65cm] (people) at (4.0,-1.55) {people +\\operators};
-  \foreach \n in {browser,dns,tls,server,cdn,search,app,people}
-    {\draw[vibeyarrow] (\n) -- (web);}
-  \draw[vibeydashed,<->] (browser) -- (server) node[midway,above,font=\tiny] {HTTP};
-  \draw[vibeydashed,<->] (people) -- (app) node[midway,below,font=\tiny] {signals};
-  \node[font=\tiny,align=center,text=vibeygray] at (0,-0.58)
-    {shared protocols\\memory, metabolism, repair, adaptation};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  part/.style={vibeybox, minimum width=2.4cm},
+  human/.style={vibeygate, minimum width=2.4cm},
+  verb/.style={vibeypill, fill=vibeyblue!9, text=vibeyink}]
+  % The elliptical arcs below are Bezier segments whose control points lie outside the
+  % ink; fix the bounding box to the ink (loop radii 8.75 x 3.7 plus line width).
+  \useasboundingbox (-8.8,-3.75) rectangle (8.8,3.75);
+  % ---- the shared substrate every participant meets ----------------------
+  \node[vibeycore, minimum width=3.4cm, minimum height=1cm] (hub) at (0,0)
+    {Shared open protocols\\[-1pt]{\mdseries HTTP $\cdot$ HTML $\cdot$ DNS $\cdot$ TLS}};
+
+  % ---- independently maintained projects (blue) and people (gold) --------
+  \node[part]  (ua)   at (-3.4, 2.3)  {\textbf{User agents}\\ browsers, engines};
+  \node[part]  (name) at ( 0,   2.3)  {\textbf{Naming \& trust}\\ DNS, TLS, certificates};
+  \node[part]  (cdn)  at ( 3.4, 2.3)  {\textbf{Edge CDNs}\\ caching, delivery};
+  \node[part]  (srv)  at ( 6.6, 0)    {\textbf{Origin servers}\\ hosting, compute};
+  \node[part]  (app)  at ( 3.4,-2.3)  {\textbf{Apps \& services}\\ identity, payments};
+  \node[part]  (disc) at ( 0,  -2.3)  {\textbf{Discovery}\\ search, crawlers};
+  \node[human] (std)  at (-3.4,-2.3)  {\textbf{Standards bodies}\\ IETF, W3C, WHATWG};
+  \node[human] (ppl)  at (-6.6, 0)    {\textbf{Operators \& users}\\ people, policy, FOSS};
+
+  % ---- interaction contracts: every exchange goes through the substrate --
+  \foreach \n in {ua,name,cdn,srv,app,disc,std,ppl} { \draw[vibeylink] (hub) -- (\n); }
+
+  % ---- organism behaviour of the whole: an outer loop that no part owns --
+  \draw[vibeyflow] (138.7:8.75 and 3.7) arc[start angle=138.7, end angle=41.8,   x radius=8.75, y radius=3.7];
+  \draw[vibeyflow] (29.1:8.75 and 3.7)  arc[start angle=29.1,  end angle=-28.6,  x radius=8.75, y radius=3.7];
+  \draw[vibeyflow] (-41.3:8.75 and 3.7) arc[start angle=-41.3, end angle=-138.2, x radius=8.75, y radius=3.7];
+  \draw[vibeyflow] (209.1:8.75 and 3.7) arc[start angle=209.1, end angle=151.4,  x radius=8.75, y radius=3.7];
+  \node[verb] at (145:8.75 and 3.7) {{\scriptsize\bfseries senses}\\[-1pt] requests, telemetry, reports};
+  \node[verb] at (35:8.75 and 3.7)  {{\scriptsize\bfseries exchanges}\\[-1pt] data, payments, packages};
+  \node[verb] at (-35:8.75 and 3.7) {{\scriptsize\bfseries repairs}\\[-1pt] patches, revocation, failover};
+  \node[verb] at (215:8.75 and 3.7) {{\scriptsize\bfseries changes}\\[-1pt] releases, standards, links};
 \end{tikzpicture}
-\caption{The Web as a digital ecology. Its organism properties are distributed
-across projects, protocols, operators and users; the arrows are interaction contracts
-through which the ecology senses, exchanges resources, repairs and changes.}
+\caption{The Web as a living digital ecology. Independently run projects (blue) and human institutions (gold) meet only through shared open protocols, which nobody owns; the gray links are those interaction contracts. The outer loop is what the whole does that no single part does: it senses, exchanges, repairs and changes. Evidence of its health is gathered from these contracts.}
 \label{fig:web-ecology}
 \end{figure*}
 ```
@@ -584,53 +1137,129 @@ trajectory, composition and delivery evidence, retries failed items a bounded nu
 and refuses to advance past an unresolved item. The cutoff-bounded pilot below
 is an illustration of why those guardrails matter: partial verdicts, a failed
 forty-turn run, a live process and generated Go artifacts were all observable,
-but none was evidence of a finished Python feature.
+but none was evidence of a finished Python feature, as diagrammed in [Fig. 11](#fig:qwen-cdd).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeybox,minimum width=2.0cm] (context) at (-5.1,0.7)
-    {derive\\tracked context};
-  \node[vibeybox,minimum width=2.0cm] (edit) at (-2.55,0.7)
-    {edit actual\\Python repo};
-  \node[vibeybox,minimum width=2.0cm] (tests) at (0,0.7)
-    {run tests\\and gates};
-  \node[vibeybox,minimum width=2.0cm] (diff) at (2.55,0.7)
-    {inspect diff\\and artifacts};
-  \node[vibeycore,minimum width=2.0cm] (deliver) at (5.1,0.7)
-    {commit + PR\\delivery evidence};
-  \draw[vibeyarrow] (context) -- (edit);
-  \draw[vibeyarrow] (edit) -- (tests);
-  \draw[vibeyarrow] (tests) -- (diff);
-  \draw[vibeyarrow] (diff) -- (deliver);
-  \node[vibeywarn,minimum width=2.5cm] (backlog) at (0,-1.25)
-    {failed / unfinished\\return to backlog};
-  \draw[vibeydashed,-{Latex[length=2mm]}] (tests.south) -- (backlog.north);
-  \draw[vibeydashed,-{Latex[length=2mm]}] (diff.south) -- (backlog.north);
-  \draw[vibeyarrow] (backlog.west) |- (context.south);
-  \node[font=\tiny,align=center,text=vibeygray] at (2.55,-1.25)
-    {marker alone is not\\completion evidence};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  qstep/.style={vibeybox,text width=1.8cm,minimum height=1cm},
+  qwide/.style={text width=3cm,minimum height=1cm},
+  lbl/.style={font=\sffamily\scriptsize,align=center,inner sep=1.5pt}]
+  % ---- backlog: the item in progress and the one that waits behind it
+  \node[vibeysoft,text width=1.5cm,minimum height=1cm] (itemi) at (-7.59,1.6)
+    {\textbf{item $i$}\\in progress};
+  \node[vibeyghost,text width=1.5cm,minimum height=1cm] (itemnext) at (-7.59,-1.0)
+    {item $i{+}1$\\waits};
+
+  % ---- the five per-item steps (unattended), ending at the delivery gate
+  \node[qstep] (ground)    at (-4.62,1.6) {\textbf{Ground}\\tracked context};
+  \node[qstep] (implement) at (-1.88,1.6) {\textbf{Implement}\\in the real repo};
+  \node[qstep] (test)      at (0.86,1.6)  {\textbf{Test}\\tests and gates};
+  \node[qstep] (inspect)   at (3.60,1.6)  {\textbf{Inspect}\\diff and tree};
+  \node[vibeygate,qwide] (deliver) at (6.89,1.6) {\textbf{Deliver}\\commit; PR on approval};
+
+  % ---- what a pass yields: a completion record, or a refusal that routes back
+  \node[vibeycore,qwide,minimum height=1.3cm] (record) at (6.89,-1.0)
+    {\textbf{Completion record}\\criteria $\leftrightarrow$ code $\leftrightarrow$ checks\\trajectory, delivery};
+  \node[vibeywarn,text width=4cm,minimum height=1.3cm] (reject) at (2.23,-1.0)
+    {\textbf{Not evidence}\\partial verdict $\cdot$ live process\\generated files $\cdot$ failed gate};
+
+  % ---- lanes
+  \coordinate (bhead) at (-7.59,2.4);
+  \coordinate (bfoot) at (-7.59,-1.65);
+  \coordinate (lhead) at (-4.62,2.4);
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit=(itemi)(itemnext)(bhead)(bfoot)] (backlog) {};
+    \node[vibeylanelabel] at (backlog.north west) {Backlog};
+    \node[vibeylane,fit=(ground)(deliver)(reject)(record)(lhead)] (loop) {};
+    \node[vibeylanelabel] at (loop.north west) {Per-item convergence};
+  \end{scope}
+
+  % ---- forward flow
+  \draw[vibeyflow] (itemi) -- (ground);
+  \draw[vibeyflow] (ground) -- (implement);
+  \draw[vibeyflow] (implement) -- (test);
+  \draw[vibeyflow] (test) -- (inspect);
+  \draw[vibeyflow] (inspect) -- (deliver);
+  \draw[vibeyarrow] (deliver) -- (record)
+    node[midway,right=1pt,lbl,text=vibeygray] {evidence};
+
+  % ---- refusals: anything that is not evidence routes the item back
+  \draw[vibeyback] (test.south) -- (test.south |- reject.north);
+  \draw[vibeyback] (inspect.south) -- (inspect.south |- reject.north);
+  \draw[vibeyback] (record.west) -- (reject.east);
+  \draw[vibeyback] (reject.west) -| (ground.south);
+  \node[lbl,text=vibeyred,anchor=south] at (-2.3,-0.94) {re-queue item $i$};
+  \node[vibeypill,anchor=north] at (-2.3,-1.08) {retries bounded};
+
+  % ---- the backlog advances only on a complete record
+  \draw[vibeyarrow,draw=vibeygreen] (record.south) -- ++(0,-0.75) -| (itemnext.south);
+  \node[lbl,text=vibeygreen!85!black,anchor=north] at (-0.3,-2.45) {advance only on evidence};
 \end{tikzpicture}
-\caption{Per-item convergence in a Qwen storm. Each item independently traverses
-repository grounding, implementation, tests, diff inspection and delivery; a partial
-verdict or generated artifact routes back instead of advancing the backlog.}
+\caption{In a Qwen storm, each backlog item moves through five steps: read the tracked repository, change it, run the tests and gates, inspect the diff, and deliver. Whatever is not evidence, such as a partial verdict, a live process or generated files, sends the item back for a bounded retry; the next item waits until this one is proven done.}
 \label{fig:qwen-cdd}
 \end{figure*}
 ```
 
+```latex
+\begin{plainwords}
+Being busy is not the same as being done. Convergence-Driven Development keeps a simple score: how many promises are not yet kept, how many tests still fail, how many questions are still open, and how many stray changes were made. Every step must lower the score. If a step raises it without a plan to lower it again, the work goes back to the last good state. We picture a project as an atom: a solid centre of working code, with orbits of unfinished work still moving around it.
+\end{plainwords}
+```
+
+## Biodigitology
+
+This paper coins **Biodigitology** as the study of digital life. Its object is
+not software as a metaphor for carbon biology; it is the observable life-like
+organization of software systems in the digital realm: identity and boundaries,
+resource metabolism, sensing and memory, homeostasis, adaptation and repair,
+reproduction and exchange. Biodigitology asks what evidence shows that these
+functions exist, how they interact across project atoms and software organisms,
+and where the structure is converging, neutral or diverging. CDD is the delivery
+method that supplies those observations; Biodigitology is the field of study
+that interprets them.
+
+The project recognizes Adam Matthew Steinberger as the **World's First
+Biodigitologist**, the person credited in this corpus with coining the term and
+initiating its study here. This is a project-origin designation recorded for
+authorship and priority. It is not presented as an externally adjudicated
+historical claim, and “digital life” here does not imply carbon biology,
+subjective experience or a human-like mind.
+
+```latex
+\begin{plainwords}
+When many programs work together for a long time, they start to behave a little like a living thing: they take in energy, notice what happens around them, remember, heal, and make copies of their parts. Biodigitology is the name this paper gives to studying that. It does not mean software is alive like a plant or a person. It means we can measure those life-like signs and use them to tell whether a big system is getting healthier or sicker.
+\end{plainwords}
+```
+
 ## The engine family
 
-Five runners implement engines: `claudeloop` over Claude Code, `codexloop` over OpenAI
-Codex, `cursorloop` over Cursor's agent and its Cloud Agents API, `agyloop` over
-Gemini through the Antigravity SDK, and `qwenloop` over a local Qwen model. The pilot
-below uses `qwen3:14b`; the runner contract does not depend on that model choice.
-`claudeloop` came first; the others transplanted its core. The orchestrator
-depends on a narrow contract that all five honour: a bounded run, a done marker, an
+Five runner packages implement the engine family: `claudeloop` over Claude Code,
+`codexloop` over OpenAI Codex, `cursorloop` over Cursor's agent and its Cloud Agents
+API, `agyloop` over Gemini through the Antigravity SDK, and the local runner package
+over Ollama. The local package exposes `gptossloop`, the sovereign default on
+GPT-OSS 20B, and opt-in `qwenloop` on a Qwen model; `claudeloop-local` is a local
+backend profile of the Claude runner. The pilot below uses `qwen3:14b`; the runner
+contract does not depend on that model choice. `claudeloop` came first; the others
+transplanted its core. The orchestrator depends on a narrow contract that every
+runner honours: a bounded run, a done marker, an
 event vocabulary, a capacity mapping, and a shared wind-down exit code (75) meaning
 that the engine ran out of window capacity mid-item and stopped cleanly after writing
 its state. Capabilities beyond the contract (savepoints, unwind, mid-run prompts and
 others) differ by runner and are declared per engine.
+
+Across those packages the orchestrator declares seven selectable identities: the four
+paid engines (`claudeloop`, `codexloop`, `cursorloop`, `agyloop`), the sovereign
+default `gptossloop`, opt-in `qwenloop`, and opt-in `claudeloop-local`. LOCAL is
+preferred first by smooth-weighted round robin; PAID is a fallback only when no local
+identity is eligible. DESIGN and DECOMPOSE use the sovereign provider when no
+`--provider` is supplied. This is an implemented topology, not a roadmap claim.
+
+The distinction matters for reproducibility. A runner package is an executable
+adapter boundary; an engine identity is a configuration and policy choice inside that
+boundary. Counting packages as engines would hide the two local policies, while
+counting every binary as a package would overstate the distribution surface.
 
 ### Bounded runs that never block
 
@@ -656,6 +1285,94 @@ Every turn, verdict and spend entry of a run is one line of JSON in an append-on
 trail under the run directory, so the runner obeys the same write-ahead discipline
 as the orchestrator, at the scale of one session.
 
+### What an engine may see
+
+A bound on what a run may spend is not a bound on what it may reach. Until 3.0.0 every
+engine process started from a copy of the worker's whole environment with four
+Python variables removed; the DESIGN and DECOMPOSE executors of two engines passed no
+environment at all and so inherited everything; and gate commands, which run
+engine-written code, got the same copy without git's variables (#1093). What reached
+processes that run model-chosen shell commands unattended therefore included the queue
+and ledger DSN, every other `VIBEY_*` secret, libpq's `PG*` variables, GitHub tokens
+and any cloud credential the worker held. With the DSN a session could rewrite queue
+rows, and, before the ledger guard above, the ledger, and nothing would record it.
+ADR-0054 records the same gap from the other side: the bump's grant separates
+operating-system accounts, and an engine holding the DSN could reach the queue below
+it.
+
+The change (#1093) builds every child's environment from an allow-list and never from a
+copy. Every child starts from the system basics only: the path with vibey's own
+virtual environment removed, the home directory and user, the shell, the temporary
+directory, locale, time zone, terminal, certificate bundle, proxy and the XDG
+directories. An engine adds the variables its descriptor declares for its runner and
+vendor CLI and its own credential; anything else reaches an engine or a gate only when
+the project declares it in reviewed configuration. Some names can never be declared by
+anyone: `VIBEY_*` and `PG*` for every child, `GIT_*` for gates, and for engines any name
+containing `DSN`, `DATABASE_URL`, `PASSWORD` or `PASSWD`; a declaration that tries is
+refused before the project exists and again when the worker is built. The same builder
+now starts the engines' probes, the gates, vibey's own git calls, the desktop notifier,
+the Azure CLI and the skills helper. vibey's own git calls also run with no hook at
+all, with the file-system monitor switched off, and against a repository whose local
+configuration declares a filter or merge driver they refuse to check out or merge,
+because an engine writes to a linked worktree of the repository vibey then runs git
+in, and a planted hook, monitor or driver would run inside vibey's call. A review found
+that planted programs ran with the DSN in hand before this, and that the notifier could
+be made to run injected shell commands; both are reproduced in tests that failed
+before the fix (#1093, review round 2).
+
+This control keeps secrets out of a child's *environment*. It is not a boundary
+between the worker and the processes it starts, because they are the same
+operating-system user, and the security policy that ships with #1093 says so in so
+many words. A local PostgreSQL with `trust` or `peer` authentication needs no DSN at
+all, so on such a machine the allow-list does not stop an engine reaching the queue,
+and `vibey doctor` warns of it. A process running as the worker's user can also read
+the worker's environment through the operating system and any file the worker can
+read. The container boundary that would separate them is implemented but not wired in.
+Running sessions as a separate low-privilege user is the containment that would close
+this, and it is not in 3.0.0.
+
+#1093 merged at 14:37Z on 2026-09-24 (`351c10c4`). Its independent review had found
+six defects, among them vibey's own git calls running programs planted in the
+repository with the DSN in hand (rated critical), the notifier's command injection, and
+engine credentials a project declared never reaching the startup preflight, and each
+was reproduced in a test before it was fixed (#1093's description). A re-review then
+found the skills helper running with the full environment and loading code from the
+working directory; the merged change starts that helper from the system basics as well,
+with Python isolated so that the working directory is not on its import path
+(`src/vibey/infrastructure/skills_context.py`). No verdict on the merged result is
+recorded in a tracked source.
+
+Two allow-lists sit beside it. qwenloop's own `shell` tool, which runs the commands the
+model chooses, has run since #1100 with the system basics only, and never with
+`VIBEY_*`, `PG*`, or a name containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`,
+`CREDENTIAL`, `DSN` or `DATABASE_URL`. Before, it passed everything but names
+containing `KEY` and `TOKEN`, so `VIBEY_PG_URL` and `PGPASSWORD` reached commands a
+model chose (`CHANGELOG.md`). ADR-0055 calls this hygiene rather than a boundary, for
+the reason given above. And what a project adds is declared in reviewed configuration:
+`vibey.toml`'s `[engine_environment]` `allow` for every engine and
+`[engine_environment.engines]` for one, and `[gates]` `env_allow` for gate commands,
+which `vibey new` copies into the project record and the `VibeyProject` spec declares
+as `engineEnvironment` and `gates`; nobody edits the record by hand. 3.0.0 therefore
+asks a project to declare what it used to inherit: agyloop's Vertex credentials, a
+provider key a paid adapter reads from the environment, a GitHub token for claudeloop's issue
+import, and any toolchain variable a gate needs (`CHANGELOG.md`).
+
+### The sovereign driver and local fit
+
+The local driver is now part of the tracked engine family. It runs a task through the
+Ollama-backed local runner, by default in a separate git worktree on a branch of its
+own, and reads projects and open gates through the JSON CLI contracts rather than SQL.
+The driver keeps one queue per model and a directory lock across processes. Its
+environment boundary rejects `VIBEY_*`, `PG*` and names containing credential words,
+while the project may explicitly allow the small set of variables a gate needs.
+
+The driver makes the fit explicit rather than hiding it in a default. A portable
+probe records the endpoint, model, revision, prompt shape, every context/output pair,
+and a selected fit. The runtime accepts only a matching revision and endpoint, and
+caps prompt characters from the recorded shape. The probe persists the same `valid`
+field the runtime consumes; this producer/consumer contract is regression tested. A
+stale or malformed fit is ignored and the safe configured ceiling is used.
+
 ### Windows versus credits
 
 The discrimination the family is built around separates a *window*, a rate limit that
@@ -675,7 +1392,7 @@ optional reset time, exhausted credits, failed authentication), and the rule tha
 credits have no clock is enforced at three independent layers: the credits type has no
 reset field, a property test asserts that no credits state ever produces a deadline,
 and a database `CHECK` constraint rejects an engine-health row that pairs exhausted
-credits with a reset time. The runners classify in the same order of precedence.
+credits with a reset time ([Fig. 12](#fig:capacity-taxonomy)). The runners classify in the same order of precedence.
 `claudeloop` checks credit signals before the window path, so a billing failure can
 never be read as a waitable window even when a stray reset time rides along with it.
 `codexloop` is *taxonomy-faithful*: classification keys on the vendor's
@@ -696,6 +1413,62 @@ Completion is read from a structured per-turn verdict where the vendor supports 
 with an explicit done marker as the fallback, and the capacity verdict is consulted
 first either way.
 
+```latex
+\begin{figure*}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  state/.style={minimum width=3.75cm,minimum height=.95cm},
+  runner/.style={vibeytealbox,minimum width=3.75cm,minimum height=.9cm},
+  sub/.style={font=\sffamily\scriptsize,text=vibeygray,align=center,inner sep=1pt},
+  shieldtext/.style={font=\sffamily\tiny,text=vibeyink,align=center,inner sep=0pt},
+  shield/.style={fill=vibeyink!7,draw=vibeyink!45,line width=.5pt,rounded corners=1.6pt}]
+  % ---- the four capacity values
+  \node[vibeygood,state]  (available) at (2.4,6.2)   {Available\\ready to dispatch};
+  \node[vibeysoft,state]  (window)    at (6.85,6.2)  {%
+    \tikz[baseline=-0.6ex]{\draw[vibeyblue,line width=.55pt] (0,0) circle (.115cm);
+      \draw[vibeyblue,line width=.55pt,line cap=round] (0,0) -- (0,.075cm) (0,0) -- (.06cm,-.03cm);}%
+    \hspace{2.5pt}Window\\a rate limit that will reopen};
+  \node[vibeywarn,state]  (credits)   at (11.3,6.2)  {%
+    \tikz[baseline=-0.6ex]{\draw[vibeyred!80,line width=.55pt] (0,0) circle (.115cm);
+      \draw[vibeyred!80,line width=.55pt,line cap=round] (0,0) -- (0,.075cm) (0,0) -- (.06cm,-.03cm);
+      \draw[vibeyred,line width=.8pt,line cap=round] (-.15cm,.15cm) -- (.15cm,-.15cm);}%
+    \hspace{2.5pt}Credits exhausted\\a balance no waiting refills};
+  \node[vibeyghost,state] (auth)      at (15.75,6.2) {Auth failed\\credentials rejected};
+  % ---- what each value means for the scheduler
+  \node[sub,anchor=north] at (6.85,5.5) {waitable: deadline, optional reset,\\every wait capped by $W_{\max}$};
+  \node[sub,anchor=north] at (11.3,5.5) {no clock, never scheduled to reopen;\\re-probed on a bounded backoff};
+  % ---- three independent enforcement layers hang under credits
+  \begin{scope}[on background layer]
+    \draw[vibeyedge] (credits.south) -- (11.3,3.8);
+  \end{scope}
+  \foreach \y/\txt in {4.55/{\textbf{Type}: no reset field},
+                       4.13/{\textbf{Property test}: never a deadline},
+                       3.71/{\textbf{CHECK constraint}: no reset time}}{
+    \draw[shield] (11.3-1.55,\y+.19) -- (11.3+1.55,\y+.19) -- (11.3+1.55,\y-.06) -- (11.3,\y-.26) -- (11.3-1.55,\y-.06) -- cycle;
+    \node[shieldtext] at (11.3,\y-.01) {\txt};
+  }
+  % ---- runner vocabularies beneath
+  \node[runner] (qwen)   at (2.4,1.9)   {gptossloop, qwenloop $\cdot$ 3 states\\hardware, not a balance};
+  \node[runner] (codex)  at (6.85,1.9)  {codexloop $\cdot$ 6 states\\error code before HTTP status};
+  \node[runner] (agy)    at (11.3,1.9)  {agyloop $\cdot$ 5 states\\quota day in Pacific time};
+  \node[runner] (claude) at (15.75,1.9) {claudeloop\\checks credits before the window};
+  % ---- lanes
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit={(available)(auth)(2.4,7.05)(2.4,3.5)}] (lane1) {};
+    \node[vibeylane,fit={(qwen)(claude)(2.4,2.75)}] (lane2) {};
+  \end{scope}
+  \node[vibeylanelabel] at (lane1.north west) {Capacity value};
+  \node[vibeylanelabel] at (lane2.north west) {Runner vocabularies};
+  \node[vibeytag,anchor=north east] at ($(lane1.north east)+(-0.2,-0.16)$) {a capacity verdict outranks a completion claim};
+  % ---- each runner maps onto the four values
+  \foreach \r in {qwen,codex,agy,claude}{
+    \draw[vibeyflow] (\r.north) -- (\r.north |- lane1.south);
+  }
+\end{tikzpicture}
+\caption{The orchestrator sorts every engine answer into four capacity values. A window is a rate limit that will reopen, so waiting is allowed under a cap. Exhausted credits have no clock: three separate checks, in the type, a test and the database, stop anyone from scheduling them like a window. Each runner maps its own states onto these four.}
+\label{fig:capacity-taxonomy}
+\end{figure*}
+```
 ### Quotas and hardware as capacity
 
 Two runners stretch the taxonomy at its ends. Gemini meters by per-model quotas whose
@@ -707,14 +1480,13 @@ excursion stays capped by $W_{\max}$. Its generated REST surface is pinned by a 
 test to a committed snapshot of the vendor's discovery document, so a regenerated
 client that diverges fails the suite instead of a run.
 
-`qwenloop` has no vendor. Its capacity is hardware, with the states available, locally
-busy and misconfigured, and nobody refills it by adding a payment method. Model
-acquisition is explicit: the doctor never downloads weights, and installing a model
-is a separate, deliberate command, because a surprise multi-gigabyte download is
-itself a capacity event on the constrained machine the runner exists to respect.
-Because no external party can revoke its capacity, it is the family's sovereign
-fallback: it is an opt-in standby for BUILD, and it is the preferred provider for the
-DESIGN interview, which it can run with no vendor account at all.
+The local runner has no vendor. Its capacity is hardware, with the states available,
+locally busy and misconfigured, and nobody refills it by adding a payment method.
+Model acquisition is explicit: the doctor never downloads weights, and installing a
+model is a separate, deliberate command, because a surprise multi-gigabyte download
+is itself a capacity event on the constrained machine the runner exists to respect.
+`gptossloop` is the sovereign default; `qwenloop` is opt-in for a different local
+model, and both share the same Ollama transport and measured-fit controls.
 
 ### The transplant thesis
 
@@ -745,37 +1517,102 @@ $\sum_i w_i$ from the winner, so the sequence is deterministic and spreads load 
 proportion to weight without bursts. Rotation fires only at boundaries (a new item, a
 capacity rejection, which excludes the rejecting engine, a graceful wind-down, an
 effort escalation, an engine crash, or a phase transition) and never inside a turn, so
-every handoff has a well-defined ledger range $\rho$.
+every handoff has a well-defined ledger range $\rho$, shown in [Fig. 13](#fig:engine-pool).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeycore,minimum width=2.5cm] (selector) at (0,0)
-    {EngineSelector\\SWRR policy};
-  \node[vibeysoft,minimum width=1.65cm] (qwen) at (-4.5,1.55) {qwenloop\\LOCAL};
-  \node[vibeysoft,minimum width=1.65cm] (claude) at (-1.5,2.05) {claudeloop\\PAID};
-  \node[vibeysoft,minimum width=1.65cm] (codex) at (1.5,2.05) {codexloop\\PAID};
-  \node[vibeysoft,minimum width=1.65cm] (cursor) at (4.5,1.55) {cursorloop\\PAID};
-  \node[vibeysoft,minimum width=1.65cm] (agy) at (4.5,-1.55) {agyloop\\PAID};
-  \node[vibeybox,minimum width=1.65cm] (work) at (0,-2.0) {work item\\boundary};
-  \foreach \n in {qwen,claude,codex,cursor,agy}
-    {\draw[vibeyarrow] (\n) -- (selector);}
-  \draw[vibeyarrow] (selector) -- (work);
-  \draw[vibeydashed,-{Latex[length=2mm]}] (work.east) -- (agy.west);
-  \node[font=\tiny,align=center,text=vibeygray] at (2.65,-2.45)
-    {capacity rejection\\handoff at boundary};
-  \node[font=\tiny,align=center,text=vibeygray] at (-2.7,-1.05)
-    {weights combine\\health, fidelity, cost, affinity};
-  \node[font=\tiny,align=center,text=vibeyred] at (2.7,-1.05)
-    {rotation only\\at a safe boundary};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  eng/.style={minimum height=.85cm,inner xsep=3pt},
+  lab/.style={font=\sffamily\scriptsize,text=vibeygray,inner sep=1.5pt,align=center},
+  redlab/.style={lab,text=vibeyred}]
+  % ------------------------------------------------ local tier (preferred first)
+  \node[vibeytealbox,eng,minimum width=2.5cm] (qwen) at (1.35,2.1)
+    {\textbf{gptossloop}\\local Ollama\\sovereign default};
+  \node[vibeytealbox,eng,minimum width=2.5cm] (qwen2) at (4.0,2.1)
+    {\textbf{qwenloop}\\local Ollama\\opt-in};
+  \node[vibeytealbox,eng,minimum width=2.6cm] (cll) at (6.65,2.1)
+    {\textbf{claudeloop-local}\\claudeloop on a\\local backend profile};
+  % ------------------------------------------------ paid tier (fallback)
+  \node[vibeysoft,eng,minimum width=1.75cm] (claude) at (1.05,-0.7) {\textbf{claudeloop}\\Anthropic};
+  \node[vibeysoft,eng,minimum width=1.75cm] (codex)  at (3.0,-0.7)  {\textbf{codexloop}\\OpenAI};
+  \node[vibeysoft,eng,minimum width=1.75cm] (cursor) at (4.95,-0.7) {\textbf{cursorloop}\\Cursor};
+  \node[vibeysoft,eng,minimum width=1.75cm] (agy)    at (6.9,-0.7)  {\textbf{agyloop}\\Google};
+  % lane extents: shared x-range, headroom for the lane label
+  \coordinate (p1a) at (0.05,3.2);  \coordinate (p1b) at (7.95,1.4);
+  \coordinate (p2a) at (0.05,0.3);  \coordinate (p2b) at (7.95,-1.2);
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit=(qwen)(qwen2)(cll)(p1a)(p1b)] (L1) {};
+    \node[vibeylane,fit=(claude)(agy)(p2a)(p2b)] (L2) {};
+  \end{scope}
+  \node[vibeylanelabel] at (L1.north west) {Local tier: eligible local engines are chosen first (sub-doctrine 8.a)};
+  \node[vibeylanelabel] at (L2.north west) {Paid tier: declared, never default; chosen only when no local engine is eligible};
+  % ------------------------------------------------ the selector
+  \node[vibeycore,minimum width=4.0cm] (sel) at (11.1,0.7)
+    {Engine selector\\smooth weighted round robin\\$w_i=\max(1,\mathrm{round}(b_i h_i f_i c_i a_i))$};
+  \draw[vibeyflow,rounded corners=3pt] (L1.east) -- ++(0.45,0) |- ([yshift=7pt]sel.west);
+  \draw[vibeyflow,rounded corners=3pt] (L2.east) -- ++(0.45,0) |- ([yshift=-7pt]sel.west);
+  % ------------------------------------------------ the session and the handoff
+  \node[vibeybox,eng,minimum width=3.2cm] (sess) at (15.35,2.1)
+    {\textbf{Turns on the chosen engine}\\unattended; ledger range $\rho$};
+  \node[vibeybox,eng,minimum width=3.2cm] (brief) at (15.35,-0.7)
+    {\textbf{Handoff brief}\\checked by the no-loss gate};
+  \node[vibeygate,minimum width=2.8cm] (gate) at (15.35,-2.55)
+    {\textbf{Human gate}\\never a silent partial};
+  \draw[vibeyflow,rounded corners=3pt] ([yshift=7pt]sel.east) -- ++(0.35,0) |- node[lab,pos=.3,left] {chosen\\engine} (sess.west);
+  \draw[vibeyback] (sess.south) -- node[redlab,right,xshift=2pt] {capacity rejection\\at a boundary} (brief.north);
+  \draw[vibeyback,rounded corners=3pt] (brief.west) -| node[redlab,pos=.25,below,yshift=-2pt] {seeds the successor;\\rejecting engine excluded} (sel.south);
+  \draw[vibeyback] (brief.south) -- node[redlab,right,xshift=2pt] {gate fails: retry,\\transcript, or a person} (gate.north);
+  % ------------------------------------------------ the boundary rule
+  \node[vibeypill] at (4.0,-2.55)
+    {rotation fires only at a boundary, never inside a turn:\\
+     new item $\cdot$ capacity rejection $\cdot$ wind-down $\cdot$ effort escalation $\cdot$ crash $\cdot$ phase transition};
 \end{tikzpicture}
-\caption{Engine selection and handoff. Local Qwen is preferred when eligible;
-smooth weighted round robin distributes boundary-level work, while capacity failure
-routes the same ledger-backed item to another engine without rotating mid-turn.}
+\caption{Choosing an engine. Local engines (teal) are preferred; paid engines (blue) are the fallback. The selector ranks eligible engines by smooth weighted round robin. A capacity rejection sends a handoff brief through the no-loss gate to the next engine, excluding the one that failed. Rotation happens only at a boundary, so each handoff has a well-defined ledger range $\rho$.}
 \label{fig:engine-pool}
 \end{figure*}
 ```
+
+```latex
+\begin{plainwords}
+A runner is a program that lets one robot helper work by itself, safely. Every run has limits: how many turns, how much money, how much time. The runners never sit waiting for a person to type. They also know the difference between ``come back in ten minutes'' and ``you have no money left'', and they never mistake one for the other. A fair rotation shares jobs among the helpers, and a helper that says ``I am out'' is never believed when it also says ``I finished''. Each helper is also handed only the keys its job needs, never the whole key ring, although a helper running as the same computer user could still go looking, and the paper says so.
+\end{plainwords}
+```
+
+## Dispatch experiments from the 2026-09-26 session
+
+This section records the bounded dispatch experiments run during the current
+implementation session. They are machine-local observations, not universal
+performance claims. The laptop ran Ollama with `gpt-oss:20b` and RabbitMQ 4.3.6
+on loopback. The model-turn experiment used two samples at hybrid concurrency
+$2$; the orchestration-bus experiment used twelve messages.
+
+```latex
+\begin{table}[t]
+\centering\small
+\begin{tabular}{@{}p{1.45in}rrr@{}}
+\textbf{Surface} & \textbf{Single} & \textbf{Hybrid} & \textbf{Mux.}\\
+Model turns (turns/s) & 0.1162 & 0.2597 & 0.1297\\
+Bus, first run (msg/s) & 41.2398 & 271.8715 & 422.8348\\
+Bus, repeat run (msg/s) & 33.6749 & 251.2280 & 412.2460\\
+\end{tabular}
+\caption{Bounded local dispatch experiments. Hybrid won model turns; the multiplexer won the orchestration bus.}
+\label{tab:dispatch-experiments}
+\end{table}
+```
+
+The model-turn result was persisted as per-machine benchmark evidence and the
+orchestration-bus result was persisted as the local `auto` winner. The two bus
+runs agree on the winning policy while their absolute rates vary, which is why
+the implementation recomputes rather than treating one measurement as a
+constant. The experiments compare dispatch paths only; they do not establish
+model quality, paid-provider quality, or cross-machine performance.
+
+Paid-provider experiments were not run in this session. No live paid-provider
+benchmark result is therefore claimed. The provider benchmark executor and the
+durable global paid budget guard are implemented and unit-tested, but a live
+provider result requires an enabled adapter, a representative run, reported
+usage, and charging within the authorized total cap.
 
 ## Exact-head evaluation and the release calculus
 
@@ -805,6 +1642,49 @@ $$E(h, \sigma) = \begin{cases} \mathsf{pending} & \text{checks incomplete} \\ \m
 The guard $a \geq A$ is evaluated only where a repair would be spent, strictly
 after the freshness test $r \neq h$. Reviews are free; only repairs are counted.
 \end{invariant}
+```
+
+[Fig. 14](#fig:evaluation-automaton) draws the same function as a state machine.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  st/.style={minimum width=1.65cm,minimum height=.8cm},
+  g/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.2pt}]
+  % ---- states: top row
+  \node[vibeybox,st]  (P) at (0.95,0) {\textbf{Pending}\\checks\\incomplete};
+  \node[vibeysoft,st] (R) at (4.25,0) {\textbf{Review}\\$h$ awaits\\its verdict};
+  \node[vibeygood,st] (G) at (7.5,0)  {\textbf{Ready}\\absorbing};
+  % ---- states: bottom row
+  \node[vibeysoft,st] (F) at (2.3,-2.3) {\textbf{Repair}\\agent pushes $h'$};
+  \node[vibeywarn,st] (B) at (6.2,-2.3) {\textbf{Blocked}\\absorbing};
+  % ---- start marker
+  \node[vibeyanchor] (S) at (-0.2,0) {};
+  \draw[vibeyarrow] (S) -- (P);
+  % ---- forward flow
+  \draw[vibeyflow] (P) -- node[g,above] {checks\\complete} (R);
+  \draw[vibeyarrow,draw=vibeygreen] (R) -- node[g,above,text=vibeygreen] {$r=h$\\$v=\top$} (G);
+  % ---- fail with budget left: repair, then a new head returns to review
+  \draw[vibeyback] (R) to[bend right=22] node[g,text=vibeyred,left=3pt] {$r=h,\ v=\bot$\\$a<A$, $a:=a+1$} (F);
+  \draw[vibeyflow] (F) to[bend right=22] (R);
+  \node[g,text=vibeyblue] at (2.3,-3.1) {repair pushes $h'$: $a:=a+1$\\$r\neq h'$, back to review};
+  % ---- fail with budget spent: blocked, until an operator refills
+  \draw[vibeyback] (R) to[bend left=22] node[g,text=vibeyred,right=3pt] {$r=h,\ v=\bot$\\$a\ge A$} (B);
+  \draw[vibeyarrow,draw=vibeygold] (B) to[bend left=22] (R);
+  \node[g,text=vibeygold!80!black] at (6.2,-3.1) {operator refill, $k\le k_{\max}$\\$a:=0$, back to review};
+  % ---- the invariant: freshness is tested before the budget
+  \node[vibeypill,fill=vibeygold!22] (pill) at (4.25,1.3) {freshness first: $r\neq h$ is tested before $a\ge A$};
+  \draw[vibeydashed] (pill.south) -- (R.north);
+  % ---- footnote
+  \node[vibeynote] at (4.25,-4.05) {$E(h,\sigma)$ depends only on the head $h$ and $\sigma=(a,r,v,k)$.\\Reviews are free; only repairs count toward the budget $A$.};
+\end{tikzpicture}
+\caption{The release calculus as a state machine. A pull request waits in Pending until its checks finish, then goes to Review because its newest commit $h$ has no verdict yet. A pass leads to Ready; a fail leads to Repair while attempts remain, and every repair pushes a new commit that must be reviewed again. Only when the fail arrives with the budget spent does it become Blocked, and only an operator refill reopens it.}
+\label{fig:evaluation-automaton}
+\end{figure}
+```
+
+```latex
 \begin{theorem}[Bounded convergence]
 Absent contributor pushes, every lineage reaches a terminal state in at most
 $A\,(1+k_{\max})$ repairs, where $k_{\max}$ bounds operator refills.
@@ -819,32 +1699,51 @@ and $\mathsf{ready}$ and $\mathsf{blocked}$ absorb.
 \end{proof}
 ```
 
+The invalidation of stale claims across successive heads is diagrammed in [Fig. 15](#fig:exact-head).
+
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
 \begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeybox,minimum width=1.55cm] (h0) at (-4.2,0.6) {$h_0$\\reviewed};
-  \node[vibeybox,minimum width=1.55cm] (h1) at (-1.4,0.6) {$h_1$\\repair};
-  \node[vibeybox,minimum width=1.55cm] (h2) at (1.4,0.6) {$h_2$\\repair};
-  \node[vibeycore,minimum width=1.55cm] (h3) at (4.2,0.6) {$h_3$\\current head};
-  \draw[vibeyarrow] (h0) -- (h1) node[midway,above,font=\tiny] {push};
-  \draw[vibeyarrow] (h1) -- (h2) node[midway,above,font=\tiny] {push};
-  \draw[vibeyarrow] (h2) -- (h3) node[midway,above,font=\tiny] {push};
-  \node[vibeysoft,minimum width=2.1cm] (claimold) at (-0.2,-1.2)
-    {claim\\
-    $(c,h_2)$};
-  \node[vibeywarn,minimum width=2.1cm] (decision) at (3.5,-1.2)
-    {decision on $h_3$\\must re-review};
-  \draw[vibeydashed,-{Latex[length=2mm]}] (claimold) -- (decision);
-  \node[font=\tiny,align=center,text=vibeygray] at (1.65,-1.88)
-    {stale claim rejected};
-  \node[font=\scriptsize\bfseries,text=vibeyred] at (-3.1,-1.2)
-    {exact-head boundary};
-  \draw[vibeyarrow] (h3.south) -- (decision.north);
+  % ---- head lineage (top row)
+  \node[vibeybox, minimum width=1.9cm] (h0) at (0, 3.0) {$h_0$\\reviewed: findings};
+  \node[vibeybox, minimum width=1.9cm] (h1) at (3.7, 3.0) {$h_1$\\reviewed: findings};
+  \node[vibeybox, minimum width=1.9cm] (h2) at (7.4, 3.0) {$h_2$\\reviewed: findings};
+  \node[vibeycore, minimum width=1.9cm] (h3) at (11.1, 3.0) {$h_3$\\current head};
+  \draw[vibeyflow] (h0) -- (h1) node[midway, above, font=\sffamily\scriptsize, text=vibeyblue] {repair};
+  \draw[vibeyflow] (h1) -- (h2) node[midway, above, font=\sffamily\scriptsize, text=vibeyblue] {repair};
+  \draw[vibeyflow] (h2) -- (h3) node[midway, above, font=\sffamily\scriptsize, text=vibeyblue] {repair};
+
+  % ---- claims and verdicts (bottom row)
+  \node[vibeyghost, minimum width=1.9cm] (c0) at (0, 0.4) {claim $(c,h_0)$\\\textcolor{vibeyred}{stale}};
+  \node[vibeyghost, minimum width=1.9cm] (c1) at (3.7, 0.4) {claim $(c,h_1)$\\\textcolor{vibeyred}{stale}};
+  \node[vibeyghost, minimum width=1.9cm] (c2) at (7.4, 0.4) {claim $(c,h_2)$\\\textcolor{vibeyred}{stale}};
+  \node[vibeygate, minimum width=1.9cm] (gate) at (11.1, 0.4) {review $h_3$\\fresh verdict required};
+  \node[vibeygood, minimum width=1.9cm] (done) at (14.8, 0.4) {ready\\merge or release};
+
+  % each review binds a claim to exactly one head
+  \draw[vibeyarrow] (h0) -- (c0) node[midway, left, font=\sffamily\scriptsize, text=vibeygray] {review};
+  \draw[vibeyarrow] (h1) -- (c1);
+  \draw[vibeyarrow] (h2) -- (c2);
+  \draw[vibeyarrow] (h3) -- (gate) node[midway, right, font=\sffamily\scriptsize, text=vibeyink] {$r = h_2 \neq h_3$};
+
+  % the old claim cannot be carried to the new head
+  \draw[vibeyback] (c2.east) -- (gate.west) node[midway, above, font=\sffamily\scriptsize, text=vibeyred] {stale for $h_3$};
+
+  % only a fresh verdict on the current head can ship
+  \draw[vibeyarrow, draw=vibeygreen] (gate) -- (done) node[midway, above, font=\sffamily\scriptsize, text=vibeygreen] {$v = \top$};
+
+  % ---- lanes (pad coordinates give the labels headroom)
+  \coordinate (pad1) at (0, 3.75);
+  \coordinate (pad2) at (0, 1.15);
+  \begin{scope}[on background layer]
+    \node[vibeylane, fit=(h0)(h3)(pad1)] (lane1) {};
+    \node[vibeylane, fit=(c0)(done)(pad2)] (lane2) {};
+  \end{scope}
+  \node[vibeylanelabel, anchor=north east] at (lane1.north east) {Head lineage};
+  \node[vibeylanelabel, anchor=north east] at (lane2.north east) {Claims and verdicts};
 \end{tikzpicture}
-\caption{Exact-head evaluation treats every claim as $(c,h_i)$ rather than as a
-property of a pull request in the abstract. A repair advances the head and invalidates
-the old claim; the current head must be reviewed again before merge or release.}
+\caption{Every review verdict is a claim about one exact commit, written $(c,h_i)$. A repair moves the head from $h_2$ to $h_3$, so each earlier claim goes stale and cannot speak for the new head. The current head must be reviewed again, and only a fresh verdict on $h_3$ can lead to a merge or release.}
 \label{fig:exact-head}
 \end{figure*}
 ```
@@ -864,7 +1763,33 @@ the loop: the per-job platform token publishes claims but cannot act; the review
 credential proposes revisions on guarded branches but cannot merge; the merging
 credential consumes verdicts but can never produce them. No single credential can
 both judge and act, so a compromised judge cannot ship and a compromised actor cannot
-self-approve. Untrusted third-party revisions are data to all three principals.
+self-approve. Untrusted third-party revisions are data to all three principals
+([Fig. 16](#fig:trust-separation)).
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \node[vibeysoft,minimum width=1.55cm,minimum height=.95cm] (platform) at (3.45,4.4) {platform\\token};
+  \node[vibeygate,minimum width=1.55cm,minimum height=.95cm] (reviewer) at (5.15,4.4) {reviewing\\credential};
+  \node[vibeycore,minimum width=1.55cm,minimum height=.95cm] (merger) at (6.85,4.4) {merging\\credential};
+  \foreach \y/\row in {3.4/publish claims, 2.7/propose revisions, 2.0/merge or release, 1.3/produce a verdict}
+    {\node[font=\sffamily\scriptsize,text=vibeyink,anchor=east] at (2.55,\y) {\row};
+     \draw[vibeyline] (0.05,\y-0.35) -- (7.75,\y-0.35);}
+  \draw[vibeyline] (0.05,3.75) -- (7.75,3.75);
+  \newcommand{\yes}{\textcolor{vibeygreen}{\ding{51}}}
+  \newcommand{\no}{\textcolor{vibeyred}{\ding{55}}}
+  \node at (3.45,3.4) {\yes}; \node at (5.15,3.4) {\no}; \node at (6.85,3.4) {\no};
+  \node at (3.45,2.7) {\no};  \node at (5.15,2.7) {\yes}; \node at (6.85,2.7) {\no};
+  \node at (3.45,2.0) {\no};  \node at (5.15,2.0) {\no};  \node at (6.85,2.0) {\yes};
+  \node at (3.45,1.3) {\no};  \node at (5.15,1.3) {\yes}; \node at (6.85,1.3) {\no};
+  \node[vibeypill] at (3.9,0.45) {a judge cannot ship; an actor cannot self-approve};
+  \node[vibeyghost,minimum width=2.3cm] (stranger) at (1.3,4.4) {third-party\\revision: data};
+\end{tikzpicture}
+\caption{Three keys, three different powers. The platform token may only publish what it found, the reviewing key may only propose fixes, and the merging key may only act on verdicts it never wrote. No single stolen key can both grade a change and ship it, and code from strangers is treated as data by all three.}
+\label{fig:trust-separation}
+\end{figure}
+```
 
 **Release monotonicity.** Versions are derived, not remembered: for mainline $M$ and
 change set $\Delta$, $\mathrm{ver}(M \cup \Delta) \geq \mathrm{ver}(M)$, with equality
@@ -886,6 +1811,72 @@ it. Handoffs between seats stay lossless because pushes use a compare-and-swap o
 remote ref whose lease is captured before any fetch; fetching first would silently
 re-arm the lease and reduce the swap to an overwrite.
 
+**A verdict binds to what the model read.** The exact-head invariant binds a claim to
+the revision it evaluated. A reviewer running on a local model needs a second binding:
+the claim must be about the input the model actually read, and a local server can read
+less than it was sent without saying so. In 3.0.0 the review lane became sovereign by
+declaration (#1087, #1088): paid review, repair and conflict resolution are declared
+off, and the self-hosted runner, restored at 08:41Z on 2026-09-24 and declared as code
+(#1086), answers the whole review. Its first review, of #1090, failed with an
+unparseable answer. The first diagnosis, carried in #1094's description, was silent
+truncation: at an estimated three characters per token the prompt came to about 41,000
+tokens against a 32,768-token window. That diagnosis was wrong, and #1101 restates it.
+The server's own counters show 31,765 prompt tokens read and 1,004 generated, 32,769 in
+all, which is the whole window: the model read its entire prompt and ran out of room to
+answer (`done_reason=length`). The error was in the estimate, not the server. The
+prompt, about 124,000 characters, ran at about 3.95 characters per token, and the ratio
+is a property of the text, not a constant of the model:
+
+| Text | Characters per token |
+|---|---:|
+| #1090's review prompt | 3.95 |
+| a lockfile | about 2.1 |
+| hexadecimal | about 1.9 |
+| base64 | about 1.5 |
+| CJK prose | about 1.4 |
+| emoji | about 0.7 |
+
+The first row is #1090's own ratio as #1101 records it; the others are recorded,
+rounded, in the configuration reference beside the `chars_per_token` setting
+(`src/vibey_tools/gh/docs/configuration.md`). A fixed estimate of three over-counts
+prose and code, the safe direction, and under-counts dense text by up to a factor of
+four, so the estimate now decides only what to trim, and the request itself refuses to
+be cut.
+
+Real truncation looks different, and #1101 reproduced it on the storm's host with
+Ollama 0.34.2 and `gpt-oss:20b` at a 32,768-token window. A lockfile-style prompt of
+80,060 characters, which the server counted as 36,798 tokens, was answered with HTTP
+200 and `prompt_eval_count` 16,386: no error, and about half the window, which is
+$32768 - (32768 - 4)/2$. The same request sent with `truncate: false` and
+`shift: false` was refused with HTTP 400 in 0.3 s. A reviewer that reads only the
+upper bound on the server's count cannot see this cut, since 16,386 is far under any
+bound. Which end of the prompt the server discards is disputed. A reading of the
+server's source put the cut at the front, where the review rules and the start of the
+diff sit (the throughput audit's record); one canary run on the cut prompt echoed the
+code placed at the start of the system prompt but not the one after the diff, which
+suggests the tail (#1101). One run does not settle it, and the design does not need it
+settled.
+
+The fixes refuse a verdict on a cut prompt four ways (#1094, #1101). Every request asks
+the server to refuse rather than truncate, and a refusal is reported in the server's
+own words. Every request carries a fresh random check code at the start of the system
+prompt and another after the diff, and the answer must echo both, so a cut at either
+end is caught whichever end the server chooses. A diff too large for the window is
+refused before anything is sent, never cut, and the gate asks a person. And when a
+supporting document had to be cut or left out, the verdict claims only the half of the
+review the diff alone can ground, so the composer refuses it as the whole review. The
+upper-bound check on the server's count stays. What is not yet known is the check
+code's false-refusal rate on live reviews: at the cutoff no live review had exercised
+it, an availability fix (a budget for supporting documents) was still to come, and no
+pull request had yet passed the review gate on the sovereign reviewer's verdict alone
+(the 3.0.0 release-gate record, 2026-09-24 12:22Z).
+
+```latex
+\begin{plainwords}
+A pull request changes over time, like a homework draft that gets rewritten. A grade belongs to one draft only. Vibey never uses a grade from an old draft to decide about a new one. It counts repairs, not reviews, so the helpers cannot loop forever. And the key that grades a change is never the key that publishes it, so no single stolen key can both cheat and ship. A grade must also be about the whole draft the grader actually read. A small computer running the grader can quietly read only half of a long draft and still hand back a confident grade, so every request now tells it to refuse instead, and hides a secret word at the start and at the end that the grader must repeat back. If either word is missing, the grade is thrown away. Our first guess at why one grade failed was wrong, and we say so: that time the grader had read everything and simply ran out of room to answer.
+\end{plainwords}
+```
+
 ## Deterministic retrieval and fail-closed bootstrap
 
 Two further components apply the ledger's discipline, append before acting and fail
@@ -893,7 +1884,7 @@ closed rather than degrade silently, at other scales.
 
 **Retrieval.** A skill library cannot be loaded wholesale into a context window, yet
 fragmentary retrieval of safety- and correctness-critical guidance is worse than none.
-At revision `559638f4` the library holds 710 skill documents across 135 plugins.
+At the current source cutoff the library holds 728 skill documents across 136 plugins.
 `vibey-skills` indexes it as a pure function of the corpus and retrieves only whole
 sections.
 
@@ -929,48 +1920,91 @@ callbacks that can never mask the original error.
 
 The ledger, the outbox and the audit chain are one principle at three scales: the
 record of intent exists before its effect, and every later state is derived from the
-record.
+record, as diagrammed in [Fig. 17](#fig:record-effect).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
-\begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeycore,minimum width=2.2cm] (record) at (-4.9,0) {record intent\\first};
-  \node[vibeysoft,minimum width=2.2cm] (ledger) at (-1.65,1.05) {delivery ledger\\state projection};
-  \node[vibeysoft,minimum width=2.2cm] (outbox) at (-1.65,-1.05) {transactional outbox\\at-least-once};
-  \node[vibeysoft,minimum width=2.2cm] (audit) at (1.65,1.05) {audit hash chain\\tamper evidence};
-  \node[vibeysoft,minimum width=2.2cm] (bootstrap) at (1.65,-1.05) {bootstrap\\fail-closed};
-  \node[vibeybox,minimum width=2.2cm] (effect) at (4.9,0) {effect\\derived state};
-  \draw[vibeyarrow] (record) -- (ledger);
-  \draw[vibeyarrow] (record) -- (outbox);
-  \draw[vibeyarrow] (ledger) -- (audit);
-  \draw[vibeyarrow] (outbox) -- (bootstrap);
-  \draw[vibeyarrow] (audit) -- (effect);
-  \draw[vibeyarrow] (bootstrap) -- (effect);
-  \node[font=\scriptsize\bfseries,text=vibeyred] at (0,-2.05)
-    {append before act; missing evidence stops the effect};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  box/.style={minimum height=.95cm},
+  wideb/.style={box,text width=4.3cm},
+  midb/.style={box,text width=4.0cm},
+  lbl/.style={vibeynote,font=\sffamily\scriptsize,inner sep=1.5pt},
+  crash/.style={lbl,text=vibeyred}]
+  % ---- column headers
+  \node[vibeyhead,anchor=south] (hA) at (2.95,6.95)  {Intent recorded};
+  \node[vibeyhead,anchor=south] (hB) at (8.8,6.95)   {State derived};
+  \node[vibeyhead,anchor=south] (hC) at (14.65,6.95) {Effect allowed};
+  % ---- lane 1: orchestrator scale (the delivery ledger)
+  \node[vibeycore,wideb] (a1) at (2.95,5.85)  {Ledger event appended\\append-only; corrections supersede};
+  \node[vibeysoft,midb]  (b1) at (8.8,5.85)   {State projected\\\mbox{$\mathrm{state}(t)=f(\mathrm{ledger}_{\le t})$}};
+  \node[vibeygood,wideb] (c1) at (14.65,5.85) {Job proceeds\\lease, phase, commit, human gate row};
+  % ---- lane 2: service scale (the transactional outbox)
+  \node[vibeycore,wideb] (a2) at (2.95,4.0)   {Outbox row and state change\\committed in one transaction};
+  \node[vibeysoft,midb]  (b2) at (8.8,4.0)    {Dispatcher reads\\committed rows only};
+  \node[vibeygood,wideb] (c2) at (14.65,4.0)  {External call made\\at-least-once; marked delivered once};
+  % ---- lane 3: audit scale (the hash chain)
+  \node[vibeycore,wideb] (a3) at (2.95,2.15)  {Chain link appended\\\mbox{$c_i = H(c_{i-1}\,\|\,r_i)$}};
+  \node[vibeysoft,midb]  (b3) at (8.8,2.15)   {Verifier re-hashes\\from \mbox{$c_0 = H(r_0)$}};
+  \node[vibeygood,wideb] (c3) at (14.65,2.15) {Edits detected\\any change breaks every later link};
+  % ---- bootstrap layer underneath
+  \node[vibeybox,wideb] (s1) at (2.95,0.3)  {Fail-closed start\\missing precondition halts, named};
+  \node[vibeybox,midb]  (s2) at (8.8,0.3)   {Optional capability\\degrades as a recorded decision};
+  \node[vibeybox,wideb] (s3) at (14.65,0.3) {Retries built once\\typed, bounded, cause never masked};
+  % ---- lanes on the background layer
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit={(0.25,5.35)(17.35,6.55)}] (lane1) {};
+    \node[vibeylane,fit={(0.25,3.5)(17.35,4.7)}]   (lane2) {};
+    \node[vibeylane,fit={(0.25,1.65)(17.35,2.85)}] (lane3) {};
+    \node[vibeylane,fit={(0.25,0.0)(17.35,1.0)}]   (lane4) {};
+  \end{scope}
+  \node[vibeylanelabel] at (lane1.north west) {Orchestrator scale};
+  \node[vibeylanelabel] at (lane2.north west) {Service scale};
+  \node[vibeylanelabel] at (lane3.north west) {Audit scale};
+  \node[vibeylanelabel] at (lane4.north west) {Bootstrap layer};
+  % ---- the durability boundary: everything right of it happens after the record is on disk
+  \draw[vibeydashed] (6.0,1.4) -- (6.0,6.95);
+  \node[vibeypill,anchor=south] at (6.0,6.95) {durable from here};
+  % ---- record -> derive -> effect, in every lane
+  \foreach \r in {1,2,3}{
+    \draw[vibeyflow] (a\r) -- (b\r);
+    \draw[vibeyflow] (b\r) -- (c\r);
+  }
+  % ---- crash anywhere: back to the record
+  \draw[vibeyback,rounded corners=3pt] (hC.north) |- (8.8,7.58) -| (hA.north);
+  \node[crash,anchor=south] at (8.8,7.62) {crash at any step: replay from the record; duplicates dropped by identity};
 \end{tikzpicture}
-\caption{Append-before-act at three implementation scales. The delivery ledger,
-transactional outbox, audit chain and bootstrap layer all make intent durable before
-an external or derived effect is allowed to proceed.}
+\caption{Append before act, at three scales. Each row is one part of vibey (the ledger, the outbox, the audit chain) and reads the same way: the intent is saved, the state is derived from that record, and only then may the effect happen. A crashed worker restarts from the record. The bootstrap layer below keeps the same rule at start-up.}
 \label{fig:record-effect}
 \end{figure*}
+```
+
+```latex
+\begin{plainwords}
+Two smaller tools follow the same rule of writing things down before acting. One looks up instructions in a big library and always returns whole pages, never half a page, and it says clearly when it could not fit everything in. The other starts up cloud programs and refuses to start at all if something it needs is missing, instead of limping along quietly.
+\end{plainwords}
 ```
 
 ## Production rate and governance
 
 The components above make engines substitutable and human decisions explicit. This
-section asks what, given that, bounds the rate of delivery. It uses three tracked
-sources and nothing else: the sovereignty stress record
+section asks what, given that, bounds the rate of delivery. Its tracked sources are the
+sovereignty stress record
 (`src/vibey_tools/gh/docs/sovereignty-stress-2026-08-30.md`), the cutoff-bounded local
 Qwen storm record
-(`src/vibey_tools/gh/docs/qwenloop-storm-2026-09-20.json`), and this repository's git
-history, which is field data. The stress record is a controlled escalation of the local
-review lane; the Qwen record is an operational reliability observation, not another
-throughput experiment.
-`scripts/paper_evidence.py` recomputes every figure in this section from those three
-sources; history figures are stated at revision `559638f4`, which the script's
-`--rev 559638f4` reproduces.
+(`src/vibey_tools/gh/docs/qwenloop-storm-2026-09-20.json`), the QwenStorm 3.0.0
+evidence ledger and host benchmark under `docs/plans/qwenstorm-3.0.0/`, the
+delivery-estimate ledger, and this repository's git history, which is field data. The
+stress record is a controlled escalation of the local review lane; the Qwen record is an
+operational reliability observation, not another throughput experiment.
+`scripts/paper_evidence.py` recomputes the stress, Qwen and history figures, and
+`scripts/paper_figures.py` redraws every computed figure from the tracked records;
+history figures are stated at the paper's pinned source revision, which `--rev HEAD`
+reproduces for this update. Two further sources are not tracked, and we name them where we use them:
+the storm throughput audit of 2026-09-23, whose record is a page kept outside the
+repository and whose inputs are local run logs, and the forge's own records of pull
+requests and their merge times. Where we could recompute an audit figure from the local
+logs we did, on 2026-09-24, and say so.
 
 ### The stress record
 
@@ -978,61 +2012,49 @@ A harness fired $N$ simultaneous generations at `qwen2.5-coder:14b`, served by o
 on one machine with 24 GB of memory and 10 cores, for $N$ from 1 to 128, with a 900 s
 deadline per generation. Each generation was a real unit of work, an issue triaged or
 a pull-request diff reviewed, drawn from a pool of seven artifacts of 2 to 22 KB.
-Throughput is successful generations per minute of rung wall clock.
+Throughput is successful generations per minute of rung wall clock, reported across four views in [Fig. 18](#fig:stress-rate).
 
+<!-- BEGIN GENERATED figure:stress-dashboard rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
 ```latex
 \begin{figure*}[t]
 \centering
-\begin{tikzpicture}[x=0.47cm,y=0.85cm]
-  \begin{scope}
-    \draw[vibeyarrow] (0,0) -- (13.4,0);
-    \draw[vibeyarrow] (0,0) -- (0,4.1);
-    \draw[vibeydashed] (0,0.99) -- (13.2,0.99);
-    \draw[vibeydashed] (0,2.00) -- (13.2,2.00);
-    \draw[vibeyblue,very thick] plot coordinates
-      {(0,0.36) (1,0.99) (2,0.99) (3,1.17) (4,1.72) (5,1.27)
-       (6,1.54) (7,1.37) (8,1.40) (9,2.00) (10,1.60) (11,2.66)
-       (12,3.52) (13,1.53)};
-    \foreach \x/\n in {0/1,1/2,2/3,3/4,4/6,5/8,6/12,7/16,8/24,9/32,10/48,11/64,12/96,13/128}
-      {\filldraw[fill=vibeyblue,draw=white] (\x,0) circle (0.08);
-       \node[font=\tiny,rotate=60,anchor=north] at (\x,-0.08) {\n};}
-    \node[font=\scriptsize\bfseries,anchor=south west] at (0,4.05)
-      {successful throughput (generations / min)};
-    \node[font=\tiny,anchor=west] at (13.0,0.99) {stable floor};
-    \node[font=\tiny,anchor=west] at (13.0,2.00) {stable ceiling};
-  \end{scope}
-  \begin{scope}[xshift=7.7cm]
-    \draw[vibeyarrow] (0,0) -- (13.4,0);
-    \draw[vibeyarrow] (0,0) -- (0,1.15);
-    \fill[vibeygreen] (0,0) rectangle (0.55,1.00);
-    \fill[vibeygreen] (1,0) rectangle (1.55,1.00);
-    \fill[vibeygreen] (2,0) rectangle (2.55,1.00);
-    \fill[vibeygreen] (3,0) rectangle (3.55,1.00);
-    \fill[vibeygreen] (4,0) rectangle (4.55,1.00);
-    \fill[vibeygreen] (5,0) rectangle (5.55,1.00);
-    \fill[vibeygreen] (6,0) rectangle (6.55,1.00);
-    \fill[vibeygreen] (7,0) rectangle (7.55,1.00);
-    \fill[vibeygold] (8,0) rectangle (8.55,0.875);
-    \fill[vibeygold] (9,0) rectangle (9.55,0.938);
-    \fill[vibeyred] (10,0) rectangle (10.55,0.500);
-    \fill[vibeyred] (11,0) rectangle (11.55,0.625);
-    \fill[vibeyred] (12,0) rectangle (12.55,0.552);
-    \fill[vibeyred] (13,0) rectangle (13.55,0.180);
-    \foreach \x/\n in {0/1,1/2,2/3,3/4,4/6,5/8,6/12,7/16,8/24,9/32,10/48,11/64,12/96,13/128}
-      {\node[font=\tiny,rotate=60,anchor=north] at (\x,-0.08) {\n};}
-    \node[font=\scriptsize\bfseries,anchor=south west] at (0,1.1)
-      {success fraction by offered concurrency};
-    \node[font=\tiny,align=left,anchor=north west] at (0,-0.72)
-      {green = 100\%\\gold = 87.5--93.8\%\\red = overloaded};
-  \end{scope}
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 2,horizontal sep=1.7cm,vertical sep=1.75cm},
+  vibeyaxis,width=7.9cm,height=4.3cm,xmode=log,log basis x=2,xtick={1,2,4,8,16,32,64,128},xticklabels={1,2,4,8,16,32,64,128},
+  xmin=0.8,xmax=160,xlabel={offered concurrency $N$}]
+\nextgroupplot[title={a. Successful throughput},ylabel={generations / min},ymin=0,ymax=4.6,ytick={0,...,4}]
+\fill[vibeyblue!9] (axis cs:2,0) rectangle (axis cs:32,4.6);
+\node[vibeynote,text=vibeyblue,anchor=south] at (axis cs:8,3.55) {stable region $N=2$--$32$};
+\draw[vibeydashed] (axis cs:0.8,0.99) -- (axis cs:160,0.99) node[vibeynote,anchor=west,text=vibeygray] {0.99};
+\draw[vibeydashed] (axis cs:0.8,2.0) -- (axis cs:160,2.0) node[vibeynote,anchor=west,text=vibeygray] {2.00};
+\addplot[vibeyblue,line width=1pt,mark=*,mark size=1.4pt,mark options={fill=white,line width=.7pt}] coordinates {(1,0.36) (2,0.99) (3,0.99) (4,1.17) (6,1.72) (8,1.27) (12,1.54) (16,1.37) (24,1.4) (32,2.0) (48,1.6) (64,2.66) (96,3.52) (128,1.53)};
+\node[vibeycallout,anchor=south east] at (axis cs:96,3.52) {peak 3.52/min\\55.2\% success};
+\node[vibeycallout,anchor=east,xshift=-3pt] at (axis cs:128,1.53) {collapse};
+\nextgroupplot[title={b. Success fraction},ylabel={succeeded (\%)},ymin=0,ymax=124,ytick={0,25,50,75,100}]
+\draw[vibeydashed] (axis cs:0.8,87.5) -- (axis cs:160,87.5) node[vibeynote,anchor=west,text=vibeygray] {87.5};
+\addplot[ybar,bar width=5pt,bar shift=0pt,draw=none,fill=vibeygreen!80] coordinates {(1,100.0) (2,100.0) (3,100.0) (4,100.0) (6,100.0) (8,100.0) (12,100.0) (16,100.0)};
+\addplot[ybar,bar width=5pt,bar shift=0pt,draw=none,fill=vibeygold!90] coordinates {(24,87.5) (32,93.8)};
+\addplot[ybar,bar width=5pt,bar shift=0pt,draw=none,fill=vibeyred!75] coordinates {(48,50.0) (64,62.5) (96,55.2) (128,18.0)};
+\node[vibeynote,anchor=north west,align=left] at (axis cs:0.9,122) {\textcolor{vibeygreen}{$\blacksquare$} 100\% \quad \textcolor{vibeygold}{$\blacksquare$} 87.5--93.8\% \quad \textcolor{vibeyred}{$\blacksquare$} overloaded};
+\nextgroupplot[title={c. Latency against the 900\,s deadline},ylabel={seconds},ymin=0,ymax=1000,
+  legend style={at={(axis cs:0.9,800)},anchor=north west}]
+\addplot[fill=vibeyblue!12,draw=none,forget plot] coordinates {(1,166.0) (2,118.0) (3,132.0) (4,154.0) (6,59.0) (8,191.0) (12,174.0) (16,440.0) (24,701.0) (32,292.0) (48,900.0) (64,555.0) (96,821.0) (128,901.0) (128,901.0) (96,901.0) (64,901.0) (48,901.0) (32,900.0) (24,900.0) (16,700.0) (12,464.0) (8,375.0) (6,206.0) (4,203.0) (3,180.0) (2,118.0) (1,166.0)} -- cycle;
+\draw[vibeyred,densely dashed,line width=.7pt] (axis cs:0.8,900) -- (axis cs:160,900) node[vibeycallout,anchor=south east] {deadline};
+\addplot[vibeyblue,line width=1pt,mark=*,mark size=1.2pt] coordinates {(1,166.0) (2,118.0) (3,132.0) (4,154.0) (6,59.0) (8,191.0) (12,174.0) (16,440.0) (24,701.0) (32,292.0) (48,900.0) (64,555.0) (96,821.0) (128,901.0)};
+\addlegendentry{p50}
+\addplot[vibeyteal,line width=.8pt,mark=square*,mark size=1.1pt] coordinates {(1,166.0) (2,118.0) (3,180.0) (4,203.0) (6,206.0) (8,375.0) (12,464.0) (16,700.0) (24,900.0) (32,900.0) (48,901.0) (64,901.0) (96,901.0) (128,901.0)};
+\addlegendentry{max}
+\nextgroupplot[title={d. Free memory during the rung},ylabel={free memory (\%)},ymin=0,ymax=14]
+\addplot[vibeyviolet,line width=1pt,mark=*,mark size=1.2pt,mark options={fill=white}] coordinates {(1,11.6) (2,11.2) (3,9.3) (4,9.4) (6,11.1) (8,10.3) (12,9.4) (16,8.6) (24,8.8) (32,9.3) (48,8.9) (64,10.0) (96,9.7) (128,9.1)};
+\node[vibeycallout,anchor=south east,align=right] at (axis cs:140,12.1) {paging space 99.1\%\\at $N=128$};
+\node[vibeynote,anchor=south west,align=left] at (axis cs:1,0.5) {server crashed and self-restarted\\at $N=64$ and $N=128$};
+\end{groupplot}
 \end{tikzpicture}
-\caption{The sovereignty stress record in two views. Throughput rises into a broad
-stable band from offered concurrency $N=2$ through $N=32$, while the success fraction
-collapses beyond the substrate's sustainable region. The points and bars reproduce the
-paper's rung table; the second panel makes the throughput/success trade-off visible.}
+\caption{The sovereignty stress record in four views. (a) Successful throughput rises into a broad stable band, 0.99--2.00 generations per minute, across offered concurrency $N=2$ to $32$, then peaks at 3.52 per minute at $N=96$ before collapsing. (b) The success fraction stays at or above 87.5\% through $N=32$ and falls beyond it. (c) Median latency and the slowest generation of each rung approach the 900\,s deadline as the substrate saturates. (d) Free memory oscillated in a narrow band throughout; paging space, not free memory, marked the collapse. Every point reproduces the record's rung table.}
 \label{fig:stress-rate}
 \end{figure*}
 ```
+<!-- END GENERATED figure:stress-dashboard -->
 
 | $N$ | Succeeded | p50 (s) | Per minute |
 |---:|---:|---:|---:|
@@ -1052,7 +2074,31 @@ paper's rung table; the second panel makes the throughput/success trade-off visi
 | 128 | 23/128 | 901 | 1.53 |
 
 In all, 243 of 444 generations succeeded over 2.18 hours. Every failure was a clean
-timeout; not one response was malformed or corrupt.
+timeout; not one response was malformed or corrupt. The cumulative progression of attempts
+and successes across the 14 rungs is plotted in [Fig. 19](#fig:stress-cumulative).
+
+<!-- BEGIN GENERATED figure:stress-cumulative rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[vibeyaxis,width=8.6cm,height=5cm,xmin=1,xmax=14,ymin=0,ymax=474,
+  xtick={1,2,3,4,5,6,7,8,9,10,11,12,13,14},xticklabels={1,2,3,4,6,8,12,16,24,32,48,64,96,128},
+  xlabel={rung (offered concurrency $N$)},ylabel={generations, cumulative},legend pos=north west]
+\addplot[fill=vibeysilver!35,draw=none,forget plot] coordinates {(1,1) (2,3) (3,6) (4,10) (5,16) (6,24) (7,36) (8,52) (9,76) (10,108) (11,156) (12,220) (13,316) (14,444)} \closedcycle;
+\addplot[fill=vibeygreen!45,draw=none,forget plot] coordinates {(1,1) (2,3) (3,6) (4,10) (5,16) (6,24) (7,36) (8,52) (9,73) (10,103) (11,127) (12,167) (13,220) (14,243)} \closedcycle;
+\addplot[vibeysilver,line width=.5pt] coordinates {(1,1) (2,3) (3,6) (4,10) (5,16) (6,24) (7,36) (8,52) (9,76) (10,108) (11,156) (12,220) (13,316) (14,444)};
+\addlegendentry{attempted}
+\addplot[vibeygreen,line width=.8pt] coordinates {(1,1) (2,3) (3,6) (4,10) (5,16) (6,24) (7,36) (8,52) (9,73) (10,103) (11,127) (12,167) (13,220) (14,243)};
+\addlegendentry{succeeded}
+\node[vibeynote,anchor=east,align=right] at (axis cs:12.4,346) {243 of 444\\54.7\% overall};
+\end{axis}
+\end{tikzpicture}
+\caption{Cumulative generations across the fourteen rungs of the stress record: 444 attempted, 243 succeeded. The gap opens only after the stable region; every failure in the run was a clean timeout, never a malformed response.}
+\label{fig:stress-cumulative}
+\end{figure}
+```
+<!-- END GENERATED figure:stress-cumulative -->
 
 ### The local Qwen storm pilot
 
@@ -1079,8 +2125,66 @@ allocated at the cutoff but had no events yet. Another produced one tool error a
 one turn. Four directories had no events at this cutoff, while one storm process was
 still alive. Across all thirteen directories the logs contain 105 model-turn
 boundaries, 85 tool calls, 550,576 input tokens, 83,609 output tokens, and 42
-file-write calls totalling 32,073 bytes. Thus the accepted completion rate at the
-cutoff was 4/13, or 30.8%, while a verdict alone would have suggested 6/13, or 46.2%.
+file-write calls totalling 32,073 bytes, as detailed across each run in [Fig. 20](#fig:qwen-runs).
+Thus the accepted completion rate at the cutoff was 4/13, or 30.8%, while a verdict alone
+would have suggested 6/13, or 46.2%.
+
+<!-- BEGIN GENERATED figure:qwen-runs rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},vibeyaxis,width=8.6cm,height=4.6cm,
+  xmin=0.3,xmax=13.7,xtick={1,2,3,4,5,6,7,8,9,10,11,12,13},xlabel={run, in order of start},x tick label style={yshift=-5pt}]
+\nextgroupplot[title={a. Turns and tool calls per run},ylabel={count},ymin=0,ymax=48,legend pos=north west,ybar,bar width=4pt,legend image code/.code={\fill[#1,draw=none] (0cm,-2.2pt) rectangle (0.28cm,2.2pt);}]
+\addplot[fill=vibeyblue,draw=none] coordinates {(1,11) (2,1) (3,0) (4,0) (5,0) (6,5) (7,9) (8,9) (9,2) (10,6) (11,40) (12,22) (13,0)};
+\addlegendentry{model turns}
+\addplot[fill=vibeyteal!80,draw=none] coordinates {(1,13) (2,1) (3,0) (4,0) (5,0) (6,4) (7,8) (8,12) (9,2) (10,5) (11,20) (12,20) (13,0)};
+\addlegendentry{tool calls}
+\node[fill=vibeygold,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:1,0) {};
+\node[fill=vibeyred!60,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:2,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:3,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:4,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:5,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:6,0) {};
+\node[fill=vibeygold,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:7,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:8,0) {};
+\node[fill=vibeyred,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:9,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:10,0) {};
+\node[fill=vibeyred,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:11,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:12,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:13,0) {};
+\nextgroupplot[title={b. Tokens per run},ylabel={tokens (thousands)},ymin=0,ymax=286,legend pos=north west,ybar,bar width=4pt,legend image code/.code={\fill[#1,draw=none] (0cm,-2.2pt) rectangle (0.28cm,2.2pt);}]
+\addplot[fill=vibeyviolet!85,draw=none] coordinates {(1,93.4) (2,1.3) (3,0.0) (4,0.0) (5,0.0) (6,23.4) (7,62.3) (8,17.1) (9,4.3) (10,8.6) (11,238.6) (12,101.6) (13,0.0)};
+\addlegendentry{input}
+\addplot[fill=vibeygold,draw=none] coordinates {(1,9.8) (2,0.4) (3,0.0) (4,0.0) (5,0.0) (6,4.1) (7,8.1) (8,7.5) (9,0.9) (10,5.7) (11,30.5) (12,16.5) (13,0.0)};
+\addlegendentry{output}
+\node[fill=vibeygold,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:1,0) {};
+\node[fill=vibeyred!60,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:2,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:3,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:4,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:5,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:6,0) {};
+\node[fill=vibeygold,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:7,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:8,0) {};
+\node[fill=vibeyred,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:9,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:10,0) {};
+\node[fill=vibeyred,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:11,0) {};
+\node[fill=vibeygreen,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:12,0) {};
+\node[fill=vibeysilver,minimum width=8pt,minimum height=4pt,inner sep=0pt] at ([yshift=-5pt]axis cs:13,0) {};
+\end{groupplot}
+\node[vibeynote,anchor=north west,align=left] at ([yshift=-2pt]current bounding box.south -| group c1r1.south west)
+  {disposition strip: \textcolor{vibeygreen}{$\blacksquare$} completed (4) \;
+   \textcolor{vibeygold}{$\blacksquare$} verdict only (2) \;
+   \textcolor{vibeyred}{$\blacksquare$} no verdict (2) \;
+   \textcolor{vibeyred!60}{$\blacksquare$} tool error (1) \;
+   \textcolor{vibeysilver}{$\blacksquare$} no events (4)};
+\end{tikzpicture}
+\caption{The thirteen run directories of the cutoff-bounded local Qwen storm, in order of start. (a) Model turns and tool calls; (b) input and output tokens, 550,576 and 83,609 in all. The strip beneath each panel colours every run by its disposition at the cutoff: only 4 of 13 both emitted a verdict and wrote the completion marker, and the largest run, forty turns and 238,608 input tokens, ended without a verdict at all.}
+\label{fig:qwen-runs}
+\end{figure*}
+```
+<!-- END GENERATED figure:qwen-runs -->
 
 This is a runner-reliability observation, not a model-quality or throughput estimate.
 It is nevertheless an empirical check of the completion contract: a verdict without
@@ -1090,40 +2194,866 @@ configuration observation worth preserving: the requested context setting was 32
 tokens, while the local server reported 40,960 at the cutoff. The paper therefore makes
 no claim about a controlled context-window effect from this pilot. The raw logs remain
 local operational artifacts; the compact tracked extraction is the reproducible source
-used by `scripts/paper_evidence.py`.
+used by `scripts/paper_evidence.py`. The resulting distribution of dispositions is
+summarised in [Fig. 21](#fig:qwen-disposition).
 
 ```latex
-\begin{figure}[t]
+\begin{figure}[!t]
 \centering
-\begin{tikzpicture}[x=0.55cm,y=1cm]
-  \node[font=\scriptsize\bfseries,anchor=west,text=vibeyink] at (0,1.55)
-    {13 run directories at the evidence cutoff};
-  \draw[draw=vibeyink,line width=.65pt,rounded corners=2pt]
-    (0,0) rectangle (13,0.72);
-  \fill[vibeygreen] (0,0) rectangle (4,0.72);
-  \fill[vibeygold] (4,0) rectangle (6,0.72);
-  \fill[vibeyred] (6,0) rectangle (8,0.72);
-  \fill[vibeygray] (8,0) rectangle (9,0.72);
-  \fill[vibeygray!35] (9,0) rectangle (13,0.72);
-  \foreach \x in {4,6,8,9}
-    {\draw[white,line width=.65pt] (\x,0) -- (\x,0.72);}
-  \node[font=\tiny,text=white,align=center] at (2,0.36) {4\\complete};
-  \node[font=\tiny,text=white,align=center] at (5,0.36) {2\\verdict only};
-  \node[font=\tiny,text=white,align=center] at (7,0.36) {2\\no verdict};
-  \node[font=\tiny,text=white,align=center] at (8.5,0.36) {1\\tool error};
-  \node[font=\tiny,text=vibeyink,align=center] at (11,0.36) {4\\no events};
-  \node[vibeywarn,minimum width=2.3cm,anchor=west] at (8.4,2.25)
-    {+1 active\\storm process};
-  \draw[vibeydashed,-{Latex[length=2mm]}] (8.9,2.05) -- (8.9,0.8);
-  \node[font=\tiny,align=left,anchor=north west] at (0,-0.38)
-    {verdicts: 6\\completion markers: 4\\accepted rate: 4/13};
+\begin{tikzpicture}[x=1cm,y=1cm,
+  seg/.style={inner sep=0pt,minimum height=.6cm,anchor=west,draw=white,line width=.6pt,
+    font=\sffamily\scriptsize\bfseries,text=white},
+  segname/.style={font=\sffamily\scriptsize,text=vibeyink,align=center,anchor=north,inner sep=1pt},
+  bracelabel/.style={font=\sffamily\scriptsize,align=center,anchor=south,inner sep=1pt},
+  brace/.style={draw=vibeygray,line width=.5pt,decorate,decoration={brace,amplitude=3pt}}]
+  % ---- the thirteen run directories, one unit (0.5 cm) per run, in disposition order
+  \node[seg,fill=vibeygreen,minimum width=2.0cm]                (done)    at (0,0)   {4};
+  \node[seg,fill=vibeygold,minimum width=1.0cm]                 (verdict) at (2.0,0) {2};
+  \node[seg,fill=vibeyred,minimum width=1.0cm]                  (noverd)  at (3.0,0) {2};
+  \node[seg,fill=vibeyred!60,minimum width=.5cm]                (toolerr) at (4.0,0) {1};
+  \node[seg,fill=vibeysilver,minimum width=2.0cm,text=vibeyink] (empty)   at (4.5,0) {4};
+
+  % ---- disposition names, one per segment; the one-run segment gets a short leader
+  \node[segname] at (done.south)    {completed};
+  \node[segname] at (verdict.south) {verdict\\only};
+  \node[segname] at (noverd.south)  {no\\verdict};
+  \node[segname] at (empty.south)   {no events};
+  \node[segname] (toolname) at ([yshift=-.85cm]toolerr.south) {tool error};
+  \draw[vibeyedge] (toolerr.south) -- (toolname.north);
+
+  % ---- the completion contract, read off the bar: delivered needs verdict AND marker
+  \draw[brace] (0,.42) -- (1.94,.42);
+  \draw[brace] (2.06,.42) -- (6.5,.42);
+  \node[bracelabel,text=vibeygreen!80!black] (dlabel) at (1.0,.58)
+    {\textbf{delivered: 4}\\verdict and marker};
+  \node[bracelabel,text=vibeyink] (nlabel) at (4.28,.58)
+    {\textbf{not delivered: 9}\\completion marker missing};
+
+  % ---- the group of thirteen, named once
+  \coordinate (lanehead) at (0,1.5);
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit=(done)(empty)(toolname)(dlabel)(nlabel)(lanehead)] (lane) {};
+    \node[vibeylanelabel] at (lane.north west) {13 run directories};
+  \end{scope}
+
+  % ---- the process still running at the cutoff: outside the thirteen, counts for nothing
+  \node[vibeyghost,minimum width=1.25cm,anchor=west] (active) at (6.95,0) {+1 active\\process};
+  \node[vibeynote,anchor=north] at ([yshift=-2pt]active.south) {still running,\\not one of the 13};
 \end{tikzpicture}
-\caption{Cutoff-bounded Qwen storm dispositions. A verdict-only run remains
-incomplete, and an active process is independent of the resolved or empty
-directories; counting all visible artifacts as completed would overstate delivery.}
+\caption{The thirteen Qwen storm run directories at the evidence cutoff, each segment as wide as its share of runs. Only the four with both a verdict and a completion marker count as delivered; a verdict alone does not. One process was still running and belongs to none of the thirteen. Counting every visible artifact as finished would overstate delivery.}
 \label{fig:qwen-disposition}
 \end{figure}
 ```
+
+### The QwenStorm 3.0.0 evidence ledger
+
+The QwenStorm 3.0.0 run of 2026-09-22 and 2026-09-23 drove the open backlog through
+one local model, `gpt-oss:20b` on Ollama, one lane at a time: each lane is one issue,
+one source file with its interface and one test file, and every lane is reviewed
+against its specification and its diff before it may become a pull request. Its record
+is an append-only evidence ledger
+(`docs/plans/qwenstorm-3.0.0/evidence/ledger.jsonl`) that a consumer,
+`tools/storm-evidence.py`, fills from the storm's own progress log and lane results.
+
+Each lane was allowed at most three attempts. Across the 30 lanes the ledger holds,
+70 attempts and 2,606 model turns were logged ([Fig. 23](#fig:storm-lanes)). Seventeen
+lanes ended in a completion claim, and a claim is not delivery: over the same span the
+reviewer integrated 12 lanes and abandoned 14, and the rest remained unsettled at the
+cutoff. The figures below are the tool's own, regenerated between its markers; every
+sentence about them is written outside those markers.
+
+<!-- BEGIN GENERATED storm-evidence — regenerated by tools/storm-evidence.py -->
+
+*Derived from `docs/plans/qwenstorm-3.0.0/evidence/ledger.jsonl`, an append-only record consumed under sub-doctrine 10.g.*
+*Regenerated automatically; do not edit inside these markers.*
+*This block states figures only — every claim about them is written by a person outside it.*
+
+| quantity | value |
+|---|---|
+| ledger records | 277 |
+| span consumed from | 2026-09-23T04:40:49Z |
+| span consumed to | 2026-09-24T00:24:17Z |
+| lanes observed | 30 |
+| lanes claiming completion | 17 |
+| lane starts / ends logged | 49 / 42 |
+| lanes integrated / abandoned | 12 / 14 |
+| recorded attempts | 70 |
+| total turns across attempts | 2606 |
+
+**Gaps in this span:** none; every byte and record between the watermarks was read.
+
+<!-- END GENERATED storm-evidence -->
+
+The consumer obeys sub-doctrine 10.g, the unbroken read
+([Fig. 22](#fig:evidence-watermark)): its watermark is a byte offset into each source and
+an identity set over the records, never a timestamp, because records that share the
+cutoff second, arrive late or arrive out of order fall through a time comparison
+silently. It appends to the ledger and flushes before it advances the watermark, so a
+crash re-reads rather than skips, and duplicates are removed by identity. A source
+shorter than its recorded offset is reported as a gap with the source named, never
+repaired by resetting the offset to zero. The table above states that no gap occurred
+in the consumed span.
+
+```latex
+\begin{figure*}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  % the accumulating record
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit={(0,0.2) (10.25,4.6)}] (source) {};
+  \end{scope}
+  \node[vibeylanelabel] at (source.north west) {an append-only source, read by position};
+  \foreach \i/\x/\c in {0/0.45/vibeyblue!18, 1/1.65/vibeyblue!18, 2/2.85/vibeyblue!18, 3/4.05/vibeyblue!18, 4/5.25/vibeyblue!18, 5/6.45/vibeygold!35, 6/7.65/vibeygold!35, 7/8.85/white}
+    {\draw[draw=vibeyblue!60,fill=\c,rounded corners=1.5pt,line width=.5pt] (\x,1.75) rectangle (\x+1.15,2.45);}
+  \node[font=\sffamily\tiny,text=vibeyink] at (1.025,2.1) {rec 1};
+  \node[font=\sffamily\tiny,text=vibeyink] at (2.225,2.1) {rec 2};
+  \node[font=\sffamily\tiny,text=vibeyink] at (3.425,2.1) {rec 3};
+  \node[font=\sffamily\tiny,text=vibeyink] at (4.625,2.1) {rec 4};
+  \node[font=\sffamily\tiny,text=vibeyink] at (5.825,2.1) {rec 5};
+  \node[font=\sffamily\tiny,text=vibeyink,align=center] at (7.025,2.1) {rec 6\\late};
+  \node[font=\sffamily\tiny,text=vibeyink,align=center] at (8.225,2.1) {rec 7\\same tick};
+  \node[font=\sffamily\tiny,text=vibeygray,align=center] at (9.425,2.1) {next\\write};
+  \node[vibeynote,anchor=north] at (0.45,1.7) {offset 0};
+  \node[vibeynote,anchor=north east] at (6.4,1.7) {offset 13,245};
+  % the position watermark
+  \draw[vibeyflow,-] (6.45,1.35) -- (6.45,3.15);
+  \node[vibeytag,fill=vibeyblue,anchor=south] at (6.45,3.2) {watermark = byte offset};
+  \node[vibeynote,text=vibeyblue,anchor=north,align=center] at (3.4,1.35) {everything before the offset\\is in the ledger, by identity};
+  % the timestamp cutoff, which loses records
+  \draw[vibeyback,-] (7.65,0.55) -- (7.65,2.75);
+  \node[vibeycallout,anchor=west,align=left] at (7.75,1.0) {a timestamp cutoff drawn here\\would skip the late record and\\the one that shares its second};
+  \node[vibeynote,anchor=west,align=left] at (0.35,3.95) {records arrive late, out of order, or in the cutoff's own second;\\a clock cannot tell which of them it has already seen};
+  % the loop
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit={(10.7,0.2) (17.3,4.6)}] (loop) {};
+  \end{scope}
+  \node[vibeylanelabel] at (loop.north west) {order of operations, the whole guarantee};
+  \node[vibeybox,minimum width=2.6cm] (s1) at (12.35,3.55) {1. read the watermark};
+  \node[vibeybox,minimum width=2.6cm] (s2) at (15.65,3.55) {2. read from that offset};
+  \node[vibeybox,minimum width=2.6cm] (s3) at (15.65,2.2) {3. append to the ledger\\and flush};
+  \node[vibeycore,minimum width=2.6cm] (s4) at (12.35,2.2) {4. only then advance\\the watermark};
+  \draw[vibeyarrow] (s1) -- (s2);
+  \draw[vibeyarrow] (s2) -- (s3);
+  \draw[vibeyarrow] (s3) -- (s4);
+  \draw[vibeyarrow] (s4.north) -- (s1.south);
+  \node[vibeygood,minimum width=6.0cm,font=\sffamily\tiny] at (14.0,0.95) {crash before step 4: read again, never skip; duplicates dropped by identity\\source shorter than its offset: a reported gap, the offset left unmoved};
+\end{tikzpicture}
+\caption{The unbroken read. A job that consumes a growing record remembers its place as a position in the data, not as a time on a clock, so late and out-of-order records are never skipped. It writes what it read into the ledger before moving its bookmark, so a crash means reading again, never losing anything.}
+\label{fig:evidence-watermark}
+\end{figure*}
+```
+<!-- BEGIN GENERATED figure:storm-lanes rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\begin{scope}[on background layer]
+\draw[vibeyline] (0.00,-8.95) -- (0.00,0.25) node[vibeynote,anchor=south] {0}; \draw[vibeyline] (2.08,-8.95) -- (2.08,0.25) node[vibeynote,anchor=south] {40}; \draw[vibeyline] (4.16,-8.95) -- (4.16,0.25) node[vibeynote,anchor=south] {80}; \draw[vibeyline] (6.24,-8.95) -- (6.24,0.25) node[vibeynote,anchor=south] {120}; \draw[vibeyline] (8.32,-8.95) -- (8.32,0.25) node[vibeynote,anchor=south] {160};
+\end{scope}
+\node[vibeyhead,anchor=south east] at (-0.15,0.55) {lane};
+\node[vibeyhead,anchor=south] at (4.47,0.55) {turns spent, attempt after attempt};
+\node[vibeyhead,anchor=south west] at (9.04,0.55) {issue \; outcome \; turns};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-0.11) rectangle (1.46,0.11);
+\fill[vibeyred!55,rounded corners=1pt] (1.50,-0.11) rectangle (3.58,0.11);
+\fill[vibeyred!55,rounded corners=1pt] (3.62,-0.11) rectangle (4.60,0.11);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,0.00) {engines-pool};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (4.69,0.00) {\#321 \textcolor{vibeyred}{\ding{55}} 87};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-0.41) rectangle (2.08,-0.19);
+\fill[vibeyred!55,rounded corners=1pt] (2.12,-0.41) rectangle (4.20,-0.19);
+\fill[vibeyred!55,rounded corners=1pt] (4.24,-0.41) rectangle (6.32,-0.19);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-0.30) {surfaces-env};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (6.41,-0.30) {\#323 \textcolor{vibeyred}{\ding{55}} 120};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-0.71) rectangle (2.08,-0.49);
+\fill[vibeygreen!80,rounded corners=1pt] (2.12,-0.71) rectangle (3.89,-0.49);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-0.60) {visual-design-provider};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (3.98,-0.60) {\#324 \textcolor{vibeygreen}{\ding{51}} 74};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-1.01) rectangle (3.12,-0.79);
+\fill[vibeyred!55,rounded corners=1pt] (3.16,-1.01) rectangle (6.28,-0.79);
+\fill[vibeygreen!80,rounded corners=1pt] (6.32,-1.01) rectangle (7.57,-0.79);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-0.90) {chart-operator-forgejo-p1};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (7.66,-0.90) {\#326 \textcolor{vibeygreen}{\ding{51}} 144};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-1.31) rectangle (1.35,-1.09);
+\fill[vibeyred!55,rounded corners=1pt] (1.39,-1.31) rectangle (4.51,-1.09);
+\fill[vibeyred!55,rounded corners=1pt] (4.55,-1.31) rectangle (6.68,-1.09);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-1.20) {rmq-r01-queue-config};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (6.77,-1.20) {\#348 \textcolor{vibeyred}{\ding{55}} 127};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-1.61) rectangle (0.83,-1.39);
+\fill[vibeygreen!80,rounded corners=1pt] (0.87,-1.61) rectangle (2.90,-1.39);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-1.50) {rmq-r02-wakeup-composition};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (2.99,-1.50) {\#349 \textcolor{vibeygreen}{\ding{51}} 55};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-1.91) rectangle (2.08,-1.69);
+\fill[vibeyred!55,rounded corners=1pt] (2.12,-1.91) rectangle (3.26,-1.69);
+\fill[vibeygreen!80,rounded corners=1pt] (3.30,-1.91) rectangle (4.14,-1.69);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-1.80) {rmq-r03-amqp-dependency};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (4.23,-1.80) {\#350 \textcolor{vibeygreen}{\ding{51}} 78};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-2.21) rectangle (2.24,-1.99);
+\fill[vibeyred!55,rounded corners=1pt] (2.28,-2.21) rectangle (4.30,-1.99);
+\fill[vibeyred!55,rounded corners=1pt] (4.34,-2.21) rectangle (7.46,-1.99);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-2.10) {rmq-r06-job-dispatch-envelope};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (7.55,-2.10) {\#353 \textcolor{vibeyred}{\ding{55}} 142};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-2.51) rectangle (3.12,-2.29);
+\fill[vibeyred!55,rounded corners=1pt] (3.16,-2.51) rectangle (4.77,-2.29);
+\fill[vibeyred!55,rounded corners=1pt] (4.81,-2.51) rectangle (5.07,-2.29);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-2.40) {rmq-r08-dispatch-migration};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (5.16,-2.40) {\#355 \textcolor{vibeyred}{\ding{55}} 96};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-2.81) rectangle (3.12,-2.59);
+\fill[vibeyred!55,rounded corners=1pt] (3.16,-2.81) rectangle (5.71,-2.59);
+\fill[vibeygreen!80,rounded corners=1pt] (5.75,-2.81) rectangle (7.15,-2.59);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-2.70) {fakes-harness-decouple};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (7.24,-2.70) {\#400 \textcolor{vibeygreen}{\ding{51}} 136};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-3.11) rectangle (3.12,-2.89);
+\fill[vibeyred!55,rounded corners=1pt] (3.16,-3.11) rectangle (5.86,-2.89);
+\fill[vibeyred!55,rounded corners=1pt] (5.90,-3.11) rectangle (9.02,-2.89);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-3.00) {split-367-1-run-dir};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (9.11,-3.00) {\#421 \textcolor{vibeyred}{\ding{55}} 172};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-3.41) rectangle (1.77,-3.19);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-3.30) {orm-bootstrap-async-engine};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (1.86,-3.30) {\#434 \textcolor{vibeygreen}{\ding{51}} 34};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-3.71) rectangle (1.14,-3.49);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-3.60) {harness-T01-test-run-key};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (1.23,-3.60) {\#444 \textcolor{vibeygreen}{\ding{51}} 22};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-4.01) rectangle (2.39,-3.79);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-3.90) {installer-catalogue};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (2.48,-3.90) {\#469 \textcolor{vibeygreen}{\ding{51}} 46};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-4.31) rectangle (0.68,-4.09);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-4.20) {harness-T20a-qwenloop-shell-timeout-config};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (0.77,-4.20) {\#472 \textcolor{vibeygreen}{\ding{51}} 13};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-4.61) rectangle (0.16,-4.39);
+\fill[vibeyred!55,rounded corners=1pt] (0.20,-4.61) rectangle (0.40,-4.39);
+\fill[vibeygreen!80,rounded corners=1pt] (0.44,-4.61) rectangle (2.32,-4.39);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-4.50) {harness-T20c-qwenloop-shell-timeout-sandbox};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (2.41,-4.50) {\#474 \textcolor{vibeygreen}{\ding{51}} 43};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-4.91) rectangle (2.39,-4.69);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-4.80) {gap-agent-tree-parity};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (2.48,-4.80) {\#492 \textcolor{vibeygreen}{\ding{51}} 46};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-5.21) rectangle (3.02,-4.99);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-5.10) {gap-aws-secrets};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (3.11,-5.10) {\#493 \textcolor{vibeygreen}{\ding{51}} 58};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-5.51) rectangle (1.40,-5.29);
+\fill[vibeyred!55,rounded corners=1pt] (1.44,-5.51) rectangle (4.56,-5.29);
+\fill[vibeyred!55,rounded corners=1pt] (4.60,-5.51) rectangle (7.72,-5.29);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-5.40) {gap-cdd-build-trajectory};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (7.81,-5.40) {\#497 \textcolor{vibeyred}{\ding{55}} 147};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-5.81) rectangle (3.12,-5.59);
+\fill[vibeyred!55,rounded corners=1pt] (3.16,-5.81) rectangle (3.84,-5.59);
+\fill[vibeyred!55,rounded corners=1pt] (3.88,-5.81) rectangle (5.38,-5.59);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-5.70) {gap-cdd-distance};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (5.47,-5.70) {\#498 \textcolor{vibeyred}{\ding{55}} 102};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-6.11) rectangle (2.13,-5.89);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-6.00) {gap-chain-dispatch};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (2.22,-6.00) {\#499 \textcolor{vibeygreen}{\ding{51}} 41};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-6.41) rectangle (0.16,-6.19);
+\fill[vibeyred!55,rounded corners=1pt] (0.20,-6.41) rectangle (1.50,-6.19);
+\fill[vibeyred!55,rounded corners=1pt] (1.54,-6.41) rectangle (4.66,-6.19);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-6.30) {gap-ci-arch-gates};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (4.75,-6.30) {\#500 \textcolor{vibeyred}{\ding{55}} 88};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-6.71) rectangle (1.30,-6.49);
+\fill[vibeyred!55,rounded corners=1pt] (1.34,-6.71) rectangle (2.90,-6.49);
+\fill[vibeygreen!80,rounded corners=1pt] (2.94,-6.71) rectangle (4.45,-6.49);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-6.60) {gap-ci-installer-smoke};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (4.54,-6.60) {\#501 \textcolor{vibeygreen}{\ding{51}} 84};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-7.01) rectangle (0.36,-6.79);
+\fill[vibeyred!55,rounded corners=1pt] (0.40,-7.01) rectangle (3.52,-6.79);
+\fill[vibeyred!55,rounded corners=1pt] (3.56,-7.01) rectangle (6.68,-6.79);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-6.90) {gap-ci-macos-gates};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (6.77,-6.90) {\#502 \textcolor{vibeyred}{\ding{55}} 127};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-7.31) rectangle (1.40,-7.09);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-7.20) {gap-ci-os-required-checks};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (1.49,-7.20) {\#503 \textcolor{vibeygreen}{\ding{51}} 27};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-7.61) rectangle (3.12,-7.39);
+\fill[vibeyred!55,rounded corners=1pt] (3.16,-7.61) rectangle (6.28,-7.39);
+\fill[vibeyred!55,rounded corners=1pt] (6.32,-7.61) rectangle (7.15,-7.39);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-7.50) {gap-ci-tenants-arch-macos-1};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (7.24,-7.50) {\#504 \textcolor{vibeyred}{\ding{55}} 136};
+\fill[vibeygreen!80,rounded corners=1pt] (0.00,-7.91) rectangle (2.13,-7.69);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-7.80) {orm-tables};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (2.22,-7.80) {\#549 \textcolor{vibeygreen}{\ding{51}} 41};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-8.21) rectangle (1.30,-7.99);
+\fill[vibeyred!55,rounded corners=1pt] (1.34,-8.21) rectangle (2.80,-7.99);
+\fill[vibeygreen!80,rounded corners=1pt] (2.84,-8.21) rectangle (4.50,-7.99);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-8.10) {loops-residency-policy};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (4.59,-8.10) {\#556 \textcolor{vibeygreen}{\ding{51}} 85};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-8.51) rectangle (3.12,-8.29);
+\fill[vibeyred!55,rounded corners=1pt] (3.16,-8.51) rectangle (5.34,-8.29);
+\fill[vibeyred!55,rounded corners=1pt] (5.38,-8.51) rectangle (8.50,-8.29);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-8.40) {split-351-1-amqp-contract};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (8.59,-8.40) {\#561 \textcolor{vibeyred}{\ding{55}} 162};
+\fill[vibeyred!55,rounded corners=1pt] (0.00,-8.81) rectangle (0.21,-8.59);
+\fill[vibeyred!55,rounded corners=1pt] (0.25,-8.81) rectangle (1.76,-8.59);
+\fill[vibeyred!55,rounded corners=1pt] (1.80,-8.81) rectangle (3.88,-8.59);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.15,-8.70) {split-332-1-transport-seams};
+\node[font=\sffamily\tiny,anchor=west,text=vibeygray] at (3.97,-8.70) {\#1001 \textcolor{vibeyred}{\ding{55}} 73};
+\node[vibeynote,anchor=north west,align=left] at (-4.0,-9.20)
+  {\textcolor{vibeygreen!80}{$\blacksquare$} attempt completed \quad \textcolor{vibeyred!55}{$\blacksquare$} attempt failed \quad
+   30 lanes, 70 attempts, 2,606 turns; 17 lanes claimed completion,
+   12 were integrated and 14 abandoned by the reviewer};
+\end{tikzpicture}
+\caption{Every lane of the QwenStorm 3.0.0 evidence ledger, one row per lane in issue order. Each bar is one attempt, its length the turns the local model spent, green where the attempt ended in a completion claim and red where it failed; a lane gets at most three. Of 30 lanes, 17 claimed completion, and a claim is not delivery: the reviewer integrated 12 and abandoned 14 over the same span. Read from the ledger between 2026-09-23T04:40:49Z and 2026-09-24T00:24:17Z with no gaps.}
+\label{fig:storm-lanes}
+\end{figure*}
+```
+<!-- END GENERATED figure:storm-lanes -->
+
+Because a single local model instance served every lane in turn, attempts never
+overlapped in time. The timeline in [Fig. 24](#fig:storm-timeline) shows the lanes as
+the progress log recorded them; the bars never overlap, and the blank stretches between
+them are the reviewer's and the operator's time, not the machine's.
+
+<!-- BEGIN GENERATED figure:storm-timeline rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\begin{scope}[on background layer]
+\draw[vibeyline] (1.04,-9.56) -- (1.04,0.2) node[vibeynote,anchor=south] {14:00};
+\draw[vibeyline] (2.12,-9.56) -- (2.12,0.2) node[vibeynote,anchor=south] {16:00};
+\draw[vibeyline] (3.19,-9.56) -- (3.19,0.2) node[vibeynote,anchor=south] {18:00};
+\draw[vibeyline] (4.26,-9.56) -- (4.26,0.2) node[vibeynote,anchor=south] {20:00};
+\draw[vibeyline] (5.33,-9.56) -- (5.33,0.2) node[vibeynote,anchor=south] {22:00};
+\draw[vibeyline] (6.41,-9.56) -- (6.41,0.2) node[vibeynote,anchor=south] {00:00};
+\draw[vibeyline] (7.48,-9.56) -- (7.48,0.2) node[vibeynote,anchor=south] {02:00};
+\draw[vibeyline] (8.55,-9.56) -- (8.55,0.2) node[vibeynote,anchor=south] {04:00};
+\draw[vibeyline] (9.62,-9.56) -- (9.62,0.2) node[vibeynote,anchor=south] {06:00};
+\draw[vibeyline] (10.69,-9.56) -- (10.69,0.2) node[vibeynote,anchor=south] {08:00};
+\draw[vibeyline] (11.77,-9.56) -- (11.77,0.2) node[vibeynote,anchor=south] {10:00};
+\draw[vibeydashed] (6.41,-9.66) -- (6.41,0.17);\node[vibeynote,anchor=south,text=vibeygray] at (6.41,0.46) {2026-09-23 UTC};
+\end{scope}
+\fill[vibeyblue!80,rounded corners=1pt] (0.00,-0.09) rectangle (0.62,0.09);
+\fill[vibeyblue!80,rounded corners=1pt] (0.94,-0.33) rectangle (1.00,-0.15);
+\fill[vibeyblue!80,rounded corners=1pt] (0.95,-0.33) rectangle (1.01,-0.15);
+\fill[vibeyblue!80,rounded corners=1pt] (1.01,-0.57) rectangle (1.12,-0.39);
+\fill[vibeyblue!80,rounded corners=1pt] (1.19,-0.81) rectangle (1.27,-0.63);
+\fill[vibeyblue!80,rounded corners=1pt] (1.44,-1.05) rectangle (1.51,-0.87);
+\fill[vibeyblue!80,rounded corners=1pt] (1.56,-1.29) rectangle (1.62,-1.11);
+\fill[vibeyblue!80,rounded corners=1pt] (1.70,-1.53) rectangle (1.77,-1.35);
+\fill[vibeyblue!80,rounded corners=1pt] (1.79,-1.77) rectangle (1.85,-1.59);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (5.39,-0.09) rectangle (5.51,0.09);
+\fill[vibeyblue!80,rounded corners=1pt] (5.40,-2.01) rectangle (5.51,-1.83);
+\fill[vibeyblue!80,rounded corners=1pt] (5.51,-2.25) rectangle (5.57,-2.07);
+\fill[vibeyblue!80,rounded corners=1pt] (5.54,-2.49) rectangle (5.65,-2.31);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (5.65,-2.25) rectangle (5.77,-2.07);
+\fill[vibeyblue!80,rounded corners=1pt] (6.04,-2.73) rectangle (6.13,-2.55);
+\fill[vibeyblue!80,rounded corners=1pt] (6.13,-2.97) rectangle (6.23,-2.79);
+\fill[vibeyblue!80,rounded corners=1pt] (6.23,-3.21) rectangle (6.29,-3.03);
+\fill[vibeyblue!80,rounded corners=1pt] (6.29,-3.45) rectangle (6.39,-3.27);
+\fill[vibeyblue!80,rounded corners=1pt] (6.39,-3.69) rectangle (6.59,-3.51);
+\fill[vibeyblue!80,rounded corners=1pt] (6.59,-3.93) rectangle (6.69,-3.75);
+\fill[vibeyblue!80,rounded corners=1pt] (6.69,-3.69) rectangle (6.85,-3.51);
+\fill[vibeyblue!80,rounded corners=1pt] (6.85,-4.17) rectangle (6.91,-3.99);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (6.89,-4.41) rectangle (7.01,-4.23);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (7.23,-4.65) rectangle (7.35,-4.47);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (7.33,-4.65) rectangle (7.45,-4.47);
+\fill[vibeyblue!80,rounded corners=1pt] (7.34,-4.65) rectangle (7.46,-4.47);
+\fill[vibeyblue!80,rounded corners=1pt] (7.46,-4.89) rectangle (7.53,-4.71);
+\fill[vibeyblue!80,rounded corners=1pt] (7.53,-5.13) rectangle (7.85,-4.95);
+\fill[vibeyblue!80,rounded corners=1pt] (7.85,-5.37) rectangle (8.18,-5.19);
+\fill[vibeyblue!80,rounded corners=1pt] (8.18,-5.61) rectangle (8.34,-5.43);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (8.34,-5.85) rectangle (8.46,-5.67);
+\fill[vibeyblue!80,rounded corners=1pt] (8.88,-6.09) rectangle (9.21,-5.91);
+\fill[vibeyblue!80,rounded corners=1pt] (9.21,-2.97) rectangle (9.34,-2.79);
+\fill[vibeyblue!80,rounded corners=1pt] (9.34,-5.85) rectangle (9.63,-5.67);
+\fill[vibeyblue!80,rounded corners=1pt] (9.63,-6.33) rectangle (9.69,-6.15);
+\fill[vibeyblue!80,rounded corners=1pt] (9.66,-6.57) rectangle (9.72,-6.39);
+\fill[vibeyblue!80,rounded corners=1pt] (9.71,-6.81) rectangle (9.85,-6.63);
+\fill[vibeyblue!80,rounded corners=1pt] (9.85,-7.05) rectangle (9.97,-6.87);
+\fill[vibeyblue!80,rounded corners=1pt] (9.97,-7.29) rectangle (10.07,-7.11);
+\fill[vibeyblue!80,rounded corners=1pt] (10.07,-7.53) rectangle (10.28,-7.35);
+\fill[vibeyblue!80,rounded corners=1pt] (10.28,-7.77) rectangle (10.50,-7.59);
+\fill[vibeyblue!80,rounded corners=1pt] (10.50,-8.01) rectangle (10.60,-7.83);
+\fill[vibeyblue!80,rounded corners=1pt] (10.60,-8.25) rectangle (10.79,-8.07);
+\fill[vibeyblue!80,rounded corners=1pt] (10.79,-8.49) rectangle (10.98,-8.31);
+\fill[vibeyblue!80,rounded corners=1pt] (10.98,-8.73) rectangle (11.21,-8.55);
+\fill[vibeyblue!80,rounded corners=1pt] (11.21,-8.97) rectangle (11.27,-8.79);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (11.25,-9.21) rectangle (11.37,-9.03);
+\fill[vibeyblue!80,rounded corners=1pt] (12.22,-9.21) rectangle (12.40,-9.03);
+\filldraw[fill=vibeysilver,draw=white,line width=.4pt] (12.40,-9.45) rectangle (12.52,-9.27);
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,0.00) {engines-provider};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-0.24) {qwenloop-edit-tool};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-0.48) {qwenloop-request-timeout};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-0.72) {qwenloop-run-telemetry};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-0.96) {qwenloop-toolcall-retry};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-1.20) {default-model-p1};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-1.44) {default-model-p2};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-1.68) {default-model-p3};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-1.92) {surfaces-env};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-2.16) {engines-pool};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-2.40) {visual-design-provider};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-2.64) {forge-0a};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-2.88) {rmq-r01-queue-config};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-3.12) {rmq-r02-wakeup-composition};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-3.36) {rmq-r03-amqp-dependency};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-3.60) {installer-catalogue};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-3.84) {split-332-1-transport-seams};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-4.08) {orm-bootstrap-async-engine};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-4.32) {rmq-r06-job-dispatch-envelope};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-4.56) {rmq-r08-dispatch-migration};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-4.80) {orm-tables};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-5.04) {fakes-harness-decouple};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-5.28) {split-351-1-amqp-contract};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-5.52) {loops-residency-policy};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-5.76) {split-367-1-run-dir};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-6.00) {chart-operator-forgejo-p1};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-6.24) {harness-T20a-qwenloop-shell-timeout-config};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-6.48) {harness-T20c-qwenloop-shell-timeout-sandbox};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-6.72) {harness-T01-test-run-key};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-6.96) {gap-agent-tree-parity};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-7.20) {gap-aws-secrets};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-7.44) {gap-cdd-build-trajectory};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-7.68) {gap-cdd-distance};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-7.92) {gap-chain-dispatch};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-8.16) {gap-ci-arch-gates};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-8.40) {gap-ci-installer-smoke};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-8.64) {gap-ci-macos-gates};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-8.88) {gap-ci-os-required-checks};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-9.12) {gap-ci-tenants-arch-macos-1};
+\node[font=\sffamily\tiny,anchor=east,text=vibeyink] at (-0.12,-9.36) {gap-ci-tenants-arch-macos-2};
+\node[vibeynote,anchor=north west,align=left] at (0,-9.91)
+  {\textcolor{vibeyblue!80}{$\blacksquare$} one bar per logged start--end pair \quad \textcolor{vibeysilver}{$\blacksquare$} a start with no logged end \quad
+   time in UTC from 2026-09-22 12:03; a lane started twice is drawn twice};
+\end{tikzpicture}
+\caption{Lane starts and ends as the storm's progress log recorded them, over 23.1 hours from 2026-09-22 12:03 UTC. One local model served every lane in turn, one instance per model; the bars therefore never overlap in time, and the blank stretches are the reviewer's and the operator's, not the machine's.}
+\label{fig:storm-timeline}
+\end{figure*}
+```
+<!-- END GENERATED figure:storm-timeline -->
+
+### The storm throughput audit
+
+The operator wanted far more concurrent lanes. An audit on 2026-09-23 asked first why
+the storm could not simply run more, what would raise the yield of the lanes it
+already ran, and which safety controls had to hold before any scale-up. Its record is
+the page *QwenStorm throughput audit* (audit run of 2026-09-23, status updated
+2026-09-24 11:10Z), kept outside the repository; its inputs were the lane run logs
+(`lanes/*/.qwenloop/runs/*/events.jsonl`), the storm's progress log, the model server's
+log and the forge, at `develop` revision `b2f5b267`. The run logs and progress log were
+local operational files, never tracked, and a reboot of the host later on 2026-09-24
+erased them (see the governance account below). Every figure below is the audit's
+unless we say we recomputed it.
+
+**One model slot binds.** Across the 82 run directories on disk, 2,985 model turns were
+recorded, and model calls took 9.68 of the 10.01 hours those runs spanned, 96.7%; tool
+execution and harness overhead were the other 3.3%. The progress log held 41 closed
+lane intervals, and not one overlaps another. We recomputed these figures from the
+local files on 2026-09-24, before the reboot, and they agree. Three things serialised
+the storm, and they stack: the queue script waited for any running lane anywhere on
+the host, sub-doctrine 8.c gives a model on the operator's own hardware one run at a
+time, and the server was configured with one slot. Amdahl's law then bounds what more
+lanes sharing that slot could buy: with 3.3% of lane time outside the model, the
+speed-up is at most $1/0.967 \approx 1.03$. Interleaving lanes would also evict each
+other's cached prompt prefix; the audit put the cost at about 80 s of re-read per
+switch at the median turn of 22,500 tokens. Whether a *second slot* helps is a
+different question, which the calibration below measures. These populations are not
+the evidence ledger's (30 lanes, 70 attempts, 2,606 turns), which consumes the progress
+log and lane results from 2026-09-23T04:40:49Z onward; the audit counts every run
+directory then on disk, and the runs of nine earlier lanes had been deleted and are in
+neither. We report both and reconcile neither to the other.
+
+**Conversion.** The progress log showed 40 lanes started, which we recomputed. Of
+those, 13 had work on `develop` at the audit, 3 of them (#1044, #1053, #1054) through
+the automated path, in which the runner completes and the publish step opens the pull
+request. None reached `develop` with no human step: none of the last 60 merged pull
+requests had a successful required review gate, and the merge train logged *merged 0*
+on every pass, so every merge was made by hand. Ten lanes needed a hand-built pull
+request, eight of them in a single one (#396) that repaired or hand-wrote them where
+the local model fell short. At the runner level, 18 of the 82 runs completed. The
+audit's projection is the point: more lanes multiply this conversion rate and do not
+get around it, and the hand repair it implies is capacity nothing records.
+
+**Declared, not enforced.** Seven controls existed in configuration or documentation
+and were read by nothing, or bound only in a mode not in use: the delegated approver's
+author list (with both gates green, the approver would have readied a stranger's pull
+request); the merge train's trusted authors, which held a stranger's pull request only
+when pull-request automation was off, and it was on; 31 forbidden paths, of which a
+lane could touch up to 19, among them the workflow directory, the canon and the merge
+train itself; the issue text a lane's prompt carried, whose author was never fetched
+and which was followed directly by trusted instructions with no separator; a merge
+fallback that retried with `--admin`, unattended, contrary to 12.d; an environment
+switch for unattended approval that nothing read; and an approver agent that nothing
+called. None was exploited: every one of the 594 queued issues was the operator's. All
+seven were enforced by merged code on 2026-09-24 (#1078, #1079, #1083), with the yield
+fixes the audit ranked beside them: a retry on an empty model reply, the end of 27 of 60
+failed runs (#1077); a lane's commands run in the lane's own environment, after 18 runs
+in 12 lanes had tested the wrong tree (#1080); a per-lane time limit and stall
+watchdog, after one 93-minute stall with no terminal event (#1081); real `search`,
+`find` and `open_file` tools, after 446 calls to tools that did not exist, about 11% of
+model time (#1082); and instruments that report what they measured (#1084). The storm
+had not run since, so at the cutoff the effect of these fixes on yield is unmeasured.
+One control was not settled: the repository's rulesets carry a bypass actor nobody
+declared, and 78 of the last 200 merges went in while the forge reported a review
+still required; who made them, and how, needs the organisation's audit log.
+
+**Most of the audit's first claims were wrong.** Twenty-five agents audited six
+dimensions, and adversarial verifiers then checked the leading claims before anything
+was written up. They refuted 16 of 18. Some corrections were of degree: 29 of 64
+failed runs ending on an empty reply became 27 of 60; 45 calls to nonexistent tools
+became 446; 3.75 lanes an hour from the model alone became 3.20 from the runs on disk.
+Some were of kind: the claimed serialisation point was the wrong line of the queue
+script; a single slot said to be removable with hardware is serialised by code, canon
+and configuration together; a reaper said to abandon lanes without their gates does
+not; and the account of #1090 as a silently truncated prompt was wrong, as the
+exact-head section records. We report this as a finding about method, not a footnote.
+A first pass by capable agents over complete logs was wrong more often than right on
+its headline numbers, and it was the verification step, not the analysis, that made
+the audit usable. It applies to this paper too. The host-benchmark paragraph below
+once reported that the 64k window *generated 16% faster*, and the audit's verifiers
+found decode speed varying from 26 to 34 tokens per second within one allocation, so
+that difference is inside the noise and is no longer claimed.
+
+### Host hardware benchmarks and context headroom
+
+On 2026-09-22 the storm was paused and the same ten-turn session was replayed against
+five server configurations on the one 24 GB host, with the results kept as a tracked
+file (`docs/plans/qwenstorm-3.0.0/bench/results.jsonl`). Four configurations served
+Qwen2.5-Coder-14B through llama.cpp with different slot counts, cache types and
+context windows; the fifth served `gpt-oss:20b` through Ollama.
+
+The record shows two things ([Fig. 25](#fig:bench-hosts)). For every llama.cpp
+configuration, generation speed fell as the context grew across the session, from
+about 11 tokens per second on the first turn to between 6 and 9 on the tenth, and the
+four configurations finished the session within 212 to 221 s of each other's wall
+time. The Ollama configuration finished the same session in 86 s, and the same
+`gpt-oss:20b` model served by llama.cpp at a 64k context did not load at all. The
+record does not separate the model from the serving stack, so the difference is
+reported and not explained.
+
+<!-- BEGIN GENERATED figure:bench-hosts rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.8cm},vibeyaxis,width=8.6cm,height=4.8cm,
+  xmin=0.5,xmax=10.5,xtick={1,...,10},xlabel={turn of a ten-turn session}]
+\nextgroupplot[title={a. Generation speed as the context grows},ylabel={tokens / s},ymin=0]
+\addplot[vibeyblue,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.2) (2,9.8) (3,9.3) (4,9.6) (5,9.4) (6,9.5) (7,7.6) (8,9.0) (9,8.8) (10,8.4)};
+\addplot[vibeyteal,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.2) (2,10.5) (3,10.0) (4,8.8) (5,9.4) (6,9.1) (7,8.0) (8,7.7) (9,6.9) (10,6.2)};
+\addplot[vibeygold,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.1) (2,10.8) (3,9.9) (4,9.4) (5,8.7) (6,8.1) (7,7.4) (8,7.5) (9,8.5) (10,7.9)};
+\addplot[vibeyviolet,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.3) (2,10.4) (3,10.3) (4,10.1) (5,9.8) (6,8.0) (7,9.2) (8,8.3) (9,7.5) (10,8.5)};
+\nextgroupplot[title={b. Wall time per turn},ylabel={seconds},ymin=0,legend to name=bench-hosts-legend,legend columns=-1,
+  legend style={/tikz/every even column/.append style={column sep=6pt}}]
+\addplot[vibeyblue,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.44) (2,17.22) (3,18.32) (4,19.09) (5,22.51) (6,23.45) (7,26.94) (8,23.22) (9,25.76) (10,27.07)};
+\addlegendentry{A-baseline (215\,s)}
+\addplot[vibeyteal,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.63) (2,15.81) (3,17.54) (4,19.0) (5,20.66) (6,23.4) (7,26.1) (8,24.77) (9,29.29) (10,32.29)};
+\addlegendentry{B-1slot-q8-48k (220\,s)}
+\addplot[vibeygold,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.65) (2,15.3) (3,17.47) (4,18.63) (5,21.39) (6,25.27) (7,26.71) (8,25.26) (9,26.03) (10,27.83)};
+\addlegendentry{C-1slot-q8-48k-draft (216\,s)}
+\addplot[vibeyviolet,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,11.41) (2,16.36) (3,17.7) (4,18.06) (5,20.31) (6,25.87) (7,24.37) (8,23.61) (9,27.42) (10,27.09)};
+\addlegendentry{D-1slot-f16-32k (212\,s)}
+\addplot[vibeyred,line width=.9pt,mark=*,mark size=1.1pt] coordinates {(1,8.89) (2,9.64) (3,8.46) (4,6.78) (5,8.43) (6,7.9) (7,8.44) (8,8.03) (9,10.48) (10,8.56)};
+\addlegendentry{E-gptoss-20b-ollama (86\,s)}
+\end{groupplot}
+\node[anchor=north,inner sep=0pt] (legend) at ($(group c1r1.south west)!0.5!(group c2r1.south east)+(0,-0.95cm)$)
+  {\pgfplotslegendfromname{bench-hosts-legend}};
+\node[vibeynote,anchor=north] at ([yshift=-0.08cm]legend.south) {in brackets, each configuration's whole-session wall time; E-gptoss-20b-64k: server exited during load, bench failed};
+\end{tikzpicture}
+\caption{The host benchmark of 2026-09-22: the same ten-turn session replayed against five server configurations on one 24\,GB machine. (a) Generation speed falls as the context fills for every llama.cpp configuration of Qwen2.5-Coder-14B, whatever the slot count or cache type. (b) The gpt-oss:20b model on Ollama completed the session in a fraction of the wall time; the same model served by llama.cpp at a 64k context failed to load at all. Every point is one row of the tracked results file.}
+\label{fig:bench-hosts}
+\end{figure*}
+```
+<!-- END GENERATED figure:bench-hosts -->
+
+The context window is where the host's memory was actually spent. On Apple Silicon a
+served model's weights and its key-value cache are wired memory, which no swap can
+reclaim, and the cache is reserved in proportion to the window: at a 131,072-token
+window the server wired 18.55 GB of the 24 GB, leaving the rest of the machine to
+thrash. The storm's own run ledgers record how much context 838 real turns used: a
+median of 20,070 tokens, a 99th percentile of 42,979 and a maximum of 49,118.
+[Fig. 26](#fig:host-context) sets those percentiles against the three windows
+considered. A 32k window would have truncated 71 turns; the 128k baseline was never
+reached by any turn; the 64k window chosen covers every recorded turn with a third
+again as headroom, and wires 1.3 GB less. In that one sweep it also generated 16%
+faster (32.5 against 28.0 tokens per second), but the throughput audit's verifiers found
+decode speed varying from 26 to 34 tokens per second within a single allocation, so the
+difference is inside the noise and we do not claim it. That is sub-doctrine 8.j, fitted
+to the iron: a setting moves against a number read from this host, and the number is
+recorded beside it.
+
+<!-- BEGIN GENERATED figure:host-context rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\shade[left color=vibeyblue!18,right color=vibeyblue!4] (0,-0.12) rectangle (7.0,0.12);
+\draw[vibeyink,line width=.6pt] (0,0) -- (7.0,0);
+\draw[vibeyink] (0.00,0) -- (0.00,-0.08); \draw[vibeyink] (0.88,0) -- (0.88,-0.08); \draw[vibeyink] (1.75,0) -- (1.75,-0.08); \draw[vibeyink] (2.62,0) -- (2.62,-0.08); \draw[vibeyink] (3.50,0) -- (3.50,-0.08); \draw[vibeyink] (4.38,0) -- (4.38,-0.08); \draw[vibeyink] (5.25,0) -- (5.25,-0.08); \draw[vibeyink] (6.12,0) -- (6.12,-0.08); \draw[vibeyink] (7.00,0) -- (7.00,-0.08);
+\node[vibeynote,anchor=north] at (0,-0.1) {0};
+\node[vibeynote,anchor=north east] at (6.92,-0.1) {131,072 tokens};
+\draw[vibeyink,line width=.6pt] (1.07,0.12) -- (1.07,0.34) -- (0.35,0.62) node[vibeynote,anchor=south,text=vibeyink,inner sep=1.5pt] {p50\\20,070};
+\draw[vibeyink,line width=.6pt] (1.71,0.12) -- (1.71,0.34) -- (1.15,0.62) node[vibeynote,anchor=south,text=vibeyink,inner sep=1.5pt] {p90\\32,026};
+\draw[vibeyink,line width=.6pt] (1.97,0.12) -- (1.97,0.34) -- (1.95,0.62) node[vibeynote,anchor=south,text=vibeyink,inner sep=1.5pt] {p95\\36,816};
+\draw[vibeyink,line width=.6pt] (2.30,0.12) -- (2.30,0.34) -- (2.75,0.62) node[vibeynote,anchor=south,text=vibeyink,inner sep=1.5pt] {p99\\42,979};
+\draw[vibeyink,line width=.6pt] (2.62,0.12) -- (2.62,0.34) -- (3.55,0.62) node[vibeynote,anchor=south,text=vibeyink,inner sep=1.5pt] {max\\49,118};
+\draw[vibeyred,line width=.8pt,densely dashed] (1.75,-0.15) -- (1.75,-0.60) node[vibeynote,anchor=north,text=vibeyred,align=center] (window0) {32k: truncates 71 turns};
+\draw[vibeygreen,line width=.8pt,densely dashed] (3.50,-0.15) -- (3.50,-1.50) node[vibeynote,anchor=north,text=vibeygreen,align=center] (window1) {64k: chosen, 16,418 headroom};
+\node[vibeypill,shape=rectangle,rounded corners=4.5pt,anchor=north] (window1sweep0) at ([yshift=-1.5pt]window1.south) {B $\cdot$ f16 KV cache\\17.25\,GB wired, 32.5 tok/s};
+\node[vibeypill,shape=rectangle,rounded corners=4.5pt,anchor=north] (window1sweep1) at ([yshift=-1.5pt]window1sweep0.south) {C $\cdot$ q8\_0 (requested) KV cache\\17.24\,GB wired, 30.9 tok/s, inconclusive};
+\draw[vibeygray,line width=.8pt,densely dashed] (7.00,-0.15) -- (7.00,-0.60) node[vibeynote,anchor=north east,text=vibeygray,align=center] (window2) {128k: baseline, never reached};
+\node[vibeypill,shape=rectangle,rounded corners=4.5pt,anchor=north east] (window2sweep0) at ([yshift=-1.5pt]window2.south east) {A $\cdot$ f16 KV cache\\18.55\,GB wired, 28.0 tok/s};
+\node[vibeyhead,anchor=south west] at (0,1.25) {context actually used per turn, 838 storm turns};
+\end{tikzpicture}
+\caption{Fitting the model to the iron. The percentiles mark how much context 838 real storm turns used; the dashed lines are the three context windows considered. A 32k window would have truncated 71 turns, and the 128k baseline, never reached by any turn, wired 18.55\,GB of a 24\,GB machine. The 64k window chosen covers every recorded turn with a third again as headroom. Beneath each window, the sweep's configurations measured at it report what each setting cost and delivered.}
+\label{fig:host-context}
+\end{figure}
+```
+<!-- END GENERATED figure:host-context -->
+
+**How many runs at once, per device.** The audit left one question it could not answer:
+sub-doctrine 8.c holds a model on the operator's own hardware to one run at a time,
+while 8.j requires every setting, how many run at once among them, to be fitted to a
+number measured on the machine. On 2026-09-23 the operator ruled
+*measure, then decide*. On 2026-09-24 the ruling was extended, and it is the method we
+report here, not a result. Sweep $N = 1, 2, 3, \dots$ concurrent runs replaying real storm-depth
+turns, and measure throughput, latency, wired memory and fidelity at each $N$, to find
+the ideal $N$. Calibrate every device separately, keyed by a fingerprint of its
+hardware, memory, operating system, server version, model digest and context window.
+Where the evidence is missing or stale, fall back to $N = 1$, and recalibrate
+automatically. And amend 8.c to rule the method, not a number, ratified by the
+operator's merge like every sub-doctrine. The single slot the audit found binding is
+therefore not treated as a law of this host but as the default an unmeasured device
+gets.
+
+The sweep for the 24 GB host ran on 2026-09-24 from 15:11 to 15:42Z, before the cutoff
+(ADR-0058; evidence tracked as `docs/architecture/evidence/slots-2026-09-24-mac17-2.md` and
+`.json`). The device is an Apple M5 with 24 GiB under macOS 26.6.2, running ollama 0.34.4 with
+gpt-oss:20b at a 65,536-token context per run, fingerprint `f99b07f610204948`. Each step
+replayed 60 storm-shaped turns in 20 segments, drawn from 1,096 turns in 40 runs. At
+$N = 1$, run twice, the host completed 98.2 and 112.7 turns an hour, with a median turn of
+16.5 and 12.9 s, a 95th percentile of 112.6 and 102.8 s, and peak wired memory of 18.4 and
+18.1 GB. The two runs agreed with each other exactly (structural and exact fidelity 1.0
+over 55 turns). Their throughput differed by 14.8%, so a smaller difference between steps
+is noise, not a finding. At $N = 2$ the host completed 111.9 turns an hour, within that
+noise, while the median turn rose to 29.8 s, the 95th percentile to 189.9 s and peak wired
+memory to 20.2 GB. The replies at $N = 2$ matched the single run's structure in only 81.8% of
+turns (exact: 74.5%), below the 95% floor. That was the overshoot, and the sweep stopped
+there. The ideal for this device is therefore $N = 1$: a second concurrent run bought no
+throughput and cost fidelity. One step was recorded but not judged: at a 32,768-token
+context, two runs reached 172.7 turns an hour, with structural fidelity still only 88.9%.
+The evidence does not cover other models, context windows or devices, tool execution
+between turns, whole runs, thermals, or long-horizon stability. The amendment to 8.c that
+sets the method, not a number, was proposed for the operator's ratification (#1141) and
+was not ratified at the cutoff.
+
+### Field data
+
+The git history is field data: nothing in it was held fixed. At the pinned source
+revision, 1,515 commits are reachable across nine root histories, the absorbed histories
+of the family's packages. Since 2026-08-09, when the family's own development begins,
+1,503 commits landed on 38 active days, between 1 and 191 per day (median 31, mean 39.6,
+sample standard deviation 38.3). Commits landed in all 24 hours of the day in US
+Eastern time, with the fewest (25) in the 09:00 hour and the most (102) in the 18:00
+hour. The longest
+pause was nine days with no commit, from 2026-08-30 to 2026-09-09, and nothing in the
+repository records its cause. Seventeen `vibey` release tags point at commits dated
+between 2026-08-16 and 2026-09-21, and 683 commit subjects across the absorbed
+histories end in a pull-request reference.
+
+The daily rate's spread is 100% of its mean, against 24% in the controlled region.
+That is what the model predicts when the coordinates of $d$ vary freely, but it is
+also what almost any model would predict of an uncontrolled process, so the history
+does not test the regularity. We report it so that the controlled band is never
+mistaken for a field rate.
+
+The daily cadence and release events are tracked in [Fig. 27](#fig:commits-daily).
+
+<!-- BEGIN GENERATED figure:commits-daily rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[vibeyaxis,width=17.2cm,height=5.6cm,ybar,bar width=4.2pt,xmin=-0.7,xmax=50.7,ymin=0,ymax=231,
+  xtick={0,7,14,21,28,35,42,49},xticklabels={Aug 9,Aug 16,Aug 23,Aug 30,Sep 6,Sep 13,Sep 20,Sep 27},xlabel={day (2026, c78049b6 and earlier)},ylabel={commits}]
+\addplot[fill=vibeyblue,draw=none] coordinates {(0,5) (1,41) (3,21) (4,130) (5,27) (6,92) (7,47) (8,22) (9,39) (10,20) (11,52) (12,75) (13,13) (14,61) (15,1) (16,38) (17,3) (18,56) (19,29) (20,91) (21,71) (31,3) (32,13) (36,24) (37,61) (38,33) (39,16) (40,191) (41,7) (42,4) (43,8) (44,23) (45,37) (46,41) (47,34) (48,27) (49,45) (50,2)};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:7,53) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:7,56) {v0.1.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:11,58) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:11,61) {v0.1.1--v0.1.2};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:15,7) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:15,10) {v0.2.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:20,97) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:20,100) {v0.3.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:21,77) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:21,80) {v0.4.0--v0.5.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:36,30) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:36,33) {v0.6.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:37,67) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:37,70) {v0.7.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:38,39) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:38,42) {v0.8.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:40,197) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:40,200) {v1.0.0--v1.3.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:41,13) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:41,16) {v1.4.0--v1.5.0};
+\node[vibeyanchor,fill=vibeygold] at (axis cs:43,14) {};
+\node[font=\sffamily\tiny,text=vibeygold,rotate=60,anchor=south west,inner sep=1pt] at (axis cs:43,17) {v2.0.0};
+\draw[decorate,decoration={brace,amplitude=3pt},vibeygray] (axis cs:22,6) -- (axis cs:30,6);
+\node[vibeynote,anchor=south] at (axis cs:26.0,10) {9 days without a commit};
+\node[vibeycallout,anchor=east] at (axis cs:39.4,185) {191 on Sep 18};
+\node[vibeynote,anchor=north west,align=left] at (axis description cs:0.01,0.97) {\textcolor{vibeygold}{$\bullet$} vibey release tag};
+\end{axis}
+\end{tikzpicture}
+\caption{Commits per day since 2026-08-09, when the family's own development begins, read at revision c78049b6: 1,503 commits on 38 active days, with the busiest day at 191. Gold marks are the 17 \texttt{vibey} release tags in the window; the brace marks the longest pause.}
+\label{fig:commits-daily}
+\end{figure*}
+```
+<!-- END GENERATED figure:commits-daily -->
+
+The circadian rhythm, weekday distribution, and Conventional Commit types are captured in [Fig. 28](#fig:commit-rhythm).
+
+<!-- BEGIN GENERATED figure:commit-rhythm rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{scope}[xshift=-5.4cm]
+\draw[vibeyline] (0,0) circle (0.527); \draw[vibeyline] (0,0) circle (1.054); \draw[vibeyline] (0,0) circle (1.581);
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (90:1.138) arc[start angle=90,end angle=75,radius=1.138] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (75:1.075) arc[start angle=75,end angle=60,radius=1.075] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (60:1.750) arc[start angle=60,end angle=45,radius=1.750] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (45:1.180) arc[start angle=45,end angle=30,radius=1.180] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (30:1.750) arc[start angle=30,end angle=15,radius=1.750] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (15:0.822) arc[start angle=15,end angle=0,radius=0.822] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (0:0.949) arc[start angle=0,end angle=-15,radius=0.949] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-15:0.759) arc[start angle=-15,end angle=-30,radius=0.759] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-30:0.885) arc[start angle=-30,end angle=-45,radius=0.885] -- cycle;
+\fill[vibeyred!70,draw=white,line width=.4pt] (0,0) -- (-45:0.527) arc[start angle=-45,end angle=-60,radius=0.527] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-60:1.307) arc[start angle=-60,end angle=-75,radius=1.307] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-75:1.223) arc[start angle=-75,end angle=-90,radius=1.223] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-90:1.391) arc[start angle=-90,end angle=-105,radius=1.391] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-105:1.665) arc[start angle=-105,end angle=-120,radius=1.665] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-120:1.728) arc[start angle=-120,end angle=-135,radius=1.728] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-135:1.728) arc[start angle=-135,end angle=-150,radius=1.728] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-150:1.075) arc[start angle=-150,end angle=-165,radius=1.075] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-165:1.792) arc[start angle=-165,end angle=-180,radius=1.792] -- cycle;
+\fill[vibeygold,draw=white,line width=.4pt] (0,0) -- (-180:2.150) arc[start angle=-180,end angle=-195,radius=2.150] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-195:1.750) arc[start angle=-195,end angle=-210,radius=1.750] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-210:1.370) arc[start angle=-210,end angle=-225,radius=1.370] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-225:1.855) arc[start angle=-225,end angle=-240,radius=1.855] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-240:1.180) arc[start angle=-240,end angle=-255,radius=1.180] -- cycle;
+\fill[vibeyblue!85,draw=white,line width=.4pt] (0,0) -- (-255:0.632) arc[start angle=-255,end angle=-270,radius=0.632] -- cycle;
+\node[vibeynote,text=vibeygray] at (82.5:2.42) {0}; \node[vibeynote,text=vibeygray] at (37.5:2.42) {3}; \node[vibeynote,text=vibeygray] at (-7.5:2.42) {6}; \node[vibeynote,text=vibeygray] at (-52.5:2.42) {9}; \node[vibeynote,text=vibeygray] at (-97.5:2.42) {12}; \node[vibeynote,text=vibeygray] at (-142.5:2.42) {15}; \node[vibeynote,text=vibeygray] at (-187.5:2.42) {18}; \node[vibeynote,text=vibeygray] at (-232.5:2.42) {21};
+\node[vibeynote,anchor=north,text=vibeygray,align=center] at (0,-2.62) {rings at 25, 50 and 75 commits\\[1pt]\textcolor{vibeygold}{$\blacksquare$} busiest 18:00 (102) \quad \textcolor{vibeyred!70}{$\blacksquare$} quietest 09:00 (25)};
+\end{scope}
+\begin{axis}[vibeybars,at={(0.0cm,2.7cm)},anchor=north west,width=5.3cm,height=5.2cm,bar width=9pt,xmin=-0.6,xmax=6.6,ymin=0,
+  xtick={0,...,6},xticklabels={Mon,Tue,Wed,Thu,Fri,Sat,Sun},title={b. Commits by weekday},ylabel={commits},enlarge y limits={upper,value=0.12},title style={name=weekdaystitle}]
+\addplot[fill=vibeyblue,draw=none] coordinates {(0,98) (1,161) (2,117) (3,308) (4,356) (5,230) (6,233)};
+\end{axis}
+\begin{axis}[vibeybars,at={(6.1cm,2.7cm)},anchor=north west,width=5.3cm,height=5.2cm,bar width=9pt,xmin=-0.6,xmax=7.6,ymin=0,
+  xtick={0,...,7},xticklabels={chore,fix,feat,other,docs,ci,test,refactor},x tick label style={rotate=45,anchor=north east,font=\sffamily\tiny},title={c. Conventional Commit types},ylabel={commits},enlarge y limits={upper,value=0.12}]
+\addplot[fill=vibeyteal!85,draw=none] coordinates {(0,420) (1,303) (2,291) (3,259) (4,134) (5,41) (6,33) (7,8)};
+\end{axis}
+% The clock's title shares the bar charts' title baseline, so the three panels read as one row.
+\node[vibeyhead,anchor=base west] at (-8.0,0 |- weekdaystitle.base) {a. Commits by hour, US Eastern};
+\end{tikzpicture}
+\caption{The rhythm of production since 2026-08-09, at revision c78049b6. (a) A 24-hour clock of commits in US Eastern time: every hour of the day carries commits, the busiest at 18:00 with 102 and the quietest at 09:00 with 25. (b) The weekday distribution. (c) The Conventional Commit types the pre-commit hook enforces, most common first.}
+\label{fig:commit-rhythm}
+\end{figure*}
+```
+<!-- END GENERATED figure:commit-rhythm -->
+
+Cumulative deliveries, including the absorbed package roots and pull requests, appear in [Fig. 29](#fig:cumulative-commits).
+
+<!-- BEGIN GENERATED figure:cumulative-commits rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[vibeyaxis,width=17.2cm,height=5.4cm,xmin=0,xmax=50,ymin=0,ymax=1583,
+  xtick={0,7,14,21,28,35,42,49},xticklabels={Aug 9,Aug 16,Aug 23,Aug 30,Sep 6,Sep 13,Sep 20,Sep 27},xlabel={day},ylabel={cumulative},legend pos=north west]
+\addplot[fill=vibeyblue!14,draw=none,forget plot] coordinates {(0,0) (0,5) (1,46) (2,46) (3,67) (4,197) (5,224) (6,316) (7,363) (8,385) (9,424) (10,444) (11,496) (12,571) (13,584) (14,645) (15,646) (16,684) (17,687) (18,743) (19,772) (20,863) (21,934) (22,934) (23,934) (24,934) (25,934) (26,934) (27,934) (28,934) (29,934) (30,934) (31,937) (32,950) (33,950) (34,950) (35,950) (36,974) (37,1035) (38,1068) (39,1084) (40,1275) (41,1282) (42,1286) (43,1294) (44,1317) (45,1354) (46,1395) (47,1429) (48,1456) (49,1501) (50,1503)} \closedcycle;
+\addplot[vibeyblue,line width=1pt] coordinates {(0,0) (0,5) (1,46) (2,46) (3,67) (4,197) (5,224) (6,316) (7,363) (8,385) (9,424) (10,444) (11,496) (12,571) (13,584) (14,645) (15,646) (16,684) (17,687) (18,743) (19,772) (20,863) (21,934) (22,934) (23,934) (24,934) (25,934) (26,934) (27,934) (28,934) (29,934) (30,934) (31,937) (32,950) (33,950) (34,950) (35,950) (36,974) (37,1035) (38,1068) (39,1084) (40,1275) (41,1282) (42,1286) (43,1294) (44,1317) (45,1354) (46,1395) (47,1429) (48,1456) (49,1501) (50,1503)};
+\addlegendentry{commits since Aug 9 (1,503; 12 earlier)}
+\addplot[vibeyteal,line width=1pt] coordinates {(0,0) (0,0) (1,7) (2,7) (3,9) (4,20) (5,20) (6,31) (7,47) (8,69) (9,104) (10,124) (11,145) (12,181) (13,188) (14,218) (15,218) (16,242) (17,244) (18,281) (19,304) (20,373) (21,426) (22,426) (23,426) (24,426) (25,426) (26,426) (27,426) (28,426) (29,426) (30,426) (31,426) (32,426) (33,426) (34,426) (35,426) (36,434) (37,451) (38,483) (39,494) (40,501) (41,505) (42,508) (43,515) (44,538) (45,575) (46,616) (47,649) (48,675) (49,681) (50,683)};
+\addlegendentry{commit subjects closing a pull request (683)}
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:0,0) {};
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:1,0) {};
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:4,0) {};
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:4,0) {};
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:4,0) {};
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:5,0) {};
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:12,0) {};
+\node[vibeyanchor,fill=vibeyviolet] at (axis cs:13,0) {};
+\node[vibeynote,anchor=south east,align=right] at (axis description cs:0.99,0.04) {\textcolor{vibeyviolet}{$\bullet$} a package's root commit: 8 of 9 root histories begin in the window};
+\end{axis}
+\end{tikzpicture}
+\caption{Cumulative production at revision c78049b6: commits since 2026-08-09 and, beneath them, the commits whose subject closes a pull request. The violet marks on the baseline are the days on which the absorbed packages' own histories begin; the family was written as several repositories and merged into one tree with every history preserved.}
+\label{fig:cumulative-commits}
+\end{figure*}
+```
+<!-- END GENERATED figure:cumulative-commits -->
+
+The timeline of releases across each package in the family is shown in [Fig. 30](#fig:release-cadence).
+
+<!-- BEGIN GENERATED figure:release-cadence rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\draw[vibeydashed] (6.84,-0.30) -- (6.84,0.35);\node[vibeynote,anchor=north] at (6.84,-0.32) {Sep 2026};
+\node[vibeynote,anchor=north] at (0.00,-0.32) {Aug 16};
+\node[vibeynote,anchor=north] at (15.40,-0.32) {Sep 21};
+\draw[vibeyline,line width=.5pt] (0,0.00) -- (15.40,0.00);
+\node[font=\sffamily\tiny\bfseries,anchor=east,text=vibeyink] at (-0.15,0.00) {vibey};
+\node[vibeyanchor,fill=vibeyblue] at (0.00,0.00) {};
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (0.02,0.06) {0.1.0};
+\node[vibeyanchor,fill=vibeyblue] at (1.71,0.00) {};
+\node[font=\sffamily\tiny\bfseries,text=white,fill=vibeyblue,circle,inner sep=.6pt,anchor=north] at (1.71,-0.09) {2};
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (1.73,0.06) {0.1.1--0.1.2};
+\node[vibeyanchor,fill=vibeyblue] at (3.42,0.00) {};
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (3.44,0.06) {0.2.0};
+\node[vibeyanchor,fill=vibeyblue] at (5.56,0.00) {};
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (5.58,0.06) {0.3.0};
+\node[vibeyanchor,fill=vibeyblue] at (5.99,0.00) {};
+\node[font=\sffamily\tiny\bfseries,text=white,fill=vibeyblue,circle,inner sep=.6pt,anchor=north] at (5.99,-0.09) {2};
+\draw[vibeyline] (5.99,0.06) -- (5.99,0.48);
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (6.01,0.48) {0.4.0--0.5.0};
+\node[vibeyanchor,fill=vibeyblue] at (12.41,0.00) {};
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (12.43,0.06) {0.6.0};
+\node[vibeyanchor,fill=vibeyblue] at (12.83,0.00) {};
+\draw[vibeyline] (12.83,0.06) -- (12.83,0.48);
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (12.85,0.48) {0.7.0};
+\node[vibeyanchor,fill=vibeyblue] at (13.26,0.00) {};
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (13.28,0.06) {0.8.0};
+\node[vibeyanchor,fill=vibeyblue] at (14.12,0.00) {};
+\node[font=\sffamily\tiny\bfseries,text=white,fill=vibeyblue,circle,inner sep=.6pt,anchor=north] at (14.12,-0.09) {4};
+\draw[vibeyline] (14.12,0.06) -- (14.12,0.48);
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (14.14,0.48) {1.0.0--1.3.0};
+\node[vibeyanchor,fill=vibeyblue] at (14.54,0.00) {};
+\node[font=\sffamily\tiny\bfseries,text=white,fill=vibeyblue,circle,inner sep=.6pt,anchor=north] at (14.54,-0.09) {2};
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (14.56,0.06) {1.4.0--1.5.0};
+\node[vibeyanchor,fill=vibeyblue] at (15.40,0.00) {};
+\draw[vibeyline] (15.40,0.06) -- (15.40,0.48);
+\node[font=\sffamily\tiny,text=vibeyblue,rotate=55,anchor=south west,inner sep=1pt] at (15.42,0.48) {2.0.0};
+\end{tikzpicture}
+\caption{Every release tag reachable at revision c78049b6, 17 tags on the repository. The 17 \texttt{vibey} releases run from vibey-v0.1.0 on 2026-08-16 to vibey-v2.0.0 on 2026-09-21; since the packages were absorbed into one tree, one version number ships the whole family, and the packages' earlier tags remain in their pre-absorption repositories.}
+\label{fig:release-cadence}
+\end{figure*}
+```
+<!-- END GENERATED figure:release-cadence -->
+
+Finally, the architectural shape of the consolidated repository across its ten packages and the orchestrator's layers is depicted in [Fig. 31](#fig:codebase-shape).
+
+<!-- BEGIN GENERATED figure:codebase-shape rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=3 by 1,horizontal sep=1.9cm},vibeyaxis,height=5.6cm,
+  y dir=reverse,ytick={0,...,9},ymin=-0.7,ymax=9.7,xmin=0,y tick label style={font=\sffamily\tiny},
+  scaled x ticks=false,x tick label style={/pgf/number format/fixed},point meta=x,
+  nodes near coords,every node near coord/.append style={font=\sffamily\tiny,text=vibeygray,/pgf/number format/fixed}]
+\nextgroupplot[title={a. Lines of Python per package},xbar,bar width=6pt,width=5.9cm,yticklabels={vibey,vibey-gh,claudeloop,vibey-bootstrap,agyloop,codexloop,cursorloop,qwenloop,vibey-skills,runners-common},xlabel={lines},xmax=183432]
+\addplot[fill=vibeyblue,draw=none] coordinates {(146746,0) (75594,1) (36869,2) (32732,3) (23972,4) (22614,5) (16750,6) (10909,7) (3109,8) (258,9)};
+\nextgroupplot[title={b. Test functions per package},xbar,bar width=6pt,width=4.9cm,yticklabels={,,,,,,,,,},xlabel={tests},xmax=4868]
+\addplot[fill=vibeyteal!85,draw=none] coordinates {(3894,0) (2011,1) (1478,2) (971,3) (678,4) (711,5) (562,6) (291,7) (33,8) (0,9)};
+\nextgroupplot[title={c. The orchestrator's layers},xbar,bar width=6pt,width=4.9cm,ytick={0,...,4},yticklabels={domain,application,infrastructure,cli,tui},ymin=-0.7,ymax=4.7,xlabel={lines},xmax=45323,nodes near coords={}]
+\addplot[fill=vibeyviolet!85,draw=none] coordinates {(12488,0) (13786,1) (23854,2) (6348,3) (590,4)};
+\node[vibeypill,anchor=west,fill=vibeygreen!15,text=vibeygreen!60!black] at (axis cs:13388,0) {12,488 $\cdot$ 100\% branch floor}; \node[vibeypill,anchor=west,fill=vibeygreen!15,text=vibeygreen!60!black] at (axis cs:14686,1) {13,786 $\cdot$ 100\% branch floor}; \node[vibeypill,anchor=west,fill=vibeygreen!15,text=vibeygreen!60!black] at (axis cs:24754,2) {23,854 $\cdot$ 100\% branch floor}; \node[vibeypill,anchor=west,fill=vibeygreen!15,text=vibeygreen!60!black] at (axis cs:7248,3) {6,348 $\cdot$ 100\% branch floor}; \node[vibeypill,anchor=west,fill=vibeysilver!30,text=vibeygray] at (axis cs:1490,4) {590 $\cdot$ exempt};
+\end{groupplot}
+\end{tikzpicture}
+\caption{The shape of the tree at revision c78049b6: 389,277 lines of Python in 2,245 files and 10,639 test functions. (a) Lines and (b) test functions per package, each package counted together with the test suite its pytest configuration collects, \texttt{vibey}'s in the top-level \texttt{tests/}; \texttt{runners-common} has no test functions at this revision. (c) The orchestrator's layers, four of which fail the build below 100\% branch coverage.}
+\label{fig:codebase-shape}
+\end{figure*}
+```
+<!-- END GENERATED figure:codebase-shape -->
 
 ### The measured regularity
 
@@ -1168,7 +3098,7 @@ records do not show as a commodity is governance, meaning the authority to decid
 fund, accept and ratify, and correct judgment about what was produced.
 
 The first half rests on three observations. Substitutability is a property of the
-design: five engines implement one contract, the scheduler chooses among them by
+design: six engines implement one contract, the scheduler chooses among them by
 policy, and the live runbook forces a rotation between two of them in the middle of a
 project. Price is explicit: every engine descriptor carries per-token cost rates, and
 budgets are sums of reported cost. The rate is the regularity above.
@@ -1195,6 +3125,62 @@ corrected above were a confident, wrong claim that stood unchallenged in a track
 paper from the day its package was imported until this revision checked it against
 the record. Artifacts are commoditised; correct judgment about artifacts is not, and
 that gap, more than throughput, is where the remaining engineering lies.
+
+**Review before merge is a rate limiter, and it is meant to be.** On 2026-09-24 every
+change for 3.0.0 was sent for an independent review, and merging outran the reviews.
+The 3.0.0 release-gate record (12:22Z) counts seven pull requests merged before or
+during their independent reviews that day; the forge's own times show how long each
+was open, from creation to merge.
+
+| Pull request | Open for |
+|---|---:|
+| #1094, sovereign reviewer | 49 min 44 s |
+| #1095, derived lane | 44 min 6 s |
+| #1100, ledger guard | 35 min 16 s |
+| #1101, cut prompts | 23 min 4 s |
+| #1102, truncated log | 30 s |
+| #1103, lane follow-ups | 1 min 48 s |
+| #1105, push-gate reaper | 3 min 49 s |
+
+Two earlier merges that day, outside that count, had shown the pattern: #1089 merged
+30 s after it was opened and was reviewed afterwards (#1092), and #1092 merged while
+its final review said *not yet* (#1102). The findings did not disappear. Each was
+carried into a new pull request or branch: #1092 for #1089, #1101 for #1094, #1102 for
+#1092, #1103 for #1095, and a follow-up branch for #1100. In the meantime each finding
+was live on `develop`, which a push publishes to the development package index; the
+worst were the two high findings in the ledger guard. Merging ahead of review also let
+two changes that each passed their own gates break `develop` together: #1100 made the
+suite run as a restricted application role, #1103 added a test that needs the owner's
+privileges, and nothing tested the two together before both had landed (CI run
+35998404322 at `600f3db2`: 1 failed, 3,732 passed; the one-line repair is commit
+`bd9161ee`). And it created pressure to repair in place. A later commit on the job
+queue's branch rewrote migration 0015 to make it additive after 0015 had merged, and
+an open pull request (#1106) carries it. #1103 took the other road: it left 0015 as it
+was, because a push to `develop` publishes a build that may already have applied it
+and the migrator refuses a changed checksum, and it recorded the drain instruction and
+the gap in ADR-0054, with a new lint that fails any undocumented column drop. A
+migration that may have been applied is never edited; its correction is a new
+migration or a recorded gap.
+
+The same day supplied a second governance fact, about where work is kept. At about
+09:09 US Eastern time the host rebooted. Everything held only in the operating system's
+temporary directory, which macOS empties at boot, was lost: the storm's local run logs and
+progress log, from which the audit above was computed, and every worktree kept there,
+with its uncommitted edits, among them the first draft of this very update of the
+paper. What survived is what had been committed and pushed, or tracked: the evidence
+ledger, the benchmark record and every merged pull request. Worktrees moved to a
+persistent directory, and work in progress is now committed and pushed section by
+section. It is sub-doctrine 10.g's argument, observed: evidence that is not durably
+recorded is not evidence for long.
+
+None of this is a claim about anyone's care. It is the finding of this section,
+observed on governance itself. Producing the changes was cheap and fast that day;
+independent judgment about them took tens of minutes each and was the binding input,
+and wherever a merge ran ahead of it the judgment was still paid for, later, as a
+rescue pull request, a red integration branch or a finding shipped to the development
+channel. Review before merge limits the rate of delivery in the same sense the stress
+band limits the rate of generation, and it binds for the same reason: it is the step
+that decides whether the output is correct.
 
 ### Six materials and the modulators of the rate
 
@@ -1230,28 +3216,64 @@ where $\phi_i$ is the dilation that a shortfall in coordinate $i$ imposes on dur
 unity at $d_i = 0$, and divergent as the coordinate approaches its floor. The gradient
 $-\nabla_d T$ ranks which shortfall to repair first. The postulate is falsified by
 exhibiting a real dilemma that does not decompose into these coordinates and their
-couplings; it is a postulate, not a law.
+couplings; it is a postulate, not a law. The six materials and their pairwise couplings
+are illustrated in [Fig. 32](#fig:six-materials).
 
 ```latex
-\begin{figure*}[t]
+\begin{figure*}[!t]
 \centering
 \begin{tikzpicture}[x=1cm,y=1cm]
-  \node[vibeycore,minimum width=2.25cm] (operation) at (0,0)
-    {operation\\feasible?};
-  \node[vibeysoft,minimum width=1.55cm] (network) at (0,2.2) {NETWORK\\reachable};
-  \node[vibeysoft,minimum width=1.55cm] (hardware) at (2.65,1.15) {HARDWARE\\capacity};
-  \node[vibeysoft,minimum width=1.55cm] (software) at (2.65,-1.15) {SOFTWARE\\installed};
-  \node[vibeysoft,minimum width=1.55cm] (agent) at (0,-2.2) {AGENT\\present};
-  \node[vibeysoft,minimum width=1.55cm] (information) at (-2.65,-1.15) {INFORMATION\\fresh};
-  \node[vibeysoft,minimum width=1.55cm] (agency) at (-2.65,1.15) {AGENCY\\permitted};
-  \foreach \n in {network,hardware,software,agent,information,agency}
-    {\draw[vibeyarrow] (\n) -- (operation);}
-  \node[font=\tiny,align=center,text=vibeyred] at (0,-3.05)
-    {couplings between materials are where coordination shortfalls appear};
+  % ---------------------------------------------------------------- lanes
+  \begin{scope}[on background layer]
+    \node[vibeylane,fit={(0.3,0.35) (8.9,7.05)}] (lane1) {};
+    \node[vibeylane,fit={(11.2,0.35) (17.5,7.05)}] (lane2) {};
+  \end{scope}
+  \node[vibeylanelabel] at (lane1.north west) {Six materials};
+  \node[vibeylanelabel] at (lane2.north west) {Feasibility and duration};
+
+  % ---------------------------------------------------------------- the six materials on a hexagon
+  \coordinate (hub) at (4.6,3.75);
+  \node[vibeysoft,minimum width=2.3cm] (m1) at ($(hub)+(0,2.55)$)      {\textbf{Network}\\$x_1,\,x_2,\,x_3$};
+  \node[vibeysoft,minimum width=2.3cm] (m2) at ($(hub)+(2.21,1.275)$)  {\textbf{Hardware}\\$x_4,\,x_5,\,x_6$};
+  \node[vibeysoft,minimum width=2.3cm] (m3) at ($(hub)+(2.21,-1.275)$) {\textbf{Software}\\$x_7,\,x_8,\,x_9$};
+  \node[vibeysoft,minimum width=2.3cm] (m4) at ($(hub)+(0,-2.55)$)     {\textbf{Agent}\\$x_{10},\,x_{11},\,x_{12}$};
+  \node[vibeysoft,minimum width=2.3cm] (m5) at ($(hub)+(-2.21,-1.275)$){\textbf{Information}\\$x_{13},\,x_{14},\,x_{15}$};
+  \node[vibeygate,minimum width=2.3cm] (m6) at ($(hub)+(-2.21,1.275)$) {\textbf{Agency}\\$x_{16},\,x_{17},\,x_{18}$};
+
+  % the operation at the hub: feasible when the state dominates its requirement
+  \node[vibeycore,minimum width=2.5cm] (op) at (hub) {operation $o$\\feasible $\iff x \succeq r_o$};
+
+  % each material contributes to the operation
+  \foreach \m in {m1,m2,m3,m4,m5,m6}
+    \draw[vibeyarrow,draw=vibeyblue!85,line width=.55pt,shorten <=1pt] (\m) -- (op);
+
+  % pairwise couplings around the perimeter: coordination, not a seventh material
+  \draw[vibeylink] (m1) -- (m2);
+  \draw[vibeylink] (m2) -- (m3) node[midway,vibeypill,right=2pt] {$\mathcal{C}_{23}$};
+  \draw[vibeylink] (m3) -- (m4);
+  \draw[vibeylink] (m4) -- (m5);
+  \draw[vibeylink] (m5) -- (m6) node[midway,vibeypill,left=2pt] {$\mathcal{C}_{56}$};
+  \draw[vibeylink] (m6) -- (m1);
+  \node[vibeynote,anchor=south east] at (8.8,0.45)
+    {links $\mathcal{C}_{ij}$:\\coordination is a coupling,\\not a seventh material};
+
+  % ---------------------------------------------------------------- from state to duration
+  \node[vibeybox,minimum width=5.4cm] (S) at (14.35,5.7)
+    {state $x$: 18 coordinates\\six materials $\times$ \{availability, stability, reliability\}};
+  \node[vibeywarn,minimum width=5.4cm] (D) at (14.35,4.3)
+    {dilemma vector $d = x^{*} - x$\\shortfall from the stable peak $x^{*}$};
+  \node[vibeybox,minimum width=5.4cm] (T) at (14.35,2.65)
+    {$T(o) = T_0(o)\,\prod_i \phi_i(d_i)$ \quad $C(o) = \int_0^{T(o)} c(x(t))\,dt$\\
+     $\phi_i(0)=1$; $\phi_i \to \infty$ as coordinate $i$ nears its floor};
+  \node[vibeypill] (G) at (14.35,1.2) {$-\nabla_d T$ ranks which shortfall to repair first};
+
+  \draw[vibeyflow] (lane1.east |- S) -- (S.west)
+    node[midway,above=1pt,font=\sffamily\scriptsize,text=vibeyink] {state};
+  \draw[vibeyarrow] (S) -- (D);
+  \draw[vibeyarrow] (D) -- (T);
+  \draw[vibeyarrow] (T) -- (G);
 \end{tikzpicture}
-\caption{The six-material feasibility model. Network, hardware, software, agent,
-information and agency each contribute availability, stability and reliability;
-coordination is a coupling among them rather than a seventh material.}
+\caption{Network, hardware, software, agent, information and agency each supply three coordinates (availability, stability, reliability) of the state $x \in \mathbb{R}^{18}$. An operation is feasible when $x$ meets its requirement $r_o$. Agency, the permission to act, is gold because governance sets it through human gates. Grey links are couplings: coordination, not a seventh material. Right: shortfalls $d$ stretch the duration $T(o)$.}
 \label{fig:six-materials}
 \end{figure*}
 ```
@@ -1280,66 +3302,90 @@ $[0.99, 2.00]$ gives $T_0$ between 50 and 101 minutes, where the serial rate alo
 would give 278. The interval is wide because the band is, and replication would narrow
 it. Because the held-out check exceeded the ceiling, the firm half of the prediction
 is the upper end: with every coordinate at its target, the work should take no longer
-than $W / r_{\min}$.
+than $W / r_{\min}$, as plotted in [Fig. 33](#fig:completion-band).
 
+<!-- BEGIN GENERATED figure:completion-band rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\draw[vibeyink,line width=.6pt] (0,0) -- (7.8,0);
+\draw[vibeyink] (0.00,0) -- (0.00,-0.08) node[vibeynote,anchor=north] {0}; \draw[vibeyink] (1.27,0) -- (1.27,-0.08) node[vibeynote,anchor=north] {50}; \draw[vibeyink] (2.53,0) -- (2.53,-0.08) node[vibeynote,anchor=north] {100}; \draw[vibeyink] (3.80,0) -- (3.80,-0.08) node[vibeynote,anchor=north] {150}; \draw[vibeyink] (5.07,0) -- (5.07,-0.08) node[vibeynote,anchor=north] {200}; \draw[vibeyink] (6.33,0) -- (6.33,-0.08) node[vibeynote,anchor=north] {250}; \draw[vibeyink] (7.60,0) -- (7.60,-0.08) node[vibeynote,anchor=north] {300};
+\node[vibeynote,anchor=north] at (8.0,-0.08) {min};
+\shade[left color=vibeyblue!35,right color=vibeyblue!10] (1.27,0.35) rectangle (2.56,0.75);
+\draw[vibeyblue,line width=1pt] (1.27,0.35) rectangle (2.56,0.75);
+\node[vibeynote,text=vibeyblue,anchor=south] at (1.91,0.8) {stable band: $T_0 \in [50, 101]$ min for $W = 100$};
+\node[vibeynote,anchor=north] at (1.27,0.3) {50};
+\node[vibeynote,anchor=north] at (2.56,0.3) {101};
+\draw[vibeyred,line width=1.2pt] (7.04,0.35) -- (7.04,0.75);
+\node[vibeycallout,anchor=south,align=center] at (7.04,0.8) {serial substrate\\278 min};
+\draw[vibeyarrow,draw=vibeygray] (2.66,1.55) -- (6.94,1.55) node[midway,vibeynote,anchor=south] {every shortfall dilates $T_0$; none shortens it};
+\end{tikzpicture}
+\caption{The completion-time prediction. At the stable band's rates, 100 units of the task class take between 50 and 101 minutes on the fixed substrate with every coordinate at its target; the serial rung alone would take about 278. Shortfalls in any material coordinate stretch the interval to the right and never shorten it.}
+\label{fig:completion-band}
+\end{figure}
+```
+<!-- END GENERATED figure:completion-band -->
+
+Beyond single-task completion bands, project delivery velocity is tracked over time
+in the delivery-estimate ledger, shown in [Fig. 34](#fig:forecast).
+
+<!-- BEGIN GENERATED figure:forecast rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
 ```latex
 \begin{figure*}[t]
 \centering
-\begin{tikzpicture}[x=0.05cm,y=1cm]
-  \draw[vibeyarrow] (0,0) -- (310,0);
-  \draw[vibeyarrow] (0,0) -- (0,1.8);
-  \draw[vibeyblue,very thick] (50,0.65) -- (101,0.65);
-  \filldraw[fill=vibeyblue,draw=vibeyblue] (50,0.65) circle (0.07);
-  \filldraw[fill=vibeyblue,draw=vibeyblue] (101,0.65) circle (0.07);
-  \node[font=\scriptsize,anchor=south] at (75.5,0.78)
-    {stable-band prediction for $W=100$};
-  \node[font=\tiny,anchor=north] at (50,0.45) {50 min};
-  \node[font=\tiny,anchor=north] at (101,0.45) {101 min};
-  \draw[vibeyred,very thick] (278,1.05) -- (278,1.45);
-  \node[font=\tiny,text=vibeyred,anchor=south] at (278,1.5)
-    {serial substrate: 278 min};
-  \draw[vibeydashed] (0,0.28) -- (310,0.28);
-  \node[font=\tiny,anchor=north west] at (0,0.18)
-    {zero-shortfall time $T_0$; shortfalls dilate it};
-  \foreach \x in {0,50,100,150,200,250,300}
-    {\draw[vibeyink] (\x,0) -- (\x,-0.08);}
-  \node[font=\scriptsize\bfseries,anchor=west] at (312,0) {minutes};
+\begin{tikzpicture}
+\begin{groupplot}[group style={group size=2 by 1,horizontal sep=1.7cm},vibeyaxis,width=7.9cm,height=4.6cm,
+  xmin=0.5,xmax=21.5,xtick={1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21},xticklabels={19,,,20,21,23,,24,,,25,,,26,,,,,,27,},xlabel={forecast record, by day (September 2026)}]
+\nextgroupplot[title={a. Work units in the tracker},ylabel={units},ymin=0,ymax=890,legend pos=south east]
+\addplot[vibeyred,line width=1pt,mark=*,mark size=1.3pt] coordinates {(1,0) (2,24) (3,24) (4,24) (5,25) (6,708) (7,706) (8,709) (9,710) (10,711) (11,712) (12,706) (13,711) (14,706) (15,699) (16,681) (17,687) (18,686) (19,693) (20,688) (21,688)};
+\addlegendentry{remaining}
+\addplot[vibeygreen,line width=1pt,mark=square*,mark size=1.2pt] coordinates {(1,235) (2,235) (3,235) (4,238) (5,247) (6,264) (7,279) (8,340) (9,342) (10,349) (11,351) (12,366) (13,376) (14,385) (15,386) (16,389) (17,393) (18,396) (19,400) (20,408) (21,415)};
+\addlegendentry{completed}
+\nextgroupplot[title={b. Forecast active days to completion},ylabel={active days},ymin=0,ymax=90,legend pos=south east]
+\addplot[fill=vibeyblue!14,draw=none,forget plot] coordinates {(1,0.00) (2,1.94) (3,1.94) (4,1.92) (5,2.13) (6,59.00) (7,58.20) (8,50.05) (9,49.82) (10,48.89) (11,48.68) (12,48.22) (13,47.27) (14,45.84) (15,47.08) (16,45.52) (17,45.45) (18,45.04) (19,45.05) (20,45.53) (21,44.76) (21,62.55) (20,62.55) (19,60.26) (18,62.36) (17,65.43) (16,64.86) (15,66.57) (14,64.18) (13,64.64) (12,64.18) (11,67.81) (10,67.71) (9,67.62) (8,67.52) (7,70.60) (6,78.67) (5,3.12) (4,3.00) (3,3.00) (2,3.00) (1,0.00)} -- cycle;
+\addplot[vibeyblue,line width=1pt,mark=*,mark size=1.2pt] coordinates {(1,0.00) (2,1.94) (3,1.94) (4,1.92) (5,2.13) (6,59.00) (7,58.20) (8,50.05) (9,49.82) (10,48.89) (11,48.68) (12,48.22) (13,47.27) (14,45.84) (15,47.08) (16,45.52) (17,45.45) (18,45.04) (19,45.05) (20,45.53) (21,44.76)};
+\addlegendentry{$W/r_{\max}$}
+\addplot[vibeyblue!60,line width=1pt,mark=o,mark size=1.2pt] coordinates {(1,0.00) (2,3.00) (3,3.00) (4,3.00) (5,3.12) (6,78.67) (7,70.60) (8,67.52) (9,67.62) (10,67.71) (11,67.81) (12,64.18) (13,64.64) (14,64.18) (15,66.57) (16,64.86) (17,65.43) (18,62.36) (19,60.26) (20,62.55) (21,62.55)};
+\addlegendentry{$W/r_{\min}$}
+\end{groupplot}
 \end{tikzpicture}
-\caption{The completion-time prediction. At the measured stable-band rates, 100
-units require roughly 50--101 minutes on the fixed substrate; the serial rung alone
-would require about 278 minutes. The higher scale is a dilation from shortfalls,
-not a second definition of completion.}
-\label{fig:completion-band}
+\caption{The delivery-estimate ledger, one forecast per record. (a) Remaining and completed work units as the tracker held them: remaining jumped from 25 to 708 on Sep 23, as open issues rose from 23 to 706 when the storm filed its lanes as issues. (b) The zero-shortfall time to completion the forecast derives from the observed merge rate, 45--63 active days at the last record, with every material coordinate unmeasured and so at $\phi_i = 1$.}
+\label{fig:forecast}
 \end{figure*}
 ```
+<!-- END GENERATED figure:forecast -->
 
 Governance has a price in time, and the price can be lowered without lowering the bar.
 The workstream that parallelised the orchestrator's test suite measured the four
 per-layer coverage gates falling from about 1,530 s (four sequential suite runs) to
 136 s, an 11.3-fold reduction, by computing all four floors from one instrumented run,
 and the bare suite falling from 383 s to 135 s, without removing a gate
-(`docs/runbooks/expansion/evidence/13-front1-validation.md`). That is a governance
-dilation made smaller while the requirement stayed the same.
+(`docs/runbooks/expansion/evidence/13-front1-validation.md`), as illustrated in [Fig. 35](#fig:governance-time).
+That is a governance dilation made smaller while the requirement stayed the same.
 
-### Field data
-
-The git history is field data: nothing in it was held fixed. At revision `559638f4`,
-1,103 commits are reachable across nine root histories, the absorbed histories of the
-family's packages. Since 2026-08-09, when the family's own development begins, 1,091
-commits landed on 28 active days, between 1 and 130 per day (median 31, mean 39.0,
-sample standard deviation 31.7). Commits landed in all 24 hours of the day in US
-Eastern time, with the fewest (15) in the 09:00 hour and the most (82) in the 02:00
-hour. The longest
-pause was nine days with no commit, from 2026-08-31 to 2026-09-08, and nothing in the
-repository records its cause. Eleven `vibey` release tags point at commits dated
-between 2026-08-16 and 2026-09-18, and 503 commit subjects across the absorbed
-histories end in a pull-request reference.
-
-The daily rate's spread is 81% of its mean, against 24% in the controlled region.
-That is what the model predicts when the coordinates of $d$ vary freely, but it is
-also what almost any model would predict of an uncontrolled process, so the history
-does not test the regularity. We report it so that the controlled band is never
-mistaken for a field rate.
+<!-- BEGIN GENERATED figure:governance-time rev:c78049b6fc6052be04c7da49510ed6bebe6e63bd tree:729f0aa0430a3f45dc8427a3a8f4d7ecbc31cf22 — regenerated by scripts/paper_figures.py -->
+```latex
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[vibeybars,width=8.6cm,height=4.8cm,bar width=13pt,bar shift=0pt,xmin=-0.6,xmax=3.6,ymin=0,ymax=1836,
+  xtick={0,1,2,3},xticklabels={four gates before,four gates after,suite before,suite after},
+  x tick label style={font=\sffamily\tiny,align=center,text width=1.6cm},ylabel={seconds},
+  nodes near coords,every node near coord/.append style={font=\sffamily\tiny,text=vibeygray}]
+\addplot[fill=vibeyred!70,draw=none,bar shift=0pt] coordinates {(0,1530)};
+\addplot[fill=vibeygreen!80,draw=none,bar shift=0pt] coordinates {(1,136)};
+\addplot[fill=vibeyred!70,draw=none,bar shift=0pt] coordinates {(2,383)};
+\addplot[fill=vibeygreen!80,draw=none,bar shift=0pt] coordinates {(3,135)};
+\node[vibeycallout,anchor=south,align=center] at (axis cs:0.5,356) {$11.3\times$\\faster};
+\node[vibeycallout,anchor=south,align=center] at (axis cs:2.5,355) {$2.8\times$\\faster};
+\end{axis}
+\end{tikzpicture}
+\caption{A governance dilation made smaller without lowering the bar. Computing the four per-layer coverage floors from one instrumented run took the gates from about 1,530\,s to 136\,s, and the suite itself from 383\,s to 135\,s, with no gate removed.}
+\label{fig:governance-time}
+\end{figure}
+```
+<!-- END GENERATED figure:governance-time -->
 
 ### Falsification
 
@@ -1364,7 +3410,448 @@ history. Neither the stress record nor the Qwen pilot measures network state or
 operator availability, so two of the five modulators are named, mapped and unmeasured.
 We do not claim a natural law, and we do not claim that the rate is constant. We claim
 a band, on a substrate, together with the conditions under which the claim would fail,
-and report the Qwen pilot only as a bounded reliability observation.
+and report the Qwen pilot only as a bounded reliability observation. The storm audit
+is narrower still: one storm, one model slot, one host, read from local logs that were
+never tracked and are now gone, and a record kept outside the repository. We
+recomputed its run, turn, model-time and overlap figures and its count of started
+lanes from those logs before they were lost; its conversion, control and refutation
+figures are cited from the audit with its date. The account of merging ahead of review
+covers one day of one project, and it is drawn from the forge's times and the
+release-gate record, not from a controlled comparison.
+
+```latex
+\begin{plainwords}
+We pushed one small computer harder and harder, giving it 1, 2, 4, 8 and finally 128 jobs at once. Up to 32 jobs, almost everything finished, and the computer produced about one or two finished pieces of work every minute no matter how many we asked for at once. Past that, jobs began to run out of time, and at 128 most of them failed. The computer was never broken; it was full. Only a person could decide what to do next: ask for less, allow more time, or buy a bigger computer. That is why we say the machine part is cheap and the deciding part is the hard part. Later we checked the busy season of the project's own robot helpers. Nearly all of their time went into waiting for one small brain that could think about one job at a time, so adding more helpers would have bought almost nothing, and not one job made it all the way to the finished pile without a person stepping in. When we double-checked our own first conclusions, most of them turned out to be wrong, which is itself a lesson. On the busiest day, changes were accepted faster than they could be checked, and every problem the checkers later found had to be fixed afterwards. And when the computer restarted, everything kept only in its scratch space vanished, which is why the notebook matters. Checking takes time, and that time is the price of being right.
+\end{plainwords}
+```
+
+## The 3.0.0 operational atlas
+
+The work after the paper's cutoff is not one feature. It changes where the system can
+be stopped, where it can be wrong without saying so, and who may act at each step. The
+ten figures of this section draw those changes from the code rather than the changelog.
+Each shows a contract: what is recorded, what is refused, and what a failure turns
+into. None of them asserts that every path has been exercised on a live run, and the
+text says where one has not.
+
+**The delivery path.** 3.0.0 adds a bridge from the forge's issue list to the
+six-phase machine: `scripts/triaged_delivery.py`, run once or on an interval, claims
+one triaged issue, creates a vibey project for it in a worktree of its own, drives the
+normal worker on the sovereign engine, and publishes the result as a pull request
+([Fig. 36](#fig:delivery-pipeline)). The bridge never edits a branch itself; the worker
+writes the code and the phase machine decides when it may. Every step writes its
+observations to a per-project evidence file under `.vibey/delivery-evidence/`, and
+every exit from the path that is not success is recorded there as what it was: a
+timeout, a pause for capacity, a parked gate, or a pull request whose checks have not
+passed. None of them is recorded as a completion.
+
+```latex
+\begin{figure*}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  stp/.style={minimum width=2.45cm,minimum height=1.3cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred}]
+  % ---- the forward path
+  \node[vibeysoft,stp]      (tri)   at (0,0)     {\textbf{Triaged issue}\\forge labels\\order derived};
+  \node[vibeysoft,stp]      (lease) at (3.05,0)  {\textbf{Ticket lease}\\PostgreSQL row\\900\,s lease};
+  \node[vibeyvioletbox,stp] (des)   at (6.1,0)   {\textbf{Design}\\interview defaults\\answered, recorded};
+  \node[vibeytealbox,stp]   (bld)   at (9.15,0)  {\textbf{Build}\\gptossloop worker\\own worktree};
+  \node[vibeygate,stp]      (rev)   at (12.2,0)  {\textbf{Review}\\human gate\\project parks};
+  \node[vibeybox,stp]       (pub)   at (15.25,0) {\textbf{Publish}\\push gate, PR\\train on green};
+  \foreach \a/\b in {tri/lease,lease/des,des/bld,bld/rev,rev/pub}{\draw[vibeyflow] (\a) -- (\b);}
+  % ---- the evidence rail every exit lands on
+  \node[vibeywarn,minimum width=17.5cm,minimum height=.6cm] (ev) at (7.625,-2.35)
+    {\textbf{evidence record} \texttt{.vibey/delivery-evidence/<project>.json}: every exit is recorded as what it was, never as a completion};
+  \draw[vibeyback] (lease.south) -- node[redlab,right] {lease expired:\\ticket back to ready} (lease.south |- ev.north);
+  \draw[vibeyback] (bld.south) -- node[redlab,right] {deadline: tree reaped;\\capacity short: paused} (bld.south |- ev.north);
+  \draw[vibeyback] (rev.south) -- node[redlab,right] {gate open:\\project parked} (rev.south |- ev.north);
+  \draw[vibeyback] (pub.south) -- node[redlab,left] {checks not green:\\PR left open} (pub.south |- ev.north);
+  % ---- the rule above it
+  \node[lab,anchor=south] at (7.625,0.85) {the bridge never edits a branch: the worker writes code, the phase machine decides when it may, the forge decides when it merges};
+\end{tikzpicture}
+\caption{The durable delivery path. A triaged issue is claimed under a lease, becomes an ordinary vibey project in its own worktree, is built by the sovereign engine, stops at the human review gate, and is published through the push gate as a pull request that the merge train takes only when every check is green. Each non-success exit (dashed) is written to the project's evidence record as what it was.}
+\label{fig:delivery-pipeline}
+\end{figure*}
+```
+
+**Ordering and claiming.** The bridge keeps its tickets in PostgreSQL, not in a
+process's memory ([Fig. 37](#fig:queue-state)). A reconcile pass mirrors the forge's
+open, triaged issues into rows, and a claim takes the first `ready` row under a
+900-second lease with `FOR UPDATE SKIP LOCKED`, the same primitive the job queue uses.
+The order is derived, never edited: issues a person has bumped come first, in the order
+they were bumped, then the priority label from critical to low, then the issue least
+recently updated, then the issue number. A reap pass returns an expired lease to
+`ready`; at the cutoff that pass runs only when the queue tool is invoked with
+`--reap`, not on the bridge's own loop, so an expired lease stays held until an
+operator reaps it. A dispatch is also marked on the issue
+itself, by a comment carrying the project's identity, so a second bridge that lost its
+database would still not dispatch the same issue twice.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  st/.style={minimum width=1.85cm,minimum height=.8cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred}]
+  \node[vibeysoft,st] (ready) at (0,0)     {\textbf{ready}\\claimable};
+  \node[vibeysoft,st] (leased) at (2.9,0)  {\textbf{leased}\\900\,s owner};
+  \node[vibeytealbox,st] (disp) at (5.8,0) {\textbf{dispatched}\\project made};
+  \node[vibeygood,st] (done) at (5.8,-2.05) {\textbf{completed}\\PR published};
+  \node[vibeyghost,st] (blk) at (2.9,-2.05) {\textbf{blocked}\\set by hand};
+  \node[vibeybox,minimum width=1.85cm] (gh) at (0,1.6) {forge: open issues\\labelled triaged};
+  \draw[vibeyflow] (gh) -- node[lab,right] {reconcile} (ready);
+  \draw[vibeyflow] (ready) -- node[lab,above] {claim,\\skip locked} (leased);
+  \draw[vibeyflow] (leased) -- node[lab,above] {dispatch} (disp);
+  \draw[vibeyflow] (disp) -- node[lab,right] {publish} (done);
+  \draw[vibeyback] (leased.south) to[bend left=40] node[redlab,below] {reap: lease expired} (ready.south);
+  \draw[vibeydashed,-{Stealth[length=1.8mm]}] (disp) -- (blk);
+  \node[vibeypill] at (2.9,-3.25) {claim order: bumped first, then critical $\to$ low,\\then least recently updated, then issue number};
+\end{tikzpicture}
+\caption{The triage ticket. Rows mirror the forge's triaged issues and are claimed under a lease with \texttt{FOR UPDATE SKIP LOCKED}; an expired lease returns the row to ready. The claim order is derived from labels and update time, so no one reorders the queue by hand, and the only state a person sets directly is blocked.}
+\label{fig:queue-state}
+\end{figure}
+```
+
+**Who may act.** The six-phase machine names the gates; the bridge adds actors who
+were not in the original model ([Fig. 38](#fig:authority-map)). A person labels and
+prioritises issues, answers the review gate, approves the merge, and is the only party
+who can opt a project into deployment, which is never inferred. The bridge claims,
+orders and publishes. The engine writes code only inside BUILD and only in its own
+worktree. The forge's required checks decide whether the merge train may take a pull
+request. One cell of the map needs stating plainly, because it departs from the
+original model: the DESIGN interview. The bridge answers the design interview's
+question gates with their declared defaults and then accepts the design itself, so on
+this path DESIGN does not wait for a person. Worse, the answers are recorded under the
+operator's own name with trusted provenance: on the first delivered issue three of the
+four interview gates were answered one second after they were raised, and the ledger
+cannot tell those answers from a person's. The path still stops at REVIEW, but a design
+gate answered by a default is not a design gate a person answered. We report this as a
+defect of the bridge, not a property of the model, and the model's rule, a parked gate
+and a recorded human answer, is the one the bridge must be brought back to.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  rowl/.style={font=\sffamily\scriptsize,text=vibeyink,anchor=east},
+  colh/.style={font=\sffamily\tiny\bfseries,text=vibeyink,align=center},
+  yes/.style={circle,fill=vibeyblue,inner sep=2.1pt},
+  hum/.style={circle,fill=vibeygold!90!black,inner sep=2.1pt},
+  flag/.style={circle,fill=vibeyred,inner sep=2.1pt}]
+  \foreach \x/\h in {3.35/{person},4.6/{delivery\\bridge},5.85/{engine},7.1/{forge\\checks}}
+    {\node[colh] at (\x,0.45) {\h};}
+  \foreach \y/\r in {0/{label and prioritise an issue},
+                     -0.45/{claim, order and lease},
+                     -0.9/{answer the design interview},
+                     -1.35/{accept the design},
+                     -1.8/{write code in BUILD},
+                     -2.25/{give the review verdict},
+                     -2.7/{push, open the pull request},
+                     -3.15/{merge into develop},
+                     -3.6/{opt into deployment}}
+    {\node[rowl] at (2.65,\y) {\r};
+     \draw[vibeyedge] (0.2,\y-0.225) -- (7.65,\y-0.225);}
+  \node[hum] at (3.35,0) {};
+  \node[yes] at (4.6,-0.45) {};
+  \node[flag] at (4.6,-0.9) {};
+  \node[flag] at (4.6,-1.35) {};
+  \node[yes] at (5.85,-1.8) {};
+  \node[hum] at (3.35,-2.25) {};
+  \node[yes] at (4.6,-2.7) {};
+  \node[hum] at (3.35,-3.15) {};
+  \node[yes] at (7.1,-3.15) {};
+  \node[hum] at (3.35,-3.6) {};
+  \node[font=\sffamily\tiny,text=vibeygray,align=left,anchor=north west] at (0.2,-4.0)
+    {\tikz\node[hum]{}; a person's recorded decision\quad \tikz\node[yes]{}; automated\\
+     \tikz\node[flag]{}; automated on this path; the model reserves it to a person};
+\end{tikzpicture}
+\caption{The authority map of the delivery path. Gold marks a decision a person records, blue an automated step. Red marks the two design steps the bridge performs with declared defaults, recorded under the operator's name, which the six-phase model reserves to a person; review, merge approval and deployment remain a person's, and deployment is never inferred.}
+\label{fig:authority-map}
+\end{figure}
+```
+
+**A worker that overruns.** The bridge gives each worker run a deadline, 900 seconds
+by default ([Fig. 39](#fig:process-reaping)). A worker that overruns is not merely
+signalled: the bridge walks its process tree, sends the terminate signal to the
+deepest descendants first and the worker last, waits two seconds, and kills whatever
+is still alive, because `uv run` starts children that outlive a signal sent only to
+their parent (the defect commit 19896f1 fixed). Only then does it record the timeout, and it
+leaves the job's lease to the queue's own reaper rather than releasing it, so the job
+returns to the queue by the same path a crashed worker's does and is fenced the same
+way: a late acknowledgement from the old worker is refused.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  r/.style={minimum width=3.4cm,minimum height=.7cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt}]
+  \node[vibeysoft,r] (run) at (0,0) {\textbf{worker run}\\own session, own process group};
+  \node[vibeywarn,r] (dl) at (0,-1.25) {\textbf{deadline passes}\\900\,s by default};
+  \node[vibeybox,r] (term) at (0,-2.5) {\textbf{terminate the tree}\\deepest descendants first};
+  \node[vibeybox,r] (kill) at (0,-3.75) {\textbf{kill survivors}\\after a 2\,s grace};
+  \node[vibeytealbox,r] (ev) at (0,-5.0) {\textbf{record the timeout}\\in the evidence file};
+  \node[vibeysoft,r] (reap) at (0,-6.25) {\textbf{lease left to the reaper}\\job requeued; late ack refused};
+  \draw[vibeyflow] (run) -- (dl);
+  \draw[vibeyflow] (dl) -- (term);
+  \draw[vibeyflow] (term) -- (kill);
+  \draw[vibeyflow] (kill) -- (ev);
+  \draw[vibeyflow] (ev) -- (reap);
+  \node[lab,anchor=west,align=left] at (1.95,-3.1) {no process of the old\\run is left alive to\\write after the timeout\\is recorded};
+\end{tikzpicture}
+\caption{Worker timeout handling in the delivery bridge. The whole process tree is stopped before the timeout is recorded, and the lease is left to the queue's reaper, so a timed-out job returns to the queue by the same fenced path as a crashed worker's.}
+\label{fig:process-reaping}
+\end{figure}
+```
+
+**Capacity before completion.** The bridge applies the session-runner rule of
+[Fig. 12](#fig:capacity-taxonomy) at its own level ([Fig. 40](#fig:capacity-precedence)).
+After every worker run it reads the project's status, and if any job is awaiting
+capacity or any engine's circuit reports a capacity state other than available, it
+records a pause for capacity and stops before it acts on the phase or the open gates.
+The run's phase is acted on only on the branch where capacity was available. The same order holds
+inside each runner, where a capacity verdict outranks a completion claim, so a starved
+run cannot be laundered into success at either level.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  n/.style={minimum width=2.6cm,minimum height=.75cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred}]
+  \node[vibeysoft,n] (end) at (0,0) {\textbf{worker run ends}\\status and gates read};
+  \node[vibeycore,diamond,aspect=2.2,inner sep=1pt,font=\sffamily\tiny\bfseries] (cap) at (0,-1.55) {capacity\\available?};
+  \node[vibeywarn,n] (pause) at (3.55,-1.55) {\textbf{paused for capacity}\\phase not acted on};
+  \node[vibeybox,n] (claim) at (0,-3.1) {\textbf{act on the phase}\\answer, accept, publish};
+  \node[vibeygood,n] (done) at (0,-4.45) {\textbf{progress recorded}};
+  \draw[vibeyflow] (end) -- (cap);
+  \draw[vibeyback] (cap) -- node[redlab,above] {no} (pause);
+  \draw[vibeyflow] (cap) -- node[lab,right] {yes} (claim);
+  \draw[vibeyflow] (claim) -- (done);
+  \node[lab,anchor=north,text width=3.1cm] at (3.55,-2.15) {awaiting-capacity jobs, or any engine circuit not available};
+\end{tikzpicture}
+\caption{Capacity precedence in the delivery bridge. The capacity check runs before the bridge acts on the run's phase, so an exhausted or busy engine records a pause, never progress; the same order holds inside each session runner, where a capacity verdict outranks a completion claim.}
+\label{fig:capacity-precedence}
+\end{figure}
+```
+
+**Measured local capacity.** A sovereign engine's context and output ceilings are no
+longer guessed ([Fig. 41](#fig:probe-lifecycle)). A probe (`scripts/sovereign_probe.py`,
+also reachable as a doctor check) runs a grid of context and output sizes against the
+local server and writes a record: the endpoint, the model, the source revision, the
+shape of the prompt it measured, and the fastest fit that answered validly. At start,
+the chat client loads that record only if its endpoint, model and revision match the
+running configuration and its fit is marked valid; any mismatch, a missing field, or
+an unreadable file drops back to the configured ceilings. At each request the client
+applies the fit only if the prompt is no larger than the shape it was measured on; a
+longer prompt runs under the conservative defaults of 8,192 context tokens and 2,048
+output tokens. The fit is therefore a measurement about one host, one model and one
+revision, and it is never carried to a place it was not measured.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  s/.style={minimum width=2.9cm,minimum height=.7cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred}]
+  \node[vibeysoft,s] (probe) at (0,0) {\textbf{probe a grid}\\contexts $\times$ outputs};
+  \node[vibeysoft,s] (rec) at (0,-1.3) {\textbf{record the fit}\\endpoint, model, revision,\\prompt shape, fastest valid};
+  \node[vibeybox,s] (load) at (0,-2.75) {\textbf{load at start}\\all four must match};
+  \node[vibeybox,s] (req) at (0,-4.05) {\textbf{each request}\\prompt within the shape?};
+  \node[vibeytealbox,s] (fit) at (0,-5.35) {\textbf{measured ceilings}};
+  \node[vibeywarn,minimum width=2.4cm,minimum height=.7cm] (fb) at (3.6,-3.4) {\textbf{configured ceilings}\\8,192 in, 2,048 out};
+  \draw[vibeyflow] (probe) -- (rec);
+  \draw[vibeyflow] (rec) -- (load);
+  \draw[vibeyflow] (load) -- (req);
+  \draw[vibeyflow] (req) -- node[lab,right] {yes} (fit);
+  \draw[vibeyback] (load.east) -| node[redlab,pos=.25,above] {stale or malformed} (fb.north);
+  \draw[vibeyback] (req.east) -| node[redlab,pos=.25,below] {longer prompt} (fb.south);
+\end{tikzpicture}
+\caption{The measured-capacity lifecycle. A probed fit is bound to its endpoint, model, revision and prompt shape; any mismatch at load, or a prompt longer than the one measured, falls back to the configured ceilings rather than to a guess.}
+\label{fig:probe-lifecycle}
+\end{figure}
+```
+
+**The engine's environment.** An engine session runs commands the model chooses, so
+what it can see of the worker's environment is a boundary, and in 3.0.0 it is built
+from an allow-list rather than copied ([Fig. 42](#fig:environment-boundary)). Three
+sources may add a variable: the system basics every process needs, the engine's own
+declared variables and its own API credential, and whatever the project's stored
+configuration declares under `engine_environment`, for every engine or for one. Beneath
+all three sits a forbidden set: vibey's own variables, among them the queue and ledger
+connection string, libpq's variables, and anything shaped like a database credential.
+A declaration that names one of them is refused when the worker is built, not when the
+first session would have received it. A forge token or a cloud credential is not
+forbidden, but it is on no default list; it reaches only an engine a project declares
+it for.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  src/.style={minimum width=2.25cm,minimum height=.95cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred}]
+  \node[vibeysoft,src] (sys) at (0,0) {\textbf{system basics}\\every process};
+  \node[vibeysoft,src] (eng) at (2.75,0) {\textbf{engine's own}\\declared vars,\\its credential};
+  \node[vibeysoft,src] (proj) at (5.5,0) {\textbf{project config}\\\texttt{engine\_}\\\texttt{environment}};
+  \node[vibeycore,minimum width=7.75cm,minimum height=.7cm] (al) at (2.75,-1.6) {allow-list, checked when the worker is built};
+  \node[vibeytealbox,minimum width=3.3cm,minimum height=.8cm] (sess) at (1.1,-3.1) {\textbf{engine session}\\sees only the list};
+  \node[vibeywarn,minimum width=3.3cm,minimum height=.8cm] (forb) at (4.75,-3.1) {\textbf{refused}\\a forbidden name};
+  \foreach \s in {sys,eng,proj}{\draw[vibeyflow] (\s) -- (\s |- al.north);}
+  \draw[vibeyflow] (sess.north |- al.south) -- (sess);
+  \draw[vibeyback] (forb.north |- al.south) -- (forb);
+  \node[lab,anchor=north] at (2.75,-3.65) {forbidden: vibey's own variables (the queue and ledger DSN among them),\\libpq's, and anything shaped like a database credential; forge and cloud\\tokens are on no default list and reach only an engine the project names};
+\end{tikzpicture}
+\caption{The engine environment boundary. A session's environment is assembled from three allow-listed sources, never copied from the worker, and a declaration that names a forbidden variable fails when the worker is built.}
+\label{fig:environment-boundary}
+\end{figure}
+```
+
+**What a verdict is about.** [Fig. 15](#fig:exact-head) binds a claim to the revision it
+evaluated. The sovereign reviewer adds the second binding described in the section on
+the release calculus: to the input the model actually read ([Fig. 43](#fig:exact-head-lifecycle)).
+A verdict on head $h$ is admitted only if it passes four checks in order. The diff
+must fit the window, or the request is never sent and the gate asks a person. The
+server must be told to refuse rather than truncate, so a cut is reported in the
+server's own words. The answer must echo both random check codes, one placed at the
+start of the system prompt and one after the diff, so a silent cut at either end is
+caught. And if a supporting document had to be cut or left out, the verdict may claim
+only the half of the review the diff alone can ground. Each failure is a refusal with
+its reason, and none is a pass.
+
+```latex
+\begin{figure}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  c/.style={minimum width=3.3cm,minimum height=.65cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred,anchor=west}]
+  \node[vibeysoft,c] (h) at (0,0) {\textbf{review of head $h$}\\exact head: $r = h$};
+  \node[vibeybox,c] (fit) at (0,-1.15) {diff fits the window};
+  \node[vibeybox,c] (trunc) at (0,-2.05) {server told: refuse, never cut};
+  \node[vibeybox,c] (codes) at (0,-2.95) {both check codes echoed};
+  \node[vibeybox,c] (docs) at (0,-3.85) {supporting documents whole};
+  \node[vibeygood,c] (ok) at (0,-5.0) {\textbf{verdict admitted}\\about what was read};
+  \draw[vibeyflow] (h) -- (fit);
+  \draw[vibeyflow] (fit) -- (trunc);
+  \draw[vibeyflow] (trunc) -- (codes);
+  \draw[vibeyflow] (codes) -- (docs);
+  \draw[vibeyflow] (docs) -- (ok);
+  \draw[vibeyback] (fit.east) -- ++(.35,0) node[redlab] {not sent; a person decides};
+  \draw[vibeyback] (trunc.east) -- ++(.35,0) node[redlab] {refusal, in its words};
+  \draw[vibeyback] (codes.east) -- ++(.35,0) node[redlab] {verdict discarded};
+  \draw[vibeyback] (docs.east) -- ++(.35,0) node[redlab] {half review only};
+\end{tikzpicture}
+\caption{The exact-head lifecycle extended to the reviewer's input. After $r = h$, a sovereign verdict must survive four checks, each of which refuses rather than passes: the diff fits, the server may not truncate, both check codes return, and the supporting documents were read whole.}
+\label{fig:exact-head-lifecycle}
+\end{figure}
+```
+
+**Context in slices.** The same no-silent-truncation rule is proposed for everything
+the system loads into a finite window: skills, guides, decisions, prompts and
+specifications ([Fig. 44](#fig:microslice-contract)). Under the proposed ADR-0075, a
+converter (`slice_markdown.py`) turns a source document into numbered slices without
+changing the source; each slice carries a stable identity, one purpose, its provenance,
+a measured size, and explicit `requires` and `links` relations, and an index records
+them. Retrieval starts at the slice that matches the request, follows its required
+safety and acceptance slices, measures the whole closure against the budget, and
+records the identities and size it loaded. A closure over budget is split or parked,
+never cut, and optional links are followed only when needed. The converter's slice
+boundaries are mechanical and still need review; a split is not a claim that each
+slice reads well on its own.
+
+```latex
+\begin{figure*}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  n/.style={minimum width=2.3cm,minimum height=1.35cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred}]
+  \node[vibeybox,n] (src) at (0,0) {\textbf{source}\\unchanged,\\authoritative};
+  \node[vibeysoft,n] (conv) at (3.0,0) {\textbf{converter}\\\texttt{slice\_}\\\texttt{markdown.py}};
+  \node[vibeysoft,n] (sl) at (6.0,0) {\textbf{numbered slices}\\id, purpose,\\provenance, size,\\requires, links};
+  \node[vibeybox,n] (q) at (9.0,0) {\textbf{retrieval}\\matching slice,\\then its required\\slices};
+  \node[vibeycore,diamond,aspect=1.9,inner sep=1pt,font=\sffamily\tiny\bfseries] (b) at (12.1,0) {closure\\within\\budget?};
+  \node[vibeygood,n] (load) at (15.2,0) {\textbf{load, record}\\slice ids,\\measured size};
+  \node[vibeywarn,n,minimum height=.9cm] (split) at (12.1,-2.15) {\textbf{split or park}\\never truncate};
+  \draw[vibeyflow] (src) -- (conv);
+  \draw[vibeyflow] (conv) -- (sl);
+  \draw[vibeyflow] (sl) -- (q);
+  \draw[vibeyflow] (q) -- (b);
+  \draw[vibeyflow] (b) -- node[lab,above] {yes} (load);
+  \draw[vibeyback] (b) -- node[redlab,right] {no} (split);
+  \draw[vibeyback,rounded corners=3pt] (split.west) -| node[redlab,pos=.3,below] {smaller slices, or the request parks} (sl.south);
+  \node[lab,anchor=north] at (3.0,-0.85) {mechanical boundaries;\\each split is reviewed};
+\end{tikzpicture}
+\caption{The context-microslice contract (proposed ADR-0075). Source material is converted into identified, bounded slices with provenance and explicit links; retrieval loads a slice with its required closure only when the closure fits the budget, and otherwise splits or parks it rather than dropping the tail.}
+\label{fig:microslice-contract}
+\end{figure*}
+```
+
+**How this paper is published.** The paper itself follows the discipline it describes
+([Fig. 45](#fig:publication-ladder)). `docs/paper.md` is the one source. Evidence is
+recomputed by `scripts/paper_evidence.py`, and every computed figure is written between
+revision-pinned markers by `scripts/paper_figures.py`, whose `--check` mode fails CI
+when a block has drifted from the records. From that source `vibey-gh paper` writes the
+LaTeX and DOCX, the pinned Tectonic typesets the PDF, and `vibey-gh paper-figures`
+compiles each figure on its own and turns it into SVG for the site and the book. Two
+steps are not automated and we do not claim they are. A figure that fails to compile
+for the site keeps its source and shows its caption, with a warning in the build log,
+rather than failing the release; and whether a drawing is legible, with no label on a
+line and no box on another, is judged by a person looking at it, which is how the
+defects repaired in this revision were found.
+
+```latex
+\begin{figure*}[!t]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  n/.style={minimum width=2.45cm,minimum height=1.05cm},
+  lab/.style={font=\sffamily\tiny,text=vibeygray,align=center,inner sep=1.5pt},
+  redlab/.style={lab,text=vibeyred}]
+  \node[vibeysoft,n] (ev) at (0,1.2) {\textbf{evidence}\\\texttt{paper\_evidence.py}};
+  \node[vibeysoft,n] (fg) at (0,-1.2) {\textbf{computed figures}\\\texttt{paper\_figures.py}\\revision-pinned};
+  \node[vibeycore,n] (md) at (3.35,0) {\textbf{docs/paper.md}\\the one source};
+  \node[vibeybox,n] (tex) at (6.7,1.2) {\textbf{LaTeX, DOCX}\\\texttt{vibey-gh paper}};
+  \node[vibeybox,n] (svg) at (6.7,-1.2) {\textbf{per-figure SVG}\\\texttt{paper-figures}};
+  \node[vibeytealbox,n] (pdf) at (10.05,1.2) {\textbf{PDF}\\pinned Tectonic};
+  \node[vibeytealbox,n] (site) at (10.05,-1.2) {\textbf{site and book}\\HTML, EPUB, PDF};
+  \node[vibeygate,n] (eye) at (13.7,0) {\textbf{visual inspection}\\a person looks};
+  \draw[vibeyflow] (ev.east) -- ++(.35,0) |- ([yshift=5pt]md.west);
+  \draw[vibeyflow] (fg.east) -- ++(.35,0) |- ([yshift=-5pt]md.west);
+  \draw[vibeyflow] ([yshift=5pt]md.east) -- ++(.35,0) |- (tex.west);
+  \draw[vibeyflow] ([yshift=-5pt]md.east) -- ++(.35,0) |- (svg.west);
+  \draw[vibeyflow] (tex) -- (pdf);
+  \draw[vibeyflow] (svg) -- (site);
+  \draw[vibeyflow] (pdf.east) -| (eye.north);
+  \draw[vibeyflow] (site.east) -| (eye.south);
+  \draw[vibeyback,rounded corners=3pt] (eye.east) -- ++(.35,0) |- (3.35,-2.55) -- (md.south);
+  \node[redlab,anchor=north] at (8.5,-2.6) {a defect found by eye is fixed in the source, never in an output};
+  \node[redlab,anchor=north] at (svg.south) {fails to compile: caption shown,\\warning logged};
+  \node[lab,anchor=south] at (ev.north) {\texttt{--check} fails CI on drift};
+\end{tikzpicture}
+\caption{Publication provenance. Evidence and computed figures are written into the one source, from which every output is derived by a pinned tool; the legibility of a drawing is still judged by a person, and a defect found that way is repaired in the source.}
+\label{fig:publication-ladder}
+\end{figure*}
+```
+
+Read together, the ten figures draw one boundary: durable work is distinct from live
+work, and nothing crosses from one to the other on a claim alone. A ticket, a lease, a
+measured fit and a verdict are each bound to what they were measured on, and each
+failure is recorded as what it was. They also draw the limits. The atlas does not
+claim that an open issue will be delivered, that a fit measured on one host holds on
+another, that the bridge's defaults for the design interview are the answers a person
+would give, or that a generated figure is a legible one.
+
+```latex
+\begin{plainwords}
+This part of the paper is a picture book of the newest machinery. A robot helper now takes a job from the project's to-do list, but only after a person has sorted and labelled it, and it holds the job for fifteen minutes at a time so that a stuck helper cannot keep it forever. The helper builds the change in its own copy of the project, and then it stops and waits for a person to check the work. If a helper runs too long, it is stopped completely, every little process it started included, before anything is written down. If the computer is too busy or out of allowance, the helper writes down that it paused, not that it finished. The helper only uses as much memory as was actually measured on this computer, and it only sees the secrets it was allowed to see. A grader must prove it read the whole change. One thing we tell you straight: on this path the helper fills in the first design questions with standard answers by itself, and we think a person should look at whether that is right. And the pictures in this paper are checked by a person with their own eyes, which is how we found the ones we fixed.
+\end{plainwords}
+```
 
 ## Validation
 
@@ -1387,6 +3874,30 @@ claims are validated separately, by the stress record and the evidence script ab
 the local Qwen pilot is reported as an operational reliability observation with its
 own cutoff and does not enlarge the throughput claim.
 
+The 3.0.0 additions are validated the same three ways, and each also went through an
+independent adversarial review whose probes are review records rather than tracked
+tests. At the property level, a Hypothesis state machine drives the priority lane
+through random, overlapping bumps, un-bumps and job endings and checks the derivation
+after every step (#1095, #1103), and the sovereign reviewer's refusals are pinned by a
+stub server that answers the way the real one was seen to answer: the half-window
+count, the HTTP 400 in the server's words, and a reply that echoes only one check code
+(#1101). At the chaos level, the whole orchestrator suite now runs as the restricted
+application role, so any query that needs an undeclared privilege fails as
+`permission denied` (#1100); five workers claim concurrently against a bumped queue
+and take exactly the front five in order (#1091); and a hung test is dumped at 240 s
+and failed by name at 300 s (#1105). At the cluster level, a new cluster-smoke step
+checks that, as the worker's role, an update, a delete and a truncation of the ledger
+are refused for want of privilege and disabling a trigger is refused as not the owner,
+and that, as the owner, all three are refused by the triggers (#1100). The full suite
+at #1105's head passed 3,627 tests, with 18 skipped and 1 expected failure, and the
+four per-layer branch-coverage floors at 100% (#1105).
+
+```latex
+\begin{plainwords}
+We check the system three ways. Tests that walk every branch of the important code. A chaos test where helpers crash on purpose while a real database is running, to prove that no job is lost and no job is done twice. And a live run of a whole project on two different robot helpers, including a forced switch from one to the other in the middle. The newest parts were also attacked on purpose by separate reviewers, who tried to break them before we wrote about them here.
+\end{plainwords}
+```
+
 ## Related work
 
 Queue-based job schedulers built on `SKIP LOCKED` provide claims, leases and retries
@@ -1406,7 +3917,10 @@ refuse rather than by mean time between failures. The retrieval engine is lexica
 over SQLite FTS5; dense retrieval would reintroduce the nondeterminism the
 reviewability invariant forbids. The upward drift of the throughput band is the
 continuous batching of Orca, and the coordination cost that the six-material postulate
-treats as a coupling is the one Brooks described for human teams.
+treats as a coupling is the one Brooks described for human teams. The bound on what
+more lanes sharing one model slot could buy is Amdahl's. The ledger guard uses
+PostgreSQL's own trigger and privilege machinery rather than rules, whose documented
+behaviour on partitions and `TRUNCATE` is what left the earlier guard open.
 
 ## Conclusion
 
@@ -1416,9 +3930,22 @@ human authority is a structural property of the state machine rather than a
 prompt-engineering hope. The same discipline, binding every claim to the state it
 describes, governs the runners beneath the orchestrator and the release calculus above
 it. In the project's controlled record, production kept to a band set by its
-substrate, and the inputs that stopped work were decisions and judgments. The
-engineering that remains is less about producing faster than about deciding well and
-cheaply.
+substrate, and the inputs that stopped work were decisions and judgments. The 3.0.0
+record says the same from three more directions. A local storm was bound by one model
+slot and converted no lane without a person; the audit that found this was mostly wrong
+until it was verified; and on the day the release's fixes landed, the step that
+limited delivery was independent review, which merging outran and then had to repay.
+The guarantees added in this release, a ledger the database refuses to rewrite, a queue
+order that cannot be moved from outside, an engine that cannot see the worker's
+secrets, and a reviewer that will not grade what it did not read, are each stated here
+with the limits they do not cross. The engineering that remains is less about producing
+faster than about deciding well and cheaply.
+
+```latex
+\begin{plainwords}
+Put the notebook, not the robot, at the centre. Then any robot can be swapped out, a crash just means reading the notebook again, and people stay in charge at the right moments. The machines are already fast enough. The work ahead is helping people decide well, cheaply, and on time.
+\end{plainwords}
+```
 
 ## References
 
@@ -1437,4 +3964,21 @@ cheaply.
 - PyPI, *Trusted Publishers*, `https://docs.pypi.org/trusted-publishers/`, 2023.
 - GitHub, *About protected branches and rulesets*, GitHub Docs, 2024.
 - SQLite, *FTS5 Extension*, `https://www.sqlite.org/fts5.html`.
+- G. M. Amdahl, "Validity of the Single Processor Approach to Achieving Large Scale Computing Capabilities," *Proceedings of the AFIPS Spring Joint Computer Conference*, 1967, pp. 483–485. doi:10.1145/1465482.1465560.
+- PostgreSQL Global Development Group, *The Rule System* and *CREATE TRIGGER* (rules and row-level triggers on partitioned tables; `TRUNCATE` triggers). PostgreSQL documentation, `https://www.postgresql.org/docs/current/`.
 - The vibey repository: the sovereignty stress record, `src/vibey_tools/gh/docs/sovereignty-stress-2026-08-30.md`; the evidence script, `scripts/paper_evidence.py`; the architecture decision records, `docs/architecture/decisions/`; `https://github.com/the-vibey-project/vibey`, 2026.
+
+## A call to FOSS developers
+
+Everything in this paper is free and open-source software, built in the open, and it
+is not finished. The machines that write code are cheap now; what is scarce is
+infrastructure a person can own, governance that holds up when nobody is watching, and
+evidence honest enough to publish. If you write software and any of that speaks to
+you, come and build it with us.
+
+- Join the conversation on Discord: [discord.gg/Qvu8aYnVS](https://discord.gg/Qvu8aYnVS).
+- Read how to join me and what to work on first: [vibewithadam.matthewsteinberger.com/join-me](https://vibewithadam.matthewsteinberger.com/join-me).
+
+Bring your questions, your critiques and your pull requests. Whether you care about
+queues and ledgers, sovereign local models, reproducible benchmarks, or the young field
+of Biodigitology, there is a lane for you.

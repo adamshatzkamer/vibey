@@ -260,7 +260,10 @@ the protocol, not to any one subprocess adapter."""
 
 class EngineId(StrEnum):
     CLAUDELOOP = "claudeloop"; CODEXLOOP = "codexloop"
-    CURSORLOOP = "cursorloop"; AGYLOOP = "agyloop"; QWENLOOP = "qwenloop"
+    CURSORLOOP = "cursorloop"; AGYLOOP = "agyloop"
+    GPTOSSLOOP = "gptossloop"   # the sovereign default: the local runner on GPT-OSS
+    QWENLOOP = "qwenloop"       # the same runner on a Qwen model, opt-in (ADR-0064)
+    CLAUDELOOP_LOCAL = "claudeloop-local"
 
 
 class Capability(StrEnum):
@@ -515,6 +518,20 @@ class EventKind(StrEnum):
     VISUAL_DESIGN_ACCEPTED = "VisualDesignAccepted"
     VISUAL_DESIGN_WAIVED = "VisualDesignWaived"
     DEPLOYMENT_OPTED_IN = "DeploymentOptedIn"; DEPLOYMENT_DECLINED = "DeploymentDeclined"
+    DELIVERY_ESTIMATE_RECORDED = "DeliveryEstimateRecorded"
+    # Queue priority (ADR-0054), in the same transaction as the job rows they describe
+    JOB_PRIORITY_BUMPED = "JobPriorityBumped"
+    JOB_PRIORITY_UNBUMPED = "JobPriorityUnbumped"
+    JOB_PRIORITY_REFUSED = "JobPriorityRefused"
+    # Queue reaping (ADR-0056): object, condition, measured value, threshold, action
+    QUEUE_REAPED = "QueueReaped"
+    # `vibey budget set`/`clear`: field, old, new, by, account; with the config write
+    BUDGET_CAP_CHANGED = "BudgetCapChanged"
+    # A gate answered once: gate, kind, answer, request id, by, account; with the answer
+    GATE_ANSWERED = "GateAnswered"
+    ENGINE_FAILED_OVER = "EngineFailedOver"    # ADR-0070
+    ENGINE_PROBED = "EngineProbed"
+    ENGINE_HANDED_BACK = "EngineHandedBack"
 
 
 CLOSABLE: frozenset[EventKind] = frozenset({
@@ -742,6 +759,35 @@ class FailureClass(StrEnum):
 
 def backoff(attempt: int, *, base=timedelta(seconds=2), cap=timedelta(minutes=15)) -> timedelta: ...
 def idempotency_key(project_id: UUID, cycle: int, kind: str, subject: str) -> str: ...
+
+
+# queue_priority.py -- who may move a job ahead, and what moves with it (ADR-0054)
+MOVABLE_STATES = {READY, LEASED, AWAITING_HUMAN, AWAITING_CAPACITY}
+
+@dataclass(frozen=True, slots=True)
+class Caller:                            # uid from the OS, name from pwd -- never $USER
+    uid: int; name: str
+
+class PriorityGrant:                     # the reviewed config's owner, + declared sources
+    def decide(self, source: str | None, caller) -> PriorityDecision: ...
+    # no source: admitted iff caller owns the anchor -> "operator:NAME"
+    # a source:  admitted iff declared AND caller owns the anchor -> "source:NAME"
+
+@dataclass(frozen=True, slots=True)
+class QueuedJob:                         # the part of a row that decides its place
+    id: UUID; state: StoredJobState; priority: int; run_after: datetime
+    bump_seq: int | None = None; depends_on: tuple[UUID, ...] = ()
+    bump_named: bool = False; phase_known: bool = True
+
+class ClaimOrder:                        # the claim's ORDER BY, as a sort key
+    def key(self, job: QueuedJob) -> tuple[bool, int, int, datetime, UUID]: ...
+    # (bump_seq is None, bump_seq, -priority, run_after, id)
+
+class BumpPlanner:                       # target + unfinished deps, deps first, relative
+    def plan(self, target, jobs, *, finished_ok=False) -> BumpPlan: ...
+    # order kept; a dependency that can never finish, or a ring, is refused
+class UnbumpPlanner:                     # leave the named set, re-derive the lane; refused
+    def plan(self, target, jobs) -> UnbumpPlan: ...   # while another named job needs it
 
 
 # spec.py
@@ -1121,8 +1167,12 @@ never touches the filesystem — reading the file is an infrastructure concern.
 ```python
 VALID_ISOLATION_LEVELS = ("worktree", "container", "vm")
 VALID_EFFORTS = ("trivial", "low", "standard", "high", "max")
-DEFAULT_ENGINES = ("claudeloop", "codexloop", "cursorloop", "agyloop")
-KNOWN_ENGINES = (*DEFAULT_ENGINES, "qwenloop")
+DEFAULT_ENGINES = ("gptossloop",)   # the sovereign default, on without declaration
+KNOWN_ENGINES = ("claudeloop", "codexloop", "cursorloop", "agyloop",
+                 "gptossloop", "qwenloop", "claudeloop-local")
+LOCAL_ENGINE_FEATURES = {"gptossloop": "gptossloop", "qwenloop": "qwenloop",
+                         "claudeloop-local": "claudeloop_local"}
+LOCAL_ENGINES_ON_BY_DEFAULT = frozenset({"gptossloop"})   # ADR-0064
 
 class ConfigError(VibeyError):
     def __init__(self, path: str, message: str) -> None: ...
@@ -1168,7 +1218,9 @@ class DeployConfig:
 
 @dataclass(frozen=True, slots=True)
 class FeaturesConfig:
+    gptossloop: bool = True        # on unless switched off (ADR-0064)
     qwenloop: bool = False
+    claudeloop_local: bool = False
 
 @dataclass(frozen=True, slots=True)
 class QwenloopConfig:
@@ -1194,20 +1246,23 @@ class VibeyConfig:
 def parse_toml_string(text: str) -> dict[str, Any]: ...   # stdlib tomllib.loads
 
 def parse_config(data: dict[str, Any]) -> VibeyConfig:
-    """Raises ConfigError on the first violation found. `qwenloop` may only
-    be requested (in engines.enabled or any phase's engines list) once
-    features.qwenloop is true; conversely, turning features.qwenloop on
-    without an explicit engines.enabled list adds "qwenloop" to the default
-    engine set automatically."""
+    """Raises ConfigError on the first violation found. A local engine may
+    only be requested (in engines.enabled or any phase's engines list) while
+    its switch is on: `qwenloop` once features.qwenloop is true, `gptossloop`
+    unless features.gptossloop is false. The sovereign default is added to any
+    engines.enabled list; without an explicit list, every switched-on local
+    engine is added to the default engine set automatically."""
 
 def load_config_from_string(text: str) -> VibeyConfig: ...
     # = parse_config(parse_toml_string(text))
 ```
 
 Config parsing can live in `domain/` because `tomllib` is stdlib. Reading the
-file is `infrastructure/config_loader.py::load_config_from_path`, which also
-applies the `VIBEY_FEATURE_QWENLOOP` override; as of 2026-09-15 it has no
-runtime caller (see `docs/reference/configuration.md`).
+file is `infrastructure/config_loader.py::load_config_from_path`; as of
+2026-09-15 it has no runtime caller (see `docs/reference/configuration.md`). The
+`VIBEY_FEATURE_*` overrides are applied by
+`infrastructure/engines/local_engines.py::LocalEngineSettings`, the one resolver
+the worker, `vibey doctor` and `vibey loops` share.
 
 ---
 
@@ -1586,6 +1641,14 @@ class InvalidAnswer(VibeyError):
     """A human-gate answer was not in the expected QUESTION_ID=ANSWER form."""
 class UnknownProvider(VibeyError):
     """The requested engine provider is not one vibey knows how to build."""
+class ReorderRefused(VibeyError): ...      # queue priority (ADR-0054): every one is recorded
+class UnknownJob(ReorderRefused): ...
+class NotReorderable(ReorderRefused): ...  # finished, or a state/phase this vibey does not know
+class DependencyCycle(ReorderRefused): ... # a ring the planner will not order
+class DependencyCannotFinish(ReorderRefused): ...  # a failed or cancelled dependency
+class DependentsStillBumped(ReorderRefused): ...   # un-bump them first
+class ReorderConflict(ReorderRefused): ... # the database broke a lock cycle; retry
+class PriorityRefused(ReorderRefused): ... # no grant (12.j)
 ```
 
 ---

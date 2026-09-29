@@ -8,6 +8,7 @@ they are checked against Postgres rather than a mock.
 """
 
 import os
+import re
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -96,6 +97,42 @@ async def test_spec_carries_budget_caps_into_project_config(tmp_path: Path) -> N
     assert stored.config["skills_context"] == {"mode": "shadow", "budget": 4000}
     with pytest.raises(ValueError, match="skillsContext must be an object"):
         handlers._project_config("demo", {"skillsContext": "shadow"})
+
+
+async def test_spec_carries_the_declared_gate_and_engine_environments(tmp_path: Path) -> None:
+    """The CR declares what `vibey new` reads from vibey.toml: `spec.gates` and
+    `spec.engineEnvironment` reach the record as `gates` and `engine_environment`."""
+    async with build_app() as resources:
+        project = await handlers.ensure_project(
+            resources,
+            name="demo",
+            spec={
+                "repo": str(tmp_path),
+                "gates": {"timeout_seconds": 900, "env_allow": ["JAVA_HOME"]},
+                "engineEnvironment": {"engines": {"agyloop": ["GOOGLE_ACCESS_TOKEN"]}},
+            },
+            known_project_id=None,
+        )
+        stored = await resources.projects.get(project.project_id)
+    assert stored is not None
+    assert stored.config["gates"] == {"timeout_seconds": 900, "env_allow": ["JAVA_HOME"]}
+    assert stored.config["engine_environment"] == {"engines": {"agyloop": ["GOOGLE_ACCESS_TOKEN"]}}
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ({"gates": "fast"}, "spec.gates must be an object"),
+        ({"engineEnvironment": ["X"]}, "spec.engineEnvironment must be an object"),
+        ({"gates": {"env_allow": ["VIBEY_PG_URL"]}}, "VIBEY_PG_URL can never be passed"),
+        ({"engineEnvironment": {"allow": ["PGHOST"]}}, "PGHOST can never be passed"),
+    ],
+)
+def test_a_malformed_or_forbidden_environment_in_the_spec_is_refused(
+    spec: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        handlers._project_config("demo", spec)
 
 
 async def test_answers_from_the_cr_go_through_the_shared_gate_service(tmp_path: Path) -> None:
@@ -250,3 +287,97 @@ def test_run_scoped_to_one_namespace_is_not_cluster_wide() -> None:
     with patch.object(kopf, "run") as kopf_run:
         handlers.run(namespace="vibey")
     kopf_run.assert_called_once_with(namespace="vibey", clusterwide=False)
+
+
+async def test_a_gate_answered_elsewhere_mid_reconcile_is_reported_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The compare-and-set, seen from the operator: it lists a gate as open, someone
+    answers it first, and the operator's answer is refused and reported as ignored --
+    the first answer stands."""
+    async with build_app() as resources:
+        project = await handlers.ensure_project(
+            resources, name="demo", spec={"repo": str(tmp_path)}, known_project_id=None
+        )
+        gate = await resources.gates.raise_gate(
+            project.project_id, None, HumanGateRequest(kind="question", prompt="q", options=())
+        )
+        stale = await resources.gates.open_for_project(project.project_id)
+        await resources.gate_answers.answer(gate.gate_id, {"choice": "human"}, by="adam")
+
+        async def _stale_listing(_project_id: object) -> object:
+            return stale
+
+        monkeypatch.setattr(resources.gates, "open_for_project", _stale_listing)
+        plan = await handlers.apply_answers(
+            resources,
+            project_id=project.project_id,
+            spec_answers={str(gate.gate_id): {"choice": "operator"}},
+        )
+        settled = await resources.gates.get(gate.gate_id)
+
+    assert plan.apply == ()
+    assert plan.ignored == ((str(gate.gate_id), "answered elsewhere first, by adam"),)
+    assert settled is not None
+    assert settled.answer == {"choice": "human"}
+
+
+async def test_the_operator_s_replay_of_an_answer_that_landed_is_a_no_op(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its request id is derived from the gate and the answer, so a reconcile that saw
+    the gate open while its own earlier pass was landing replays, and is not refused."""
+    async with build_app() as resources:
+        project = await handlers.ensure_project(
+            resources, name="demo", spec={"repo": str(tmp_path)}, known_project_id=None
+        )
+        gate = await resources.gates.raise_gate(
+            project.project_id, None, HumanGateRequest(kind="question", prompt="q", options=())
+        )
+        stale = await resources.gates.open_for_project(project.project_id)
+        answers = {str(gate.gate_id): {"choice": "a"}}
+        await handlers.apply_answers(resources, project_id=project.project_id, spec_answers=answers)
+
+        async def _stale_listing(_project_id: object) -> object:
+            return stale
+
+        monkeypatch.setattr(resources.gates, "open_for_project", _stale_listing)
+        again = await handlers.apply_answers(
+            resources, project_id=project.project_id, spec_answers=answers
+        )
+
+    assert again.apply == ((gate.gate_id, {"choice": "a"}),)
+    assert again.ignored == ()
+
+
+async def test_a_gate_that_cannot_be_answered_is_reported_and_the_rest_still_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from vibey.domain.errors import WrongPhase
+
+    async with build_app() as resources:
+        project = await handlers.ensure_project(
+            resources, name="demo", spec={"repo": str(tmp_path)}, known_project_id=None
+        )
+        bad = await resources.gates.raise_gate(
+            project.project_id, None, HumanGateRequest(kind="question", prompt="1", options=())
+        )
+        good = await resources.gates.raise_gate(
+            project.project_id, None, HumanGateRequest(kind="question", prompt="2", options=())
+        )
+        real = resources.gate_answers.answer
+
+        async def _refusing(gate_id, answer, **kwargs):  # type: ignore[no-untyped-def]
+            if gate_id == bad.gate_id:
+                raise WrongPhase("phase unknown here")
+            return await real(gate_id, answer, **kwargs)
+
+        monkeypatch.setattr(resources.gate_answers, "answer", _refusing)
+        plan = await handlers.apply_answers(
+            resources,
+            project_id=project.project_id,
+            spec_answers={str(bad.gate_id): {"choice": "a"}, str(good.gate_id): {"choice": "b"}},
+        )
+
+    assert plan.apply == ((good.gate_id, {"choice": "b"}),)
+    assert (str(bad.gate_id), "not answered: phase unknown here") in plan.ignored

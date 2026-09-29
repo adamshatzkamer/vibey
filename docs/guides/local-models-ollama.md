@@ -2,18 +2,25 @@
 
 Sub-doctrine 8.a makes the sovereign path the preferred way to run vibey, not the
 fallback. This guide is the operator recipe for doing that on one machine with
-[Ollama](https://ollama.com): the server, the claudeloop profile, the two switches,
+[Ollama](https://ollama.com): the server, the claudeloop profile, the switches,
 and — just as important — what a local model can and cannot carry today.
 
-With a local engine switched on, vibey:
+There are three local engines. `gptossloop` — the local runner on GPT-OSS 20B, the
+sovereign default — is on without any switch. `qwenloop` is the same runner on a
+Qwen model (`qwen3:14b`), and `claudeloop-local` is the claudeloop binary on a local
+backend profile; both are opt-in
+([ADR-0064](../architecture/decisions/0064-gptossloop-is-the-sovereign-engine.md)).
+With its local engines on, vibey:
 
 - **prefers local engines first for BUILD.** Selection runs smooth weighted
-  round-robin within the LOCAL tier (`qwenloop`, `claudeloop-local`) and falls back
-  to the paid engines only when no local engine is eligible
+  round-robin within the LOCAL tier (`gptossloop`, plus `qwenloop` and
+  `claudeloop-local` when switched on) and falls back to the paid engines only when
+  no local engine is eligible
   ([ADR-0038](../architecture/decisions/0038-local-engines-are-preferred-first.md));
 - **runs DESIGN and DECOMPOSE on the local model** when no `--provider` is given
-  (`QwenloopDesignProvider`, `QwenloopWorkPlanProducer`);
-- **costs nothing per token**: both local engines are priced 0/0, and claudeloop
+  (`GptossloopDesignProvider`, `GptossloopWorkPlanProducer`, recorded in the ledger
+  as `gptossloop`);
+- **costs nothing per token**: every local engine is priced 0/0, and claudeloop
   records every local turn at $0.
 
 ## 1. The Ollama server
@@ -46,10 +53,10 @@ ollama pull your-model:tag
 
 ```bash
 export VIBEY_OLLAMA_URL=http://127.0.0.1:11434
-export VIBEY_OLLAMA_MODEL=your-model:tag     # or --ollama-model on work/worker
+export VIBEY_OLLAMA_MODEL=your-model:tag     # or --ollama-model on work/worker; default gpt-oss:20b
 ```
 
-For the Qwen storm profile used while developing this repository, see the
+For the qwenloop storm profile used while developing this repository, see the
 copyable [qwenloop-local.toml](../examples/qwenloop-local.toml) and
 [qwenloop-storm.env.example](../examples/qwenloop-storm.env.example) examples.
 The checked-in storm profile uses `qwen3:14b`, a 32K context window, a 40-turn local budget,
@@ -58,11 +65,25 @@ for local agent work. Qwen lifecycle desktop notifications stay enabled and
 use macOS's `Ping` sound; `--desktop-notifications` is explicit in the example
 commands even though it is the default.
 
-- The DESIGN and DECOMPOSE providers talk to `<VIBEY_OLLAMA_URL>/api/chat`.
-- qwenloop's process gets `QWENLOOP_BASE_URL=<VIBEY_OLLAMA_URL>/v1` and
-  `QWENLOOP_MODEL=<the model>`, so it attaches to this server instead of starting its
-  own — each only when you have not set it yourself. Without `VIBEY_OLLAMA_URL`,
-  qwenloop keeps its own backend selection.
+- The DESIGN and DECOMPOSE providers talk to `<VIBEY_OLLAMA_URL>/api/chat`, in JSON
+  mode with the answer's schema stated in the prompt and checked on the way back; a
+  malformed answer is re-asked once, naming what was wrong. A reply cut short by its
+  output budget (`done_reason: length`, the reasoning spent every token) is retried
+  once with double the budget, within `VIBEY_OLLAMA_CONTEXT`, and reasoning level
+  `VIBEY_OLLAMA_RETRY_THINK` (`low` by default; `none` leaves the model's own). A
+  second cut-short reply fails as a *capacity* shortfall naming `VIBEY_OLLAMA_OUTPUT`
+  / `VIBEY_OLLAMA_CONTEXT`. Measured before and after in
+  [sovereign-retry-2026-09-29](../architecture/evidence/sovereign-retry-2026-09-29.md).
+- gptossloop's process gets `GPTOSSLOOP_BASE_URL=<VIBEY_OLLAMA_URL>/v1` and
+  `GPTOSSLOOP_MODEL=<the model>` (`--ollama-model`, else `VIBEY_OLLAMA_MODEL`, else
+  `gpt-oss:20b`), so it attaches to this server and runs the providers' model.
+- qwenloop's process gets `QWENLOOP_BASE_URL=<VIBEY_OLLAMA_URL>/v1` only — never a
+  model: it asks for `qwen3:14b` unless `QWENLOOP_MODEL` or its own config names
+  another, so pull that model too.
+- Each variable is set only when you have not set it yourself. Without
+  `VIBEY_OLLAMA_URL`, each runner keeps its own backend selection. gptossloop reads
+  only `GPTOSSLOOP_*` and qwenloop only `QWENLOOP_*`, so naming a model for one never
+  changes the other's.
 - claudeloop-local reads its endpoint from its **profile** (next step), so keep the
   profile's `base_url` equal to `VIBEY_OLLAMA_URL`.
 
@@ -100,12 +121,19 @@ call. A model that fails it cannot do agent work under Claude Code at all.
 ## 4. Switch the local engines on
 
 Each local engine has its own switch. The environment variable wins whenever it is
-set; otherwise `[features]` in the project's config decides.
+set; otherwise `[features]` in the project's config decides; otherwise the engine's
+default applies.
 
-| Engine | Environment | `vibey.toml` |
-|---|---|---|
-| `qwenloop` | `VIBEY_FEATURE_QWENLOOP=1` | `[features] qwenloop = true` |
-| `claudeloop-local` | `VIBEY_FEATURE_CLAUDELOOP_LOCAL=1` | `[features] claudeloop_local = true` |
+| Engine | Default | Environment | `vibey.toml` |
+|---|---|---|---|
+| `gptossloop` | on | `VIBEY_FEATURE_GPTOSSLOOP=0` switches it off | `[features] gptossloop = false` |
+| `qwenloop` | off | `VIBEY_FEATURE_QWENLOOP=1` | `[features] qwenloop = true` |
+| `claudeloop-local` | off | `VIBEY_FEATURE_CLAUDELOOP_LOCAL=1` | `[features] claudeloop_local = true` |
+
+Before ADR-0064 the qwenloop switch turned on the engine that ran `gpt-oss:20b`; that
+engine is now `gptossloop`, on by default. With the qwenloop switch on, `vibey
+worker` and `vibey doctor` print a `note:` saying so — drop the switch unless you
+want Qwen as well.
 
 claudeloop-local's own settings:
 
@@ -126,7 +154,8 @@ alike.
 ```bash
 vibey doctor                                   # lists every switched-on local engine
 vibey doctor --conformance --record --engine claudeloop-local
-vibey doctor --conformance --record --engine qwenloop
+vibey doctor --conformance --record --engine gptossloop
+vibey doctor --conformance --record --engine qwenloop   # when switched on
 ```
 
 `vibey doctor` runs `claudeloop doctor --profile <name>` for claudeloop-local, so the
@@ -139,16 +168,65 @@ default. Set `structured_verdict = true` only for a model you intend to hold to 
 conformance then requires a `VerdictRendered` event from the configured model, and a
 claim it cannot prove fails conformance and makes the engine ineligible.
 
+### Measuring a capacity fit
+
+The sovereign DESIGN and DECOMPOSE providers reach Ollama through one client with two
+ceilings: the context window it asks for (`num_ctx`: `VIBEY_OLLAMA_CONTEXT`, default
+`8192`, at least `4096`) and the output it allows (`num_predict`:
+`VIBEY_OLLAMA_OUTPUT`, default `2048`). `vibey doctor --sovereign-fit` measures what
+this host's server actually answers, and records it:
+
+```bash
+vibey doctor --sovereign-fit                   # writes ~/.local/state/vibey/sovereign-fit.json
+vibey doctor --sovereign-fit --fit-output ./sovereign-fit.json
+export VIBEY_OLLAMA_FIT=~/.local/state/vibey/sovereign-fit.json   # for work and worker
+```
+
+The probe is `scripts/sovereign_probe.py`, run with doctor's own interpreter against
+`VIBEY_OLLAMA_URL` and `VIBEY_OLLAMA_MODEL`. It sends one JSON-mode chat request for each
+combination of context `4096`, `8192` and output `512`, `1024`, `2048`, each with a
+120-second timeout. A combination is valid when the reply carries non-empty content, and
+the fastest valid one becomes `selected_fit`. The record holds `measured_at`, `url`,
+`model`, `revision` (`git rev-parse HEAD` in the directory doctor runs in, else
+`unknown`), `prompt_shape` (the probe's own prompt size), every result, and
+`selected_fit`. With no valid combination doctor prints `sovereign fit FAIL` and exits 1.
+The file is still written, with `selected_fit: null`, which the client ignores.
+
+Doctor does not export anything: set `VIBEY_OLLAMA_FIT` in the environment of `vibey
+work` and `vibey worker`. The client then uses the record only when all of these hold:
+
+- its `url` equals `VIBEY_OLLAMA_URL` (default `http://127.0.0.1:11434`) exactly, as a
+  string, so a trailing slash is a different server;
+- its `model` equals the model in effect: `--ollama-model`, else `VIBEY_OLLAMA_MODEL`,
+  else `gpt-oss:20b`;
+- when `VIBEY_REVISION` is set, its `revision` equals it;
+- its `selected_fit` is valid, with a context of at least `4096` and a positive output,
+  and it carries a `prompt_shape`.
+
+Otherwise (unset, unreadable, malformed or mismatched) the configured ceilings apply:
+`VIBEY_OLLAMA_CONTEXT` and `VIBEY_OLLAMA_OUTPUT`, `8192` and `2048` by default.
+
+A matching record replaces those two ceilings with its measured context and output, but
+only for a request no larger than the prompt it was measured with (the record's system
+plus user characters). A larger request falls back to the built-in ceilings, `8192` and
+`2048`, not to the two variables. The probe's prompt is 42 characters today, so real
+DESIGN and DECOMPOSE prompts run on the built-in ceilings: the record proves what the
+server answers at each size, not yet a working size for a full ledger.
+
+The probe script ships in the repository, not in the `vibey-engine` wheel. Doctor looks
+for it beside the source tree it runs from, so `--sovereign-fit` works from a checkout
+(an editable install) and fails with `sovereign fit FAIL` from a wheel install.
+
 ## 6. Run
 
 ```bash
 vibey worker                                   # sovereign DESIGN/DECOMPOSE, local-first BUILD
-vibey worker --engines qwenloop,claudeloop-local   # never fall back to a paid engine
+vibey worker --engines gptossloop,claudeloop-local   # never fall back to a paid engine
 ```
 
 - An explicit `--provider` always wins; `claudeloop` (paid) is never a default.
-- Verification still rotates: qwenloop's work is reviewed by claudeloop-local and the
-  other way round. With one local engine in the pool, the review goes to a paid
+- Verification still rotates: gptossloop's work is reviewed by claudeloop-local (or
+  qwenloop) and the other way round. With one local engine in the pool, the review goes to a paid
   engine if one is configured, or the engine reviews its own diff and the ledger says
   so ([ADR-0035](../architecture/decisions/0035-independence-is-the-default-not-an-absolute.md)).
 - A run whose backend cannot serve it — the server down, a model not pulled or out of

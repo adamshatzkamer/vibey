@@ -26,14 +26,14 @@ defaults below. Paths are repository-relative unless stated otherwise.
 | `branches.integration` | string / `develop` | Integration and preview branch. |
 | `branches.release` | string / `main` | Production branch; managed automation never deletes it. |
 | `merge_train.owner` | string / empty | Normalized repository-owner login. |
-| `merge_train.trusted_authors` | string list / empty | Authors exempt from outside-author review. |
+| `merge_train.trusted_authors` | string list / empty | Authors whose green pull requests the merge train may merge unattended (the owner is always included). Every other author's pull request is held "needs a human merge" whatever its gates and reviews say (ADR-0053); a bot matches either spelling (`app/x` or `x[bot]`). Distinct from `[unattended_approval] authors`, which says whom a delegated approver may act for. |
 | `merge_train.restack_conflicts` | boolean / `true` | Let the train merge the integration branch into a conflicting or behind head itself, locally, before reporting it as stuck. GitHub computes mergeability without this repository's `.gitattributes`, so a path declared `merge=union` (see `install.union_merge_paths`) is called a conflict there and resolves here. The restacked pull request merges on the NEXT train run, once its checks have re-run against the tree that now exists. Forks are never written to, whatever this is set to. `false` reports the conflict and leaves it to a person. |
 | `merge_train.protected_paths` | string list / empty | Paths the train never merges unattended. A pull request that touches one — or whose changed files it cannot list completely — is reported `needs a human merge` instead of merged, because the train's fallback to `gh pr merge --admin` would bypass the code-owner review a ruleset asks for (see `require_code_owner_review`). Shell-style globs matched case-sensitively against the whole repository-root path, where `*` also crosses `/`: `tests/live/*` protects that whole tree. A rename counts as a change to its old path too. The list comes from the paginated REST files endpoint and is checked against GitHub's own `changedFiles` count, so a truncated listing refuses rather than passes. A promotion from the integration branch is exempt: everything it carries already merged there under this check. Entries must be unique and non-empty, and a leading `/` (the CODEOWNERS habit) is refused at load because no listed path starts with one. Empty protects nothing — the behaviour before this key existed. |
 | `install.workflows` | string list / all managed workflows | Exact managed subset; `[]` installs hooks and CLI assets only. |
 | `install.union_merge_paths` | string list / `["CHANGELOG.md"]` | Files declared `merge=union` in `.gitattributes`, so two branches appending to the same section merge instead of conflicting. Appended to an existing `.gitattributes`, never rewriting it. `[]` declares none. |
 | `install.self_source` | string / `"."` | Where a repository that **is** the tooling keeps its own copy, for the workflows that install it. Declared rather than discovered on purpose: a workflow that searched the tree for a `pyproject.toml` declaring `name = "vibey-gh"` would be reading a pull request's own files, and a branch that adds one anywhere would get it installed with that job's permissions. The rendered workflows verify the path before using it and fall back to the published release if it does not hold the tooling. It also anchors `automation-bootstrap.yml`'s change scope: `gh pr diff` reports repository-root paths, so a vendored copy's automation-core files are admitted under this prefix and nowhere else. |
 | `install.fallback_package` | string / `"vibey"` | The distribution the managed workflows install when `self_source` does not hold the tooling — the branch every adopter takes, since their `self_source` default `"."` never matches. A key rather than a constant so a fork, or an internal index publishing under another name, can point it at their own distribution instead of one they cannot publish to. It is the package `pin_version` pins. |
-| `install.pin_version` | boolean / `false` | Pin every managed workflow's `pip install vibey` — the distribution that carries `vibey-gh` — to the exact version that rendered it (`vibey==X.Y.Z`), instead of the latest release on every run. `false` keeps the historical floating install. That version is knowable in two places: in the repository that IS `fallback_package`, its own `[project] version`; everywhere else, the installed `fallback_package` release the running `vibey-gh` came from, so `uvx --from vibey==X.Y.Z vibey-gh install` renders `vibey==X.Y.Z`. An editable or other source-tree install names no release — its templates may be ahead of the number it carries — so there the fallback stays floating and `install` and `check` print a `notice:` saying why. The self-hosting path (this repository, and anything else installing from its own `pyproject.toml`) is never pinned — it installs from source regardless. Running `vibey-gh install` from a newer release moves the pin forward as one visible diff. |
+| `install.pin_version` | boolean / `false` | Pin every managed workflow's `pip install vibey-engine` — the distribution that carries `vibey-gh` — to the exact version that rendered it (`vibey==X.Y.Z`), instead of the latest release on every run. `false` keeps the historical floating install. That version is knowable in two places: in the repository that IS `fallback_package`, its own `[project] version`; everywhere else, the installed `fallback_package` release the running `vibey-gh` came from, so `uvx --from vibey==X.Y.Z vibey-gh install` renders `vibey==X.Y.Z`. An editable or other source-tree install names no release — its templates may be ahead of the number it carries — so there the fallback stays floating and `install` and `check` print a `notice:` saying why. The self-hosting path (this repository, and anything else installing from its own `pyproject.toml`) is never pinned — it installs from source regardless. Running `vibey-gh install` from a newer release moves the pin forward as one visible diff. |
 
 ## `[platform]`
 
@@ -43,8 +43,8 @@ questions ([ADR 0001](adr/0001-forge-neutral-nouns.md), #138).
 
 | Field | Type / default | Meaning |
 |---|---|---|
-| `kind` | string / `"github"` | The forge. The standard names `github`, `gitlab` and `forgejo`, but only `github` has an adapter today; `gitlab` and `forgejo` are refused when the configuration loads, with "the … adapter is not implemented yet", because the commands that have not moved onto the adapter still speak to GitHub directly and would drive the wrong forge without saying so. Any other value is refused as unknown. |
-| `host` | string / `"github.com"` | The forge's host, as a bare host name with an optional port (`ghe.example.com`, `git.internal:8443`); a scheme, path or whitespace is refused. `github.com` is the host `gh` assumes on its own, so it changes nothing, and a `GH_HOST` already in the environment still applies. Any other host is handed to `gh` as `GH_HOST`, for a GitHub Enterprise Server. |
+| `kind` | string / `"forgejo"` | The forge. The standard names `github`, `gitlab` and `forgejo`, and every named forge has an adapter today. The sovereign, self-hosted default is `forgejo` (ADR 0002); `github` and `gitlab` are declared-only — an adopter writes the kind explicitly to leave the default. Any unadapted value is refused as unknown. |
+| `host` | string / `""` | The forge's host, as a bare host name with an optional port (`forgejo.local`, `ghe.example.com`, `git.internal:8443`); a scheme, path or whitespace is refused. Empty, the selected adapter's own default applies: `forgejo.local` for Forgejo, `github.com` for GitHub (which `gh` assumes on its own, so a `GH_HOST` already in the environment still applies), `gitlab.com` for GitLab. Any non-empty host is handed to the selected adapter's transport. |
 
 Apart from that refusal, which every command makes, only the reads that have moved onto the
 adapter use this table today: the open pull request heads and the releases that the
@@ -91,6 +91,49 @@ the endpoint you trust.
 `${{ secrets.… }}` expression in a privileged workflow, so a name that could close that
 expression is refused at load time.
 
+## `[unattended_approval]`
+
+The operator's grant to a delegated approver (sub-doctrine 12.f, ADR-0049). This is the
+**declared** half of the grant, reviewed in a pull request like any other state (12.c). The
+**live** half is the repository variable `switch_variable` names (`VIBEY_UNATTENDED_APPROVAL`
+by default), which must read exactly `switch_value` (`on` by default); its value is
+deliberately not a config key, because withdrawal must need no merge:
+
+```bash
+gh variable set VIBEY_UNATTENDED_APPROVAL --body off   # binds from that moment
+```
+
+Absence, `off`, empty, malformed or **unreadable** are all refusal. An approver that cannot
+read its own authorization has already lost it.
+
+| Field | Type / default | Meaning |
+|---|---|---|
+| `enabled` | boolean / `false` | Whether any delegated approval may be given. Off by default: upgrading vibey-gh is not an act of granting. |
+| `branches` | string list / `[]` | Branch globs an approver may act on. Empty is refused when `enabled` — a grant naming no branch says nothing, and silence is not consent (12.d). |
+| `authors` | string list / `[]` | Forge logins whose pull requests an approver may act on. Empty is refused when `enabled` — a grant that names nobody authorises nobody, and the absence of a grant is refusal rather than permission (12.f). The entry `@codeowners` expands to every login `.github/CODEOWNERS` names, `@` stripped, in order and without duplicates, so the allowlist and the owners of the protected paths cannot drift apart by one of them being edited alone. |
+| `forbidden_paths` | string list / the corpus, this file, `.claude/settings.json`, `.github/**`, `CODEOWNERS` | Paths no delegated approval may ever touch. A change touching one is refused **whole** — an approver does not approve the safe subset of a pull request. Must contain `.vibey-gh.toml`, enforced: an approver may never approve a change to its own grant. |
+| `require_all_gates` | boolean / `true` | Every deterministic gate must already be green. A delegated approval is added to the gates and never substituted for one. |
+| `switch_variable` | string / `"VIBEY_UNATTENDED_APPROVAL"` | The repository variable holding the live switch. Declared rather than compiled in (12.h); it must be a valid variable name — a switch nobody can set is a grant nobody can withdraw. |
+| `switch_value` | string / `"on"` | The exact value the switch must read. Compared byte for byte, so `On`, `on ` and an empty variable all refuse; surrounding whitespace is rejected when the configuration loads. |
+
+`vibey-gh approve-check PR` is what reads both halves: it exits `0` only when every condition
+above holds for that pull request, and prints each one that does not
+([CLI reference](cli.md)). The delegated approver runs it first and refuses on a non-zero exit,
+so none of these conditions rests on a model remembering to apply it.
+
+`authors` is the bound `branches` cannot express: a branch glob says nothing about who pushed
+to it. A repository with no `.github/CODEOWNERS` expands `@codeowners` to nothing rather than
+failing to load — safe only because it fails closed. Both "no CODEOWNERS file" and "CODEOWNERS
+names nobody" leave the allowlist empty, and an empty allowlist authorises nobody, never
+everybody; an enabled grant left with no authors is refused outright.
+
+Choosing `forbidden_paths` is the other half of the design when `branches` is wide. The test for an
+entry is whether a change there could alter **what a gate measures**, **who may approve**, or
+**what an agent may do**. Two that are easy to miss: `.github/workflows/**` is *generated*, so
+forbidding only the rendered copy leaves every gate editable through its templates; and
+`pyproject.toml` carries the coverage floors and pytest's `addopts`, so a one-line edit there is
+a gate change wearing a dependency's clothes.
+
 ## `[pr_automation]`
 
 | Field | Type / default | Meaning |
@@ -107,6 +150,65 @@ expression is refused at load time.
 | `normalise_commit_subjects` | boolean / `true` | Whether `Conventional Commits` REWRITES a nonconforming subject or only reports it. The automatic form is `chore: <the original subject>`, which conforms without choosing a type — so a fix normalised this way is filed as a chore. Set it `false` where the author should pick the type; the check still runs and still fails the pull request. |
 | `plugin_marketplaces` | string list / empty | Claude Code plugin marketplaces loaded by the review, repair, and conflict-resolution jobs. Each entry is an `https://` Git URL, or a repository-relative path resolved inside the trusted checkout of the default branch (never the pull request's own tree). Empty by default: a marketplace that cannot be cloned fails the review outright. |
 | `plugins` | string list / empty | Plugins those jobs install, each `<plugin>@<marketplace>`. Requires at least one `plugin_marketplaces` entry. |
+| `paid_review` | boolean / `false` | The declaration [sub-doctrine 8.b](doctrines.md) asks for before the exact-head review reaches a paid model: may the `review` job call `anthropics/claude-code-action` with `[ai] auth_secret` (by default `ANTHROPIC_API_KEY`)? **False by default**, because 8.b makes a paid counterparty declared-only — undeclared means sovereign only. See [the paid-review declaration](#the-paid-review-declaration-paid_review) below. Must be a TOML boolean; a string or a number is refused when the file is loaded. |
+| `paid_repair` | boolean / `false` | The same declaration for the `repair` job, which hands failing scans (or a declared paid review's findings) to the paid model to edit the branch. Undeclared, the job — and `mirror-fork`'s repair case — is never scheduled, and the gate reports failing scans as `PR review: needs a human (failing scans)`, ending `needs a human: automated repair needs a paid model, and none is declared (8.b).` A declared paid review's findings are then reported with that sentence too, never with a promise that repair will address them. |
+| `paid_conflict_resolution` | boolean / `false` | The same declaration for the `resolve-conflict` job, which hands a merge conflict to the paid model. Undeclared, the job — and `mirror-fork`'s conflict case — is never scheduled, and the evaluation's step summary says `needs a human: automated conflict resolution needs a paid model, and none is declared (8.b)` (the gate publishes nothing for a conflict). |
+
+### The paid-review declaration (`paid_review`)
+
+Every pull request needs one automated verdict on its exact head before the merge train
+will take it: that is the `PR review / gate` check. Who gives that verdict is this key's
+whole question.
+
+**Undeclared (`false`, the default).** No paid model is asked anything. The
+[sovereign lane](#pr_automationfallback) — a local model on a runner you own — answers the
+**whole** review: the verdict on the diff (`pass`, `summary`, `findings`) *and* the sixteen
+documentation-contract judgments. It is offered for exactly one kind of pull request: a
+**trusted author** (the owner or `[merge_train] trusted_authors`) whose head is **in this
+repository**, while the lane is switched on and its heartbeat is fresh. The local model is
+handed the diff and the pages listed in `[pr_automation.fallback] context_paths`, fetched
+read-only at the exact head, and its verdict says so: its summary begins
+`[SOVEREIGN LANE — <model> — whole review]` and names the documents it judged against,
+because this is a judgment of the change, not a repository-wide audit. The paid `review`
+job is skipped before GitHub schedules it, so nothing on that path reads the API secret.
+
+Every other pull request gets **no automated pass**. The gate fails and says why, in these
+words:
+
+| The pull request | What `PR review / gate` says |
+|---|---|
+| comes from a fork | `needs a human review: the head is in a fork (<owner/name>), which never reaches the self-hosted sovereign runner (no paid review is declared, 8.b).` |
+| has an author who is not trusted | `needs a human review: the author is not a trusted author of this repository, and the sovereign lane reviews trusted authors only (no paid review is declared, 8.b).` |
+| arrives while the lane is off | `needs a human review: the sovereign lane is switched off ([pr_automation.fallback] enabled = false) (no paid review is declared, 8.b).` |
+| arrives while the runner is down | `needs a human review: the sovereign lane is not ready: <the heartbeat probe's own reason> (no paid review is declared, 8.b).` |
+| was reviewed, but the model gave no verdict | `needs a human review: the sovereign lane produced no verdict: <its reason — an unreachable model, an unusable answer, a diff or page that could not be fetched> (no paid review is declared, 8.b).` |
+
+The last two are titled `PR review: review incomplete (needs a human review)`, so the
+scheduled recovery sweep re-probes them once the runner beats again; the others are titled
+`PR review: needs a human review`. A whole review that fails reports its findings (or, with
+none, that it returned `pass=false` without one) and is **never** handed to automated repair:
+a local model's finding is a lead for a person to check, and repair is itself a paid agent.
+The merge train already holds any pull request from an author outside `trusted_authors` for a
+human merge (ADR-0053), so this is the same rule seen from the review side.
+
+**Declared (`true`).** The two-lane review, exactly as before this key existed: the
+sovereign lane carries the diff half for a trusted author and the paid reviewer answers the
+documentation-contract half; for anyone else the paid reviewer answers the whole review and
+the local verdict is held in reserve (see [`[pr_automation.fallback]`](#pr_automationfallback)).
+
+**A refused paid call is named as one.** When the API refuses a paid call — an exhausted
+credit balance, a revoked key — `claude-code-action` still ends with `Result subtype:
+success`, which is false. The review, repair and conflict-resolution jobs read the
+execution record instead: when it carries `is_error`, the step fails with `the paid
+<review|repair|conflict resolution> was refused by the API: <the API's text, or "no reason
+given">`, and the gate repeats that sentence rather than a bare job result.
+
+**One key per paid use.** `paid_review`, `paid_repair` and `paid_conflict_resolution` each
+declare one job, the way `review_untrusted_authors` and `repair_untrusted_authors` split the
+same two jobs by author: whether a paid model may *judge* a change and whether it may *edit*
+the branch are different questions, and a repository may answer them differently. With all
+three false — the default — no job in `pr-review.yml` that references the paid model or its
+secret can be scheduled, so the `[ai] auth_secret` repository secret can be deleted.
 
 ### `[pr_automation.observability]`
 
@@ -122,7 +224,10 @@ fails closed when repository visibility is not private.
 
 ### `[pr_automation.fallback]`
 
-The sovereign review lane: a local model on the operator's own runner that reviews the
+The sovereign review lane: a local model on the operator's own runner. With no paid review
+declared (`paid_review = false`, the default) it answers the **whole** review for a trusted
+author, as [described above](#the-paid-review-declaration-paid_review). The rest of this
+section describes the declared path (`paid_review = true`), where it reviews the
 **diff-groundable half** of every pull request's exact-head review (`pass`, `summary`,
 `findings`) FIRST, whenever its heartbeat is fresh (sub-doctrine 8.a, #133). The table keeps
 its original name because it began as a fallback, and it still is one: the same verdict is
@@ -143,13 +248,19 @@ the lane while `trusted_only` is on.
 |---|---|---|
 | `enabled` | boolean / `true` | Whether the sovereign fallback job (`review-sovereign`) can run at all. **On by default, per sub-doctrine 8.a:** the sovereign path is the preference, so it is not the one that has to be opted into. That costs an adopter nothing until they stand a runner up, because the **heartbeat** gates scheduling rather than this flag — a repository with no fresh `heartbeat_ref` never offers the lane. Once a runner does exist, keep `trusted_only` true: GitHub says self-hosted runners should "almost never be used for public repositories". |
 | `runner_label` | string / `"vibey-local"` | Label the sovereign job targets, alongside `self-hosted`. |
-| `model` | string / `"qwen2.5-coder:14b"` | Model tag served by the Ollama-compatible endpoint. |
+| `model` | string / `"gpt-oss:20b"` | Model tag served by the Ollama-compatible endpoint. |
 | `base_url` | string / `"http://127.0.0.1:11434"` | Where the local model listens. |
 | `trusted_only` | boolean / `true` | Never run the sovereign lane for a fork pull request. |
-| `heartbeat_ref` | string / `"refs/vibey-gh/sovereign-heartbeat"` | The git ref `vibey-gh sovereign --beat` publishes to and the workflow reads back, so "is the local lane alive?" is answered by something the lane itself had to write. |
+| `heartbeat_ref` | string / `"refs/vibey-gh/sovereign-heartbeat"` | The git ref `vibey-gh sovereign --beat` publishes to and the workflow reads back, so "is the local lane alive?" is answered by something the lane itself had to write. A beat is published only while a runner carrying `runner_label` is registered and online (read with the runner's own login) and `base_url` answers with `model`; otherwise nothing is pushed and the ref goes stale. It replaces the previous heartbeat by compare-and-swap and goes through the pre-push gate, which lets it through by its own rule: every ref outside `refs/heads/` and `refs/tags/`, every commit the empty tree with no parents. |
 | `heartbeat_max_age_minutes` | integer / `15` | How stale that heartbeat may be before the local lane is treated as down. A ref that stopped moving is indistinguishable from a runner that stopped, which is the point — both mean do not route work there. |
-| `max_diff_chars` | integer / `60000` | Diff is truncated past this, and the model is told it was. |
+| `max_diff_chars` | integer / `60000` | For the diff half, a diff longer than this is **refused**, never cut: a verdict on part of a diff would pass the rest unread, so the gate asks a human. A **whole** review (no paid review declared) never cuts the diff either: it is shown the whole diff or refused. It never bounds the documents; `max_document_chars` does. |
+| `max_document_chars` | integer / `120000` (at least 1000) | The most characters of `context_paths` documents a whole review is shown, whatever the window would allow. The documents' own limit, never the diff's: when they shared `max_diff_chars`, this repository's two pages already took 59,607 of its 60,000, and a few hundred more characters of README cut a page, so every pull request's review claimed the diff half alone and its gate asked a human. The default is about twice what those pages hold today; the window is what usually binds. |
+| `context_window` | integer / `65536` (4096–1048576) | The model's context window in tokens, **as your host measured it**: every local request is sized from everything it sends (system prompt, user prompt, schema) and must fit inside it beside `reasoning_reserve_tokens`. A request that does not fit is **never sent**. Left to its defaults Ollama does not refuse an oversized prompt: it cuts it to about half the window and the model answers about the rest, with no error (measured on Ollama 0.34.2 with `gpt-oss:20b` at a 32,768 window: a 36,798-token request was read as 16,386 tokens). So every request is also sent with `truncate: false` and `shift: false`, which makes Ollama 0.34 refuse it with HTTP 400 — reported as `the model server refused the request (HTTP 400): …`, never as an unreachable model — and carries two random check codes, one at each end of the prompt, that the answer must echo; a reply that does not echo both is refused. A whole review first leaves out optional documents (the last in `context_paths` first, and the verdict names them); if the diff alone does not fit, the lane refuses with `the diff (~N tokens) exceeds the sovereign model's window (M tokens) once its ~S tokens of instructions and the R-token reasoning reserve are counted`, and the gate asks for a human. The default is what this repository's host tuning chose for `gpt-oss:20b`. |
+| `reasoning_reserve_tokens` | integer / `8192` | Tokens kept free for the model's reasoning **and** its answer; at least 1024 and under half of `context_window`. A reasoning model thinks before it answers: on #1090's whole review `gpt-oss:20b` spent 3,676 tokens doing both at its default effort. After each call the lane also reads Ollama's own `prompt_eval_count`, and refuses the reply if the model read more than the request was sized for — an estimate that let too much through — and reads `done_reason`, so a model that ran out of room is reported as `the model ran out of room (done_reason=length, N reasoning chars, M answer chars)`, never as a JSON error. |
+| `chars_per_token` | integer / `3` (1–8) | Characters per token when estimating a prompt. Pessimistic for prose and code (#1090 measured 3.95 for `gpt-oss:20b`), but optimistic for dense text — a lockfile tokenizes at about 2.1, hex 1.9, base64 1.5, CJK 1.4, emoji 0.7 — which is why the estimate only decides what to trim, and the request itself refuses truncation. |
+| `think` | string / empty | The reasoning effort sent to the model as Ollama's `think`: `low`, `medium` or `high`, or empty to send nothing and keep the model's default. Empty by default. On #1090's whole review `low` returned the same verdict in 471 tokens (default: 3,676) and 103s (243s) — one sample, not a fidelity study. |
 | `timeout_seconds` | integer / `600` | Bound on one review. |
+| `context_paths` | string list / `["README.md", "docs/index.md"]` | With no paid review declared, the pages the whole review judges the documentation contract against — fetched read-only through the contents API at the exact head, never checked out, and handed to the model beside the diff. A page absent at that head is skipped and the verdict names the pages it did see; any other fetch failure stops the review. Each entry must be a plain repository-relative path: no leading `/` or `~`, no `..`, no whitespace, no glob or query characters. Their text is bounded by `max_document_chars` and by what the window leaves beside the diff, and the **last declared gives way first** (the workflow passes this order as `--context-paths`). The model is told, by name, which were cut short or left out — and because the documentation judgments were then made against less than you declared, the verdict claims the diff half alone and the gate asks a human. |
 
 It never overrides a judgment the paid lane made: when the local verdict carries the diff
 half, the paid reviewer is not asked that half at all, and when it is held in reserve it is
@@ -171,7 +282,7 @@ would otherwise never be reviewable at all. When the API refuses, the job recons
 same merge-base diff locally instead: it fetches the base and head refs, deepening a shallow
 trusted checkout until their histories connect, and diffs one against the other. That
 reconstruction is read-only and executes no repository code, so the guarantee above holds
-either way, and `max_diff_chars` still caps what actually reaches the model.
+either way, and a diff past `max_diff_chars` is still refused rather than cut.
 
 The verdict is deliberately narrower than the primary review's. Ollama constrains decoding
 to the schema, so the output *shape* is guaranteed; the *judgments* are not, and a 14B model
@@ -179,14 +290,51 @@ will emit confident booleans it has no basis for. So it assesses only what it ca
 a diff — `pass`, `summary`, `findings` — and reports the documentation-contract fields as
 unevaluated. Its summary names the role it ran in (`[SOVEREIGN LANE — model]` or
 `[LOCAL FALLBACK — model]`), and the gate titles a split verdict
-`PR automation: gate (diff: sovereign lane, documentation: paid lane)` and a fallback one
-`PR automation: gate (local fallback)`, so a narrower verdict is never mistaken for a full
+`PR review: gate (diff: sovereign lane, documentation: paid lane)` and a fallback one
+`PR review: gate (local fallback)`, so a narrower verdict is never mistaken for a full
 one.
 
 `trusted_only` carries the safety argument. GitHub says self-hosted runners should "almost
 never be used for public repositories" because any user can open a pull request against
 them; excluding forks is what removes that. Leave it on, register the runner as ephemeral
 so it takes one job and exits, and run it in a container rather than on the host.
+
+## `[runners]`
+
+The machine that serves the sovereign lane, declared rather than hand-made (sub-doctrine
+12.c). `vibey-gh runner install` renders the runner's LaunchAgent, supervisor, Dockerfile and
+container entrypoint from this table and the templates in `vibey_gh/templates/runner/`;
+`vibey-gh runner check` reconciles the host against them; `vibey-gh runner cleanup` finds
+agents under `unit_prefix` that the tree no longer declares. `runner install` also installs
+the heartbeat timer that tells the gate the runner is there (`vibey-gh heartbeat`, vibey
+ADR-0060): each beat publishes only while a runner with the label is registered and online
+and the model endpoint answers, and goes through the pre-push gate like any other push. The
+runner label is
+`[pr_automation.fallback] runner_label` and the host-side model URL is its `base_url`; neither
+is declared twice. The supervisor is macOS-only (launchd, `caffeinate`, `pmset`). The
+operator's steps are in the vibey repository's `docs/runbooks/sovereign-review-runner.md`.
+
+| Field | Type / default | Meaning |
+|---|---|---|
+| `repository` | string / `""` | `owner/name` the runner registers with. Empty derives it from `[platform] repository`. `[platform] kind` must be `github`: this is a GitHub Actions runner. |
+| `unit_prefix` | string / `"org.vibey.runner"` | The LaunchAgent label is `<unit_prefix>-<repository name>`. Every agent under the prefix that is not that label is what `runner cleanup` lists. |
+| `install_dir` | path / `"~/.local/share/vibey-runner"` | Where the supervisor, Dockerfile and entrypoint are installed. Retired agents are moved into its `retired-units/`. |
+| `launch_agents_dir` | path / `"~/Library/LaunchAgents"` | Where the LaunchAgent plist is written. |
+| `log_dir` | path / `"~/Library/Logs"` | The supervisor logs to `<log_dir>/<label>.log`. |
+| `gh_config_dir` | path / `"~/.config/gh-runner"` | The runner's **own** gh login, set as `GH_CONFIG_DIR` in the LaunchAgent. It must be a file-based login (`gh auth login --with-token --insecure-storage`) holding a fine-grained token for `repository` only, with **Administration: Read and write**. gh's default directory (`$XDG_CONFIG_HOME/gh` or `~/.config/gh`) is refused however it is spelled, compared after resolving `~`, `..` and symlinks, both when the configuration loads and by the supervisor: its token is in the macOS keyring, which launchd cannot read. The supervisor refuses to start on a missing, keyring-held, unreadable-to-launchd or group/world-readable login, clears `GH_TOKEN` and `GITHUB_TOKEN`, and never falls back to another credential. |
+| `image` | string / `"vibey-runner:latest"` | The runner image the supervisor starts one container of per job. |
+| `runner_version` | `X.Y.Z` / `"2.337.0"` | The actions/runner release the image is built from (`--build-arg RUNNER_VERSION`); the Dockerfile carries no default. |
+| `container_model_url` | URL / `"http://host.docker.internal:11434"` | The model endpoint as the container sees it. |
+| `require_ac` | boolean / `true` | Stay down on battery rather than hold a laptop awake to idle-poll. |
+| `throttle_seconds` | integer 10–3600 / `120` | launchd's `ThrottleInterval` between restarts. |
+| `max_failures` | integer 1–100 / `5` | Consecutive runner failures before the supervisor stops rather than spins. |
+| `path` | string / Homebrew then system paths | The `PATH` launchd gives the supervisor; `docker` and `gh` must be on it. The heartbeat timer runs with the same `PATH`, so `git`, and `vibey-gh` (or a `python3` that imports this repository's own copy) for the pre-push hook, must be on it too. |
+| `heartbeat_scheduler` | `""`, `"launchd"` or `"systemd"` / `""` | What runs the heartbeat timer (`vibey-gh heartbeat install`, also installed by `runner install`). Empty picks by platform: a launchd agent on macOS, a systemd user service and timer on Linux. |
+| `heartbeat_interval_minutes` | integer 0–720 / `0` | Minutes between beats. `0` takes half of `[pr_automation.fallback] heartbeat_max_age_minutes` (7 for the default 15). More than half is refused at install, so one missed beat never stales the lane. |
+| `heartbeat_python` | path / `""` | The interpreter the timer runs `python -m vibey_gh.cli sovereign --beat` with. Empty is the one running the install. It, and the `vibey_gh` it imports (asked of it at install), must live outside any temporary directory and any git work tree — install vibey-gh as a tool (for example `uv tool install vibey-engine`) rather than into a checkout's virtualenv. |
+| `heartbeat_clone_dir` | path / `""` | The repository the heartbeat timer owns and pushes from: a clone with no working tree, its own pre-push gate, and a credential helper that uses only the runner's login. Empty is `<install_dir>/heartbeat-<repository name>`. It must live outside any temporary directory and any git work tree. |
+| `heartbeat_log_dir` | path / `""` | Where the timer logs (`<label>.log`) and records each beat (`<label>.last.json`, read by `heartbeat status`). Empty is `log_dir` under launchd and `~/.local/state/vibey-gh` under systemd. Refused under a temporary directory or inside a git work tree. |
+| `systemd_user_dir` | path / `"~/.config/systemd/user"` | Where the heartbeat's systemd user units are written. |
 
 ## `[conversation]`
 
@@ -442,6 +590,108 @@ stability or reliability shortfall should dilate duration through φ rather than
 the work impossible, and φ is not measured yet. **Paid credit counts as agency**:
 spending is a form of permission to act.
 
+## `[local_models]` and `vibey-gh slots`
+
+How many runs of one local model may run at once on a device is **measured on that
+device, never assumed** (sub-doctrines 8.c and 8.j, ADR-0058). A second run of a model
+already resident can double throughput, or it can overflow the machine's wired memory,
+swap it into the ground, or refuse the deep prompts the first run served. Which of these
+happens depends on the model, its context window, the runner and the hardware, so the
+answer is a calibration recorded per device, and a declaration is checked against it.
+
+```bash
+# A pool of storm-shaped turns: from a storm's own lane records, or its committed specs ...
+python docs/plans/qwenstorm-3.0.0/tools/storm_turn_pool.py specs --out pool.jsonl
+vibey-gh slots corpus --pool pool.jsonl --out corpus.json --segments 20 --min-per-stratum 5
+# ... swept at N = 1, 2, 3, ... beside an idle production runner.
+vibey-gh slots calibrate --corpus corpus.json --lock /path/to/.ollama-lock --out evidence.json
+# What a queue reads: the number on stdout, the reason on stderr.
+vibey-gh slots allowed
+```
+
+**The declaration.** `concurrent_runs` is `1` by default: 8.c as written, one run at a
+time, which needs no evidence and probes nothing. `"measured"` takes whatever this
+device's evidence supports. A number above one runs only if this device's evidence
+measured that number inside every bound and faster than one; otherwise **one runs**, and
+the refusal names what is missing (`--strict` exits `2` on a refusal).
+
+**The device.** Evidence is keyed to a fingerprint of the hardware model, processor,
+memory, accelerator, operating system, runner version, model digest and context window.
+Evidence for a device this no longer is (a runner upgrade, another model digest, more
+memory) is **stale**, and so is evidence older than `max_evidence_age_days`. Missing or
+stale evidence means one, said on stderr, and `slots allowed` writes a calibration
+request beside the evidence. `slots calibrate --if-requested` acts on exactly those
+requests, so an idle window closes the gap without anyone remembering it: the storm
+runner does this itself when its queue empties (`storm-queue.sh`).
+
+**The sweep.** `calibrate` starts its own `ollama serve` on `calibration_port`, with
+`OLLAMA_NUM_PARALLEL=N` and `OLLAMA_NOPRUNE`, beside the production runner, which it
+never restarts or reconfigures. It waits until the production runner has nothing
+resident, and a step during which production loads a model is discarded and measured
+again: two resident models bidding for one accelerator is the contention 8.c forbids, so
+a reading taken beside one measures the wrong thing. It replays the corpus with N
+closed-loop workers through `/api/chat` with `truncate: false` and `shift: false`, so a
+prompt the slot cannot hold is a recorded refusal, never a silent loss of its front
+half, and a `200` with no `done_reason` (what the runner answers when its decode fails
+underneath it) is a failure, not an answer. It samples the host every second: wired
+memory (on macOS, `vm_stat`'s wired pages; on Linux, `Unevictable` plus what an NVIDIA
+accelerator holds), the free share, swap-ins and swap-outs, and what both runners hold
+resident. It reads the runner's own log for slots, context per slot, KV cache sizes,
+model loads, truncations, context shifts and device failures. One slot is measured
+twice, so fidelity is judged against the model's agreement with itself. The sweep stops
+when a bound breaks, or after two consecutive steps without a significant gain. The
+**ideal N** is the smallest that reaches the best throughput inside every bound. At one
+slot the memory bounds are reported as *floor warnings* and never refuse: one is 8.c's
+floor.
+
+**Resumable.** Each completed step is written under `<evidence_dir>/progress/<sweep>`
+the moment it finishes, keyed by the device fingerprint, the corpus hash and the replay
+method; `--out` gets the evidence so far after every step. An interrupted sweep, run
+again with the same arguments, takes the steps it already has and measures the rest, and
+`--max-runs` can walk it one step at a time.
+
+**The runner must match.** The evidence records the runner version of every step. A
+calibration that ran on a different binary from the production runner's (Homebrew's
+`ollama` on `PATH` beside the macOS app's, say) is **not recorded** for this device. Pass
+`--binary` or set `ollama_binary`. Running N lanes also needs the production runner
+started with `OLLAMA_NUM_PARALLEL` of at least N **and** the calibrated context per slot:
+a runner that sizes every slot to its own `OLLAMA_CONTEXT_LENGTH` is not the runner that
+was measured.
+
+| Field | Type / default | Meaning |
+|---|---|---|
+| `concurrent_runs` | integer ≥ 1 or `"measured"` / `1` | How many runs of the model run at once on this device, checked against this device's evidence as above. |
+| `model` | string / empty | The model calibrated and gated. Empty means `[pr_automation.fallback] model`. |
+| `context_window` | integer / `65536` | The context every slot is calibrated at: the window the loop declares, so every turn fits one slot. Part of the fingerprint. |
+| `evidence_dir` | string / empty | Where evidence, requests and checkpoints live. Empty means `$VIBEY_GH_SLOTS_DIR`, else `~/.local/state/vibey-gh/slots`, on the device the evidence describes. |
+| `max_runs` | integer / `8` | The sweep's upper limit. It normally stops earlier. |
+| `calibration_port` | integer / `11435` | Where the calibration runner listens, beside production. |
+| `ollama_binary` | string / empty | The runner binary. Empty means `ollama` on `PATH`, else the macOS app's bundled runner. |
+| `lock` | string / empty | A `mkdir` lock held for the whole calibration, shared with anything else that must not use the model meanwhile. `--lock`, then `$VIBEY_OLLAMA_LOCK` (a machine's own convention), then this; empty takes none. |
+| `wired_ceiling_fraction` | float / `0.80` | Peak wired memory, as a share of physical memory, that a step above one may reach. |
+| `swap_growth_factor` | float / `2.0` | Swap-outs above one may reach this multiple of the one-slot rate ... |
+| `swap_floor_mb_per_minute` | float / `64.0` | ... and are never judged below this rate. |
+| `fidelity_tolerance` | float / `0.05` | How far structural agreement with the one-slot answers may fall below one slot's agreement with itself. |
+| `min_throughput_gain` | float / `0.10` | What counts as a significant gain, for the plateau rule, the ideal N, and a declared number. |
+| `max_evidence_age_days` | float / `30` | Evidence older than this is stale. |
+
+The bounds are read when a decision is made, not frozen into the evidence, so tightening
+one takes effect at once: the gate re-judges the stored measurements against what this
+file says now.
+
+```toml
+[local_models]
+concurrent_runs = 1        # 8.c as written; "measured" once the operator chooses it (ADR-0058)
+model = "gpt-oss:20b"
+context_window = 65536
+```
+
+**On a cluster.** Every node that serves a model is its own device. Run the calibration
+as a Job pinned to the node (`nodeSelector`), inside the model runner's pod network, with
+`VIBEY_GH_SLOTS_DIR` on a volume that outlives the Job, and give the workers the same
+directory. A node without evidence, or with stale evidence, runs one. The chart does not
+yet template this Job (ADR-0058 records it as owed).
+
 ## `[tidy]`
 
 The clean repo (**sub-doctrine 9.a**): every repository is kept technically clean at
@@ -601,13 +851,13 @@ paid_probe = "claude -p ok --max-turns 1"   # exit 0 = the paid lane is alive
 interval_seconds = 300
 
 [[seats]]                                    # tried in order; first healthy one wins
-name = "qwenloop"
-launch = "qwenloop run"
+name = "gptossloop"
+launch = "gptossloop run"
 health = "curl -sf http://127.0.0.1:11434/api/tags"
 
 [[seats]]
-name = "opencode"
-launch = "opencode"                          # empty health = engage without preflight
+name = "ollama"
+launch = "ollama run qwen2.5-coder"          # empty health = engage without preflight
 ```
 
 | Field | Type / default | Meaning |
@@ -615,7 +865,7 @@ launch = "opencode"                          # empty health = engage without pre
 | `enabled` | boolean / `false` | The operator writes `true` deliberately; the first live handoff should be supervised. |
 | `paid_probe` | string / empty | A shell command whose exit status answers "is the paid lane alive?" — the 296 ms *Credit balance is too low* refusal is exactly what it distinguishes from health. A hang counts as down. |
 | `interval_seconds` | integer / `300` | Loop cadence when run without `--once`. |
-| `seats` | array of tables / qwenloop, then opencode | Each seat is a name, a `launch` command, and an optional `health` preflight, judged by exit status — any agent fits without a code change. |
+| `seats` | array of tables / gptossloop | Each seat is a name, a `launch` command, and an optional `health` preflight, judged by exit status — any agent fits without a code change. qwenloop, gptossloop's opt-in Qwen twin (vibey ADR-0064), is a seat you name here. |
 
 Seat state (which agent holds the seat, and its pid) lives in
 `~/.local/state/vibey-gh/failover.json`; `--config` and `--state` override both paths.
@@ -630,6 +880,43 @@ The handoff is lossless because the seats share one working tree and the
 | `tag_prefix` | string / `v` | Nonempty, whitespace-free tag prefix. |
 | `generate_notes` | boolean / `true` | Ask GitHub to generate release notes. |
 | `require_new_version` | boolean / `false` | Fail instead of silently doing nothing when a release-branch push does not carry a new version (the tag it would need already exists at a different commit). Leave off for a repository where a docs-only or tooling-only promotion is a normal, frequent, versionless push. |
+
+## `[announce]`
+
+The changelog `vibey-gh announce` posts to Discord after each documentation deploy (see
+[operations](operations.md#discord_webhook_url-optional)). Every key is optional.
+
+| Field | Type / default | Meaning |
+|---|---|---|
+| `enabled` | boolean / `true` | Post at all. Off, the step says so and passes. |
+| `webhook_secret` | string / `DISCORD_WEBHOOK_URL` | The repository secret holding the webhook. A secret NAME, rendered into `${{ secrets.… }}`; never the URL. `GITHUB_*` is refused: GitHub reserves the prefix. |
+| `username` | string / `vibey` | The name the message is posted under (1–80 characters). Refused where Discord would refuse it: containing `discord`, `clyde`, `@`, `#`, `:` or ` ``` `, or being `everyone` or `here`. |
+| `max_changes` | integer / `8` | Lines listed before `…and N more` (1–50). Breaking changes are never counted against it. |
+| `max_subject_chars` | integer / `100` | A longer description is cut with `…` (20–400). |
+| `max_message_chars` | integer / `2000` | The message's ceiling in UTF-16 units (200–2000, Discord's limit). The message fits by construction: listed lines go first, then breaking lines shorten, then overflowing breaking changes are counted by name. |
+| `include_other` | boolean / `true` | List types in no named group under `other_group`; off, they are only counted. |
+| `breaking_group` | string / `Breaking` | The heading for any `!` or `BREAKING CHANGE` commit. It always leads. |
+| `other_group` | string / `Other` | The heading for types no group names. |
+| `groups` | table / `Added = ["feat"]`, `Fixed = ["fix"]` | `[announce.groups]`: label = commit types, in display order. A type may be in one group only. |
+| `type_words` | table / `feat = "Feature"`, `fix = "Fix"`, `docs = "Docs"`, `perf = "Performance"`, … | `[announce.type_words]`: the word a type prefix becomes. Keys given here override; the rest keep their defaults. |
+| `noise_patterns` | list of regex / merge commits, `chore(merge)`, `chore(release)`, `chore(heartbeat)`, merge-conflict chores | Subjects hidden from the list and counted as `+N maintenance commits`. A breaking change is never noise. |
+| `link_pull_requests` | boolean / `true` | Link each line's `#N` (or short commit) to the forge. |
+| `link_compare` | boolean / `true` | Link the compare view, or the changelog, after the list. |
+| `link_surfaces` | boolean / `true` | End with the channel site and the surfaces this deploy produced. |
+| `suppress_embeds` | boolean / `true` | Post with Discord's no-link-preview flag. |
+| `changelog_path` | string / `CHANGELOG.md` | A release announces this file's section for its version. Repository-relative; letters, digits and `. _ / -` only, since it is also written into a link. |
+| `max_history_pages` | integer / `10` | Pages of 100 runs, and of 100 compared commits, read for the previous position and the range (1–10: the Actions API serves a status-filtered run listing only to its 1000th result). Commits beyond are counted; no accepted announcement inside the window re-anchors, and says so. |
+| `max_history_candidates` | integer / `20` | Runs for the branch whose announcement was not accepted that are read, one jobs call each, before the announcement re-anchors and says so (1–100). Staying unknown instead would never recover from a long outage. |
+
+```toml
+[announce]
+max_changes = 6
+include_other = false
+
+[announce.groups]
+Added = ["feat"]
+Fixed = ["fix", "perf"]
+```
 
 ## `[rulesets]`
 
@@ -646,7 +933,7 @@ names are not configured here — `[rulesets.integration]` always targets
 
 | Field | Type / default | Meaning |
 |---|---|---|
-| `required_checks` | string list / integration: `["Provenance", "Analyze Python", "Documentation contract", "PR automation / gate"]`; release: the same without the gate | Required status-check contexts — **check-run names, not workflow names** (see below). Empty omits the check requirement entirely. The integration list, less `[pr_automation] ignored_checks` and the gates it routes around, is also what `automation-bootstrap.yml` waits on (see below); empty there means the bootstrap refuses every merge. |
+| `required_checks` | string list / integration: `["Provenance", "Analyze Python", "Documentation contract", "PR evaluate / gate", "PR review / gate"]`; release: the same without the gates | Required status-check contexts — **check-run names, not workflow names** (see below). Empty omits the check requirement entirely. The integration list, less `[pr_automation] ignored_checks` and the gates it routes around, is also what `automation-bootstrap.yml` waits on (see below); empty there means the bootstrap refuses every merge. |
 | `strict_required_checks` | boolean / `true` | Require the branch to be up to date with its base before merging. |
 | `required_approvals` | integer / integration: `0`, release: `1` (0–6) | Required approving reviews. Integration defaults to `0` because PR automation gates it instead. |
 | `dismiss_stale_reviews` | boolean / `true` | Dismiss stale reviews when new commits are pushed. |
@@ -719,7 +1006,8 @@ gh api "repos/OWNER/REPO/commits/$(git rev-parse HEAD)/check-runs" \
 code past PR automation — waits on these names too, so it never names a check this
 repository does not produce. `vibey-gh install` renders `[rulesets.integration]
 required_checks` into the deployed workflow, less `[pr_automation] ignored_checks` and the
-gates the bootstrap exists to route around (`gate`, `PR automation / gate`,
+gates the bootstrap exists to route around (`gate`, `PR evaluate / gate`,
+`PR review / gate`,
 `Automation bootstrap / gate`). With the defaults that is `Provenance`, `Analyze Python`,
 and `Documentation contract`; a repository whose CI reports one job named `gates` and
 requires only that waits on `gates` alone. Change the list, then re-run `vibey-gh install`
@@ -760,7 +1048,8 @@ the silence is the whole danger.
 | `ci` | `CI` |
 | `release` | `Release` |
 | `provenance` | `Provenance` |
-| `pr_automation` | `PR automation` |
+| `pr_evaluate` | `PR evaluate` |
+| `pr_review` | `PR review` |
 | `merge_train` | `Merge train` |
 | `promote` | `Promote` |
 | `release_surfaces` | `Release surfaces` |
@@ -806,8 +1095,11 @@ job's name, not the workflow's.
 | `funding_label` | string / `Support this work` | The sentence introducing the funding line. |
 | `bottom_nav` | boolean / `true` | Clone the theme's own `rel="prev"`/`rel="next"` header anchors into a previous/next bar at the bottom of every published page, so a reader who has just finished a page — especially on a phone — can move on from where they already are. Pages without those anchors (the channel picker, 404) get no bar. `false` disables the injection. |
 | `author_name` | string / `Adam Matthew Steinberger` | Reserved documentation-provenance author label. Parsed and validated (non-empty), but not yet emitted into any generated asset. |
-| `author_url` | URL / `https://vibewithadam.matthewsteinberger.com` | Reserved documentation-provenance author destination. Same current scope as `author_name`. |
+| `author_url` | URL / `https://vibewithadam.matthewsteinberger.com` | The author's own address. Stated in the rendered paper's first-page provenance note and provenance paragraph (`vibey-gh paper --author-url`), beside the revision the paper was rendered from and the time it was rendered. |
+| `author_email` | email / empty | The paper's corresponding-author address. When set, it appears in the IEEEtran byline and the provenance paragraph; empty omits it. Must be a plain `mailbox@host` address. |
+| `author_affiliation` | string / empty | The affiliation line under the author's name in the paper's byline. Empty omits it. |
 | `google_analytics_id` | string / empty (disabled) | GA4 measurement ID (`G-<alphanumeric>`) injected into every page of both generated documentation channels and the channel-picker page. Empty disables Google Analytics entirely: no script tag is emitted and no request ever reaches Google. |
+| `cookie_consent` | boolean / `true` | Cookie consent for the analytics snippet. When set and a GA4 measurement ID is configured, every published page and the channel-picker index deny analytics storage by default (Google Consent Mode v2) and show an accept/decline banner whose choice is remembered per browser, so no analytics cookie is set before the reader accepts. `false` renders the plain gtag snippet; with no measurement ID nothing renders either way. |
 | `favicon` | string / `📘` | One or two emoji render as a zero-asset SVG favicon (plus a matching `apple-touch-icon`). A value that starts with `http://`, `https://`, or `/`, or whose last path segment contains a `.`, is instead used verbatim as a `<link rel="icon">` URL. Empty omits the favicon link. |
 | `og_image` | URL / empty | Social preview image rendered into the Open Graph and Twitter Card meta tags on every generated page. Empty falls back to GitHub's own generated OpenGraph card for the release commit, which always exists and stays current. |
 | `twitter_site` | string / empty | `@handle` rendered as the `twitter:site` meta tag. Empty omits the tag. |
@@ -816,7 +1108,8 @@ job's name, not the workflow's.
 | `author` | string / empty | Rendered as the page's `<meta name="author">` and, when `generate_json_ld` is enabled, the JSON-LD `author.name`. Empty falls back to the repository owner. Distinct from `author_name`/`author_url` below, which are not yet emitted anywhere. |
 | `theme_color` | hex colour / `#080b14` | Rendered as `<meta name="theme-color">` when non-empty. Must match `^#[0-9a-fA-F]{3,8}$`. |
 | `locale` | string / `en_US` | Rendered as `og:locale` and, when `generate_json_ld` is enabled, the JSON-LD `inLanguage` (with `_` replaced by `-`). |
-| `google_site_verification` | string / empty | Google Search Console "HTML tag" verification token — the bare `content=` value, not the whole `<meta>` tag; must match `^[A-Za-z0-9_-]{1,128}$`. Rendered as a `<meta name="google-site-verification">` tag on every published page and the channel-picker index, so it survives Pages redeploys, unlike an uploaded verification file. |
+| `google_site_verification` | string / empty | Google Search Console "HTML tag" verification token — the bare `content=` value, not the whole `<meta>` tag; must match `^[A-Za-z0-9_-]{1,128}$`. Rendered as a `<meta name="google-site-verification">` tag on every published page and the channel-picker index, so it survives Pages redeploys, unlike a hand-uploaded verification file. |
+| `site_root_files` | string list / empty | Repository-relative files copied by basename into the Pages root on every release-surfaces deploy — the declared answer to Search Console's "HTML file" verification (e.g. `site_root_files = ["googleebf918639d02415d.html"]`), which a hand-uploaded file cannot give because each rebuild wipes the Pages root. Entries must stay inside the repository, carry no whitespace or shell metacharacters, and have unique file names; a declared file missing from the checkout fails the deploy rather than publishing without it. Empty copies nothing. |
 | `site_requirements` | string list / empty | Extra packages installed before the published site is built, as PEP 508 requirement specifiers. Each is shell-quoted, so `"mkdocs-material[imaging] >= 9.5"` stays one argument. |
 | `site_requirements_file` | path / `docs/requirements.txt` | Installed with `pip install -r` when the file exists. Absent, the step is skipped; empty disables the hook entirely. |
 | `properdocs_version` | string / `1.6.7` | The `properdocs` and `properdocs-theme-mkdocs` version the site build pins. |

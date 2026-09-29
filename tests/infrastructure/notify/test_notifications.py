@@ -75,8 +75,54 @@ async def test_desktop_notifier_command_construction() -> None:
     assert result is True
     assert len(calls) == 1
     assert calls[0][0] == "osascript"
-    assert "Phase Transitioned" in calls[0][2]
-    assert 'sound name "Ping"' in calls[0][2]
+    assert calls[0][-3:] == ["vibey: Phase Transitioned", "Moved to REVIEW phase", "Ping"]
+
+
+def test_desktop_notifier_uses_configured_icon_on_linux() -> None:
+    notifier = DesktopNotifier(
+        executor=lambda command: True,
+        platform_override="linux",
+        icon_path="/icons/krypton.png",
+    )
+    event = NotificationEvent(
+        kind=NotificationKind.PHASE_TRANSITIONED,
+        project_id=uuid4(),
+        title="Phase Transitioned",
+        message="Moved to REVIEW phase",
+        payload={},
+    )
+    assert notifier._build_command(event)[:3] == [
+        "notify-send",
+        "--icon",
+        "/icons/krypton.png",
+    ]
+
+
+def test_desktop_notifier_uses_terminal_notifier_for_macos_icon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vibey.infrastructure.notify.desktop.shutil.which", lambda _: "/bin/terminal-notifier"
+    )
+    notifier = DesktopNotifier(platform_override="darwin", icon_path="/icons/krypton.png")
+    event = NotificationEvent(
+        kind=NotificationKind.PHASE_TRANSITIONED,
+        project_id=uuid4(),
+        title="Phase Transitioned",
+        message="Moved to REVIEW phase",
+        payload={},
+    )
+    assert notifier._build_command(event) == [
+        "terminal-notifier",
+        "-title",
+        "vibey: Phase Transitioned",
+        "-message",
+        "Moved to REVIEW phase",
+        "-sound",
+        "Ping",
+        "-appIcon",
+        "/icons/krypton.png",
+    ]
 
 
 @pytest.mark.asyncio

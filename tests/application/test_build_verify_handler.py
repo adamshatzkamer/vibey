@@ -608,7 +608,8 @@ async def test_an_answered_gate_can_grant_more_repair_rounds(tmp_path: Path) -> 
     assert "repair" in retried.detail
 
     # A grant at or below the burned rounds still parks (pairs form too).
-    await gates.answer(gate.gate_id, answer={"answers": {"max_rounds": "2"}}, answered_by="op")
+    regate = await gates.raise_gate(job.project_id, job.id, parked.request)
+    await gates.answer(regate.gate_id, answer={"answers": {"max_rounds": "2"}}, answered_by="op")
     still_parked = await _handler_with(policy).handle(job)
     assert isinstance(still_parked, Park)
 
@@ -741,6 +742,7 @@ async def test_a_capacity_rejected_review_defers_as_capacity_not_a_work_failure(
         retry_at=FixedClock().now() + timedelta(minutes=5),
         detail="engine codexloop reported capacity rejection during the diff review",
         capacity=True,
+        capacity_state="CreditsExhausted",
     )
     # The rejection itself is still on the record; only the approval is not.
     assert any(event.kind == "CapacityRejected" for event in ledger.recorded)

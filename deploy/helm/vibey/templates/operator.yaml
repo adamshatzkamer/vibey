@@ -30,8 +30,11 @@ rules:
   # operator reconciles projects, it does not remove them, and a controller
   # that cannot delete cannot delete the wrong thing.
   - apiGroups: [vibey.dev]
-    resources: [vibeyprojects, vibeyprojects/status]
+    resources: [vibeyprojects, vibeyprojects/status, vibeysurfaces, vibeysurfaces/status]
     verbs: [list, watch, get, patch, update]
+  - apiGroups: [apps]
+    resources: [deployments, deployments/status]
+    verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -73,8 +76,10 @@ spec:
     spec:
       serviceAccountName: {{ $fullName }}-operator
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- if .Values.postgres.enabled }}
+      {{- $migrate := include "vibey.migrateInitContainer" . }}
+      {{- if or .Values.postgres.enabled $migrate }}
       initContainers:
+      {{- if .Values.postgres.enabled }}
         - name: wait-for-postgres
           image: {{ .Values.postgres.image }}
           command:
@@ -86,6 +91,10 @@ spec:
                 sleep 2
               done
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- end }}
+      {{- with $migrate }}
+      {{- . | trim | nindent 8 }}
+      {{- end }}
       {{- end }}
       containers:
         - name: operator

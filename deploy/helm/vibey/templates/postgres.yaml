@@ -1,5 +1,89 @@
 {{- if .Values.postgres.enabled }}
 {{- $fullName := include "vibey.fullname" . }}
+{{- if .Values.postgres.additionalDatabases }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-postgres-init
+  labels: {{- include "vibey.labels" . | nindent 4 }}
+data:
+  # Each additional database is owned by a login role of its own, never by the owner
+  # (ADR-0055): a surface pod holds its own database's credentials and nothing that
+  # reaches vibey's ledger. The image's initdb sources this on first boot; the
+  # container's postStart runs it with --wait on every start, so an existing install
+  # has its databases -- and everything already in them -- handed over on upgrade.
+  01-init-additional-databases.sh: |
+    #!/bin/sh
+    # Local connections need a password too (sub-doctrine 10.j, ADR-0061): the
+    # entrypoint exports PGPASSWORD while it initializes, and postStart does not.
+    export PGPASSWORD="${PGPASSWORD:-$POSTGRES_PASSWORD}"
+    vibey_surface_roles() {
+    {{- range .Values.postgres.additionalDatabases }}
+      psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+        -v role={{ . | quote }} -v pw="${{ include "vibey.surfaceDbPasswordEnv" . }}" <<'EOSQL' || return 1
+    SELECT format('CREATE ROLE %I LOGIN', :'role') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'role')\gexec
+    SELECT format('ALTER ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD %L', :'role', :'pw')\gexec
+    SELECT format('CREATE DATABASE %I OWNER %I', :'role', :'role') WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'role')\gexec
+    SELECT format('ALTER DATABASE %I OWNER TO %I', :'role', :'role')\gexec
+    EOSQL
+      psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname {{ . | quote }} -v role={{ . | quote }} <<'EOSQL' || return 1
+    SELECT format('ALTER SCHEMA public OWNER TO %I', :'role')\gexec
+    SELECT format('ALTER TABLE %s OWNER TO %I', c.oid::regclass, :'role')
+      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = 'public'
+       AND (c.relkind IN ('r', 'p', 'v', 'm', 'f')
+            OR (c.relkind = 'S' AND NOT EXISTS (
+                SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype IN ('a', 'i'))))
+       AND c.relowner <> (SELECT oid FROM pg_roles WHERE rolname = :'role')
+       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e')\gexec
+    SELECT format('ALTER ROUTINE %s OWNER TO %I', p.oid::regprocedure, :'role')
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public' AND p.prokind IN ('f', 'p')
+       AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = :'role')
+       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')\gexec
+    SELECT format('ALTER %s %s OWNER TO %I', CASE t.typtype WHEN 'd' THEN 'DOMAIN' ELSE 'TYPE' END, t.oid::regtype, :'role')
+      FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+     WHERE n.nspname = 'public' AND t.typtype IN ('e', 'd', 'c')
+       AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.reltype = t.oid AND c.relkind <> 'c')
+       AND t.typowner <> (SELECT oid FROM pg_roles WHERE rolname = :'role')
+       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid AND d.deptype = 'e')\gexec
+    EOSQL
+    {{- end }}
+    }
+    if [ "${1:-}" = "--wait" ]; then
+      attempt=0
+      while [ "$attempt" -lt 90 ]; do
+        if pg_isready -q -h /var/run/postgresql -U "$POSTGRES_USER" -d "$POSTGRES_DB" && vibey_surface_roles; then
+          exit 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 2
+      done
+      echo "could not give each surface database a role of its own" >&2
+      exit 1
+    fi
+    vibey_surface_roles
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-postgres-hba
+  labels: {{- include "vibey.labels" . | nindent 4 }}
+data:
+  # Every connection authenticates with scram-sha-256, local and remote alike --
+  # never trust, never md5, never a password in clear (sub-doctrine 10.j, ADR-0061;
+  # SECURITY.md §7). The server reads this file on every start through `hba_file`,
+  # so an install initialized before this rule was declared follows it too. It is
+  # deliberately not a value: the method is law, not a preference.
+  pg_hba.conf: |
+    # TYPE  DATABASE  USER  ADDRESS       METHOD
+    local   all       all                 scram-sha-256
+    host    all       all   127.0.0.1/32  scram-sha-256
+    host    all       all   ::1/128       scram-sha-256
+    host    all       all   0.0.0.0/0     scram-sha-256
+    host    all       all   ::/0          scram-sha-256
+---
 apiVersion: v1
 kind: Secret
 metadata:
@@ -16,8 +100,18 @@ stringData:
   # it: KEDA's operator lives in its own namespace and dials Postgres
   # itself to evaluate the scaler query. A short name works for the worker
   # and fails for the autoscaler.
-  dsn: postgresql://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ $fullName }}-postgres.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:5432/{{ .Values.postgres.database }}
+  #
+  # Two roles (ADR-0055). `dsn` is the application role's -- every worker,
+  # operator and the KEDA scaler connect as it, and it can read and append to
+  # the ledger and nothing more. `migrate-dsn` is the owner's, mounted only
+  # into the `migrate` init container, which creates the application role on
+  # first use.
+  dsn: postgresql://{{ .Values.postgres.appRole.name }}:{{ .Values.postgres.appRole.password }}@{{ $fullName }}-postgres.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:5432/{{ .Values.postgres.database }}
+  migrate-dsn: postgresql://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ $fullName }}-postgres.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:5432/{{ .Values.postgres.database }}
   password: {{ .Values.postgres.password | quote }}
+  {{- range .Values.postgres.additionalDatabases }}
+  db-password-{{ . }}: {{ include "vibey.surfaceDbPassword" (dict "root" $ "name" .) | quote }}
+  {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -57,10 +151,24 @@ spec:
       containers:
         - name: postgres
           image: {{ .Values.postgres.image }}
+          # scram-sha-256 and nothing else (sub-doctrine 10.j, ADR-0061): the rules
+          # come from the declared file above, and every password is stored as a
+          # SCRAM verifier.
+          args:
+            - "-c"
+            - "hba_file=/etc/postgresql/vibey/pg_hba.conf"
+            - "-c"
+            - "password_encryption=scram-sha-256"
           ports:
             - containerPort: 5432
               name: postgres
           env:
+            # A fresh data directory's own pg_hba.conf says the same, so nothing
+            # it holds would admit anyone another way.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--auth-local=scram-sha-256 --auth-host=scram-sha-256"
+            - name: POSTGRES_HOST_AUTH_METHOD
+              value: scram-sha-256
             - name: POSTGRES_DB
               value: {{ .Values.postgres.database }}
             - name: POSTGRES_USER
@@ -70,6 +178,13 @@ spec:
                 secretKeyRef:
                   name: {{ $fullName }}-dsn
                   key: password
+            {{- range .Values.postgres.additionalDatabases }}
+            - name: {{ include "vibey.surfaceDbPasswordEnv" . }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fullName }}-dsn
+                  key: db-password-{{ . }}
+            {{- end }}
             # The default mount point is the volume root; initdb refuses a
             # non-empty directory, and a PVC arrives with lost+found.
             - name: PGDATA
@@ -77,6 +192,22 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+            - name: hba
+              mountPath: /etc/postgresql/vibey
+              readOnly: true
+            {{- if .Values.postgres.additionalDatabases }}
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+            {{- end }}
+          {{- if .Values.postgres.additionalDatabases }}
+          # Every start, not only the first: an install from before each surface had a
+          # role of its own gets them here (ADR-0055). The container is not Running,
+          # and so not Ready, until this returns.
+          lifecycle:
+            postStart:
+              exec:
+                command: ["sh", "/docker-entrypoint-initdb.d/01-init-additional-databases.sh", "--wait"]
+          {{- end }}
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "{{ .Values.postgres.user }}", "-d", "{{ .Values.postgres.database }}"]
@@ -88,6 +219,15 @@ spec:
             initialDelaySeconds: 20
             periodSeconds: 20
           resources: {{- toYaml .Values.postgres.resources | nindent 12 }}
+      volumes:
+        - name: hba
+          configMap:
+            name: {{ $fullName }}-postgres-hba
+        {{- if .Values.postgres.additionalDatabases }}
+        - name: init-scripts
+          configMap:
+            name: {{ $fullName }}-postgres-init
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data

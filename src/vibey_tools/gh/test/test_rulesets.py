@@ -206,7 +206,8 @@ def test_rulesets_are_enabled_and_defaulted_without_any_configuration(tmp_path):
     assert cfg.rulesets.enabled is True
     assert cfg.rulesets.integration.required_approvals == 0
     assert cfg.rulesets.release.required_approvals == 1
-    assert "PR automation / gate" in cfg.rulesets.integration.required_checks
+    assert "PR evaluate / gate" in cfg.rulesets.integration.required_checks
+    assert "PR review / gate" in cfg.rulesets.integration.required_checks
     assert cfg.rulesets.release.required_checks == (
         "Provenance",
         "Analyze Python",
@@ -423,6 +424,16 @@ def test_bypass_actor_drift_is_detected_independent_of_list_order():
 
     existing_missing_one = {**desired, "id": 1, "bypass_actors": reordered[:1]}
     assert rs.diff_ruleset(desired, existing_missing_one).changed
+
+
+def test_bypass_actor_diff_accepts_github_type_only_null_ids():
+    desired = rs.build_ruleset("develop", policy(bypass_actors=("OrganizationAdmin",)))
+    existing = {
+        **desired,
+        "id": 1,
+        "bypass_actors": [{**desired["bypass_actors"][0], "actor_id": None}],
+    }
+    assert not rs.diff_ruleset(desired, existing).changed
 
 
 def test_target_enforcement_and_conditions_drift_are_each_detected():

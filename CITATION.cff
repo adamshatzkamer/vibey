@@ -14,9 +14,10 @@ abstract: >-
 authors:
   - family-names: Steinberger
     given-names: Adam Matthew
+    email: adam@matthewsteinberger.com
     website: https://vibewithadam.matthewsteinberger.com/
 license: MIT
-version: 2.0.0
+version: 3.0.0
 date-released: "2026-09-18"
 repository-code: https://github.com/the-vibey-project/vibey
 url: https://the-vibey-project.github.io/vibey/main/
@@ -35,6 +36,8 @@ preferred-citation:
   authors:
     - family-names: Steinberger
       given-names: Adam Matthew
+      email: adam@matthewsteinberger.com
+      website: https://vibewithadam.matthewsteinberger.com/
   year: 2026
   url: https://the-vibey-project.github.io/vibey/main/paper.pdf
   notes: >-

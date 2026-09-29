@@ -49,13 +49,22 @@ OWN_JOBS = (
     "Resolve merge conflicts",
     "Escalate exhausted repair lineage",
     "Sovereign diff review",
+    # Records the sovereign lane's whole review when no paid review is declared (8.b).
+    "Record the sovereign whole review",
     # The sovereign job's name before it went first (#133). Kept so a check run a
     # pre-upgrade run of this workflow left on a head is still recognised as our own.
     "Local review fallback",
     "gate",
 )
+# The workflows that render `OWN_JOBS` and the one that predates the split. GitHub prefixes
+# a check run with the workflow that emitted it when it came from `workflow_run`, so the
+# jobs render under `PR evaluate / …` and `PR review / …`. `PR automation` is kept so a
+# check run a pre-split run left on a head is still recognised as our own rather than
+# counted as (say) a failing scan.
+GATE_WORKFLOWS = ("PR evaluate", "PR review", "PR automation")
 OWN_CHECKS = frozenset(
-    [name for job in OWN_JOBS for name in (job, f"PR automation / {job}")] + ["Merge train / merge"]
+    [name for job in OWN_JOBS for name in (job, *(f"{wf} / {job}" for wf in GATE_WORKFLOWS))]
+    + ["Merge train / merge"]
 )
 PULL_REQUEST_TRIGGERS = ("pull_request", "pull_request_target")
 _STATE_RE = github_state.marker_pattern(STATE_MARKER)
@@ -435,14 +444,15 @@ def evaluate(
             return result("review", "current head requires automated review")
         if state.review_passed is not True:
             if state.review_repairable is False:
-                # The only findings came from the sovereign lane's diff review. Repair is a
-                # paid agent editing the branch, and a local model's finding is a lead for a
-                # human rather than a ruling, so it never spends a repair attempt -- the head
-                # is simply reviewed again, exactly as it was while that model was only a
+                # The only findings came from the sovereign lane -- its diff half, or its
+                # whole review when no paid review is declared (8.b). Repair is a paid agent
+                # editing the branch, and a local model's finding is a lead for a human
+                # rather than a ruling, so it never spends a repair attempt -- the head is
+                # simply reviewed again, exactly as it was while that model was only a
                 # fallback whose verdict was never recorded.
                 return result(
                     "review",
-                    "the sovereign lane's diff review has findings that automated repair "
+                    "the sovereign lane's review has findings that automated repair "
                     "does not act on; the head is reviewed again",
                 )
             if state.attempts >= cfg.pr_automation.max_repair_attempts:

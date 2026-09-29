@@ -2,15 +2,21 @@
 
 `vibey`: a queue-based, six-phase conductor for autonomous software delivery.
 Built on PostgreSQL and five `*loop` autonomous session runners (claudeloop,
-codexloop, cursorloop, agyloop, and the opt-in local qwenloop), which live in this
+codexloop, cursorloop, agyloop, and the local runner that ships as two engines:
+`gptossloop`, the sovereign default on GPT-OSS 20B, and the opt-in `qwenloop` on
+Qwen), which live in this
 repository under `src/vibey_runners/`. It orchestrates design → build → review with
 an optional visual-design interstitial, plus an opt-in Azure deployment stage
-set. One distribution — `pip install vibey` delivers the whole family,
-engines and tools included (ADR-0037). Python 3.12+.
+set. One package — `pip install vibey-engine` delivers the whole engine family,
+engines and tools included (ADR-0037, ADR-0069); the apps are `krypton-app`. Python 3.12+.
 
 **This file is deliberately short — it holds facts, not procedures.** Every
 "how do I..." lives in a skill below; every "why was it built this way"
 lives in `docs/architecture/decisions/`.
+
+Context-bearing material follows the proposed microslice contract in [ADR-0075](https://github.com/the-vibey-project/vibey/blob/develop/docs/architecture/decisions/0075-context-microslices-and-linked-surfaces.md)
+and [docs/context-microslices.md](https://github.com/the-vibey-project/vibey/blob/develop/docs/context-microslices.md):
+small identified slices, explicit links, measured budgets, and no silent truncation.
 
 ## Non-negotiables
 
@@ -68,6 +74,46 @@ lives in `docs/architecture/decisions/`.
 - **Status is evidence-bounded.** Claims name their object, source and cutoff;
   active, blocked, failed, verified and published are not interchangeable, and
   missing or contradictory evidence stays unknown. ADR-0040; sub-doctrine 10.f.
+- **Unattended authority is bounded by a gate, never by judgement.** A standing
+  grant to act while the operator is away is read narrowly: it covers the work
+  named and the judgement that work actually requires — never an act that cannot
+  be undone, a protected branch written directly, or a gate routed around (no
+  `--no-verify`, no `--admin`, no means whose purpose is to make a check stop
+  applying). Work done overnight lands as a pull request through the merge train
+  or it does not land, so it arrives where a human would have looked for it
+  anyway. Repair is not authorship: adding the import the file next door already
+  uses is bookkeeping, supplying the definition it was meant to find is the work,
+  and where a lane's output is net-negative the answer is revert and re-queue.
+  Silence is not consent, and declining is a reportable outcome — the refusals
+  are the most useful part of the report. ADR-0046; sub-doctrine 12.d.
+- **Toil that can be fully automated is.** Anything a human would otherwise do
+  *again* — the remembering, the ordering, the repetition, the transcription,
+  the checking of a thing that could check itself — is automated, no exceptions.
+  Fully: a half-automation that still needs someone to remember the uncovered
+  step is worse than none, because it looks finished; where it cannot be made
+  whole, automate the check that says out loud when the step was missed. The
+  judgement is never automated away — if a careful person doing it twice would
+  do it identically it is toil, and if the right answer could reasonably differ
+  it stays with the human and the automation surrounds it. Automation that
+  reports success it did not observe is a liability wearing its clothes.
+  ADR-0047; sub-doctrine 12.e.
+- **Consume the whole gap, and prove the span.** A job that reads an
+  accumulating record reads everything written since its own last run. A
+  timestamp is not a watermark — records sharing the cutoff instant, or
+  arriving late or out of order, fall through a time comparison silently. The
+  watermark is a position in the data: a byte offset, an identity set, a
+  sequence. It advances only after the data is durably recorded, so a crash
+  re-reads rather than skips (at-least-once, de-duplicated by identity). An
+  unreadable source is reported and the watermark left unmoved, never stepped
+  over. A figure computed over an unknown subset is not evidence.
+  ADR-0048; sub-doctrine 10.g.
+- **Work outlives the machine.** Work in progress lives on durable storage
+  and is committed and pushed often; volatile storage holds only what can be
+  regenerated. Worktrees and storm roots live in the storm home
+  (`VIBEY_STORM_HOME`, else `~/git/vibey-storm` on macOS or
+  `~/.local/share/vibey/storm` on Linux), never under `/tmp` or `$TMPDIR`, and
+  the storm tools refuse volatile paths with exit 78. Push work in progress
+  to a draft PR at least every 30–45 minutes. ADR-0057; sub-doctrine 10.h.
 - **Code lives in classes, and every class has an interface beside it.** A
   module-level function is the method of last resort, and its reason is written
   at the definition. `src/<pkg>/services/github_service.py` implies
@@ -82,11 +128,18 @@ lives in `docs/architecture/decisions/`.
 - **The ledger is append-only.** No updates, no deletes. Corrections are new
   events that supersede prior ones.
 - **Every commit follows Conventional Commits.** Enforced by a pre-commit hook.
+- **Run `git commit` and `git push` in the foreground and wait for them.** Never edit
+  a file in a worktree while a git hook is running there. The pre-push hooks test the
+  *working tree*, not the refs being pushed, so a file written mid-run fails the push
+  with `files were modified by this hook` — while the suite itself passed. It reads as
+  a test failure and is not one. Knowing the hazard does not prevent it; this rule is
+  here because it happened again to someone who had already written the warning down.
 - **Never implement on `main`.** Feature PRs squash into `develop` through the
   merge train (`vibey-gh merge-train`); `develop` is promoted to `main` by
   `vibey-gh promote` as a **rebase** merge, keeping history linear
-  (`.vibey-gh.toml [branches]`). A push to `develop` publishes `vibey-dev` to
-  TestPyPI; a push to `main` publishes `vibey` to PyPI. ADR-0028.
+  (`.vibey-gh.toml [branches]`). A push to `develop` publishes `vibey-engine`
+  and `krypton-app` dev builds to TestPyPI; a push to `main` publishes both to PyPI,
+  each by its own workflow (`vibey-engine.yml`, `krypton-app.yml`). ADR-0028, ADR-0069.
 
 ## Layer map
 
@@ -107,16 +160,17 @@ uv workspace (`[tool.uv.workspace] members = ["src/vibey_runners/*",
 "src/vibey_tools/*"]`, ADR-0021) whose other members are absorbed with history:
 
 - `src/vibey_runners/{claude,codex,cursor,agy,qwen}` — claudeloop, codexloop,
-  cursorloop, agyloop, qwenloop; `src/vibey_runners/common` — vibey-runners-common.
+  cursorloop, agyloop, gptossloop and qwenloop (one package, two engines —
+  ADR-0064); `src/vibey_runners/common` — vibey-runners-common.
 - `src/vibey_tools/gh` — vibey-gh (provenance, merge train, promotion, release,
   and the governance canon under `docs/`); `src/vibey_tools/skills` —
   vibey-skills; `src/vibey_tools/bootstrap` — vibey-bootstrap.
 
-Each tenant keeps its own `pyproject.toml`, version, Python floor (3.10+ for
-claudeloop, vibey-runners-common and vibey-skills; 3.11+ for vibey-gh and
-vibey-bootstrap; 3.12+ for the other runners and vibey), test suite and gates
-(ADR-0022). The old sibling GitHub repositories are gone, and so are the old
-PyPI names: the whole tree ships as the single `vibey` distribution (ADR-0037).
+Each tenant keeps its own `pyproject.toml`, version, Python floor (3.12+ for
+every library; CI's `tools` matrix runs each on 3.12, 3.13 and 3.14), test
+suite and gates (ADR-0022). The old sibling GitHub repositories are gone, and so
+are the old PyPI names: the whole tree ships as the single `vibey-engine` package
+(ADR-0037, ADR-0069).
 
 ## The six-phase model
 
@@ -136,19 +190,24 @@ explicit opt-in; declining deployment records a successful local completion.
 
 ## The queue and engines
 
-- **Queue backend:** PostgreSQL 17, never SQLite. `FOR UPDATE SKIP LOCKED` is
-  the reason; see ADR-0002.
+- **Queue backend:** PostgreSQL 14+, never SQLite. CI exercises every currently
+  supported major (14–18); the Helm chart defaults to PostgreSQL 17. `FOR UPDATE
+  SKIP LOCKED` is the reason; see ADR-0002.
 - **Engines:** `claudeloop`, `codexloop`, `cursorloop`, and `agyloop` are the
-  default paid-engine pool (tier PAID). Two default-off local engines (tier LOCAL)
-  join them behind their own switches: `qwenloop` (`VIBEY_FEATURE_QWENLOOP` or
-  `[features] qwenloop`) and `claudeloop-local` — the claudeloop binary on a local
-  backend profile (`VIBEY_FEATURE_CLAUDELOOP_LOCAL` or `[features]
-  claudeloop_local`). Under sub-doctrine 8.a local engines are **preferred first**:
+  default paid-engine pool (tier PAID).
+  Three local engines (tier LOCAL) join them, each behind its own switch:
+  `gptossloop` — the sovereign default on GPT-OSS 20B, **on by default**, switched
+  off only by `VIBEY_FEATURE_GPTOSSLOOP=0` or `[features] gptossloop = false`;
+  `qwenloop` — the same runner on a Qwen model (`qwen3:14b`), off by default
+  (`VIBEY_FEATURE_QWENLOOP=1` or `[features] qwenloop = true`); and
+  `claudeloop-local` — the claudeloop binary on a local backend profile, off by
+  default (`VIBEY_FEATURE_CLAUDELOOP_LOCAL` or `[features] claudeloop_local`).
+  ADR-0064. Under sub-doctrine 8.a local engines are **preferred first**:
   BUILD selection runs SWRR within the LOCAL tier and falls back to PAID only when
-  no local engine is eligible (ADR-0038, amending ADR-0015's standby). With a local
-  engine on and no `--provider`, DESIGN and DECOMPOSE run on the sovereign
-  providers (`QwenloopDesignProvider`, `QwenloopWorkPlanProducer`; ADR-0027,
-  ADR-0038). `VIBEY_OLLAMA_URL` is the one local endpoint setting.
+  no local engine is eligible (ADR-0038, amending ADR-0015's standby). With no
+  `--provider`, DESIGN and DECOMPOSE run on the sovereign providers
+  (`GptossloopDesignProvider`, `GptossloopWorkPlanProducer`; ADR-0027, ADR-0038,
+  ADR-0064). `VIBEY_OLLAMA_URL` is the one local endpoint setting.
 - **Rotation:** `domain/rotation.py::select()` implements smooth-weighted
   round-robin selection (ADR-0005) and is wired in production: `bootstrap.py`
   builds `EngineSelector`, and BUILD jobs pick their engine per job through
@@ -164,8 +223,10 @@ explicit opt-in; declining deployment records a successful local completion.
 # CI job `uv-lock` (runs first)
 uv lock --check
 
-# CI job `gates`: the 7-gate sweep over src/vibey (Postgres 17 service)
+# CI job `gates`: Gate 0 plus the 7-gate sweep over src/vibey (services:
+# postgres:17 and rabbitmq; the broker tests skip without it)
 uv sync --extra dev
+uv run vibey-gh corpus-index --check
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy --strict src/vibey
@@ -179,11 +240,11 @@ uv run coverage report --include='src/vibey/cli/*' --fail-under=100
 
 uv run lint-imports
 uv run bandit -q -r src/vibey
-uv run pip-audit
+uv run pip-audit --skip-editable
 
-# CI job `tools`: each tool's own suite, plain pip, on its Python floor and newer
+# CI job `tools`: each tool's own suite, plain pip, on Python 3.12, 3.13 and 3.14
 (cd src/vibey_tools/gh && pip install -e ".[dev]" && python -m pytest -q)
-(cd src/vibey_tools/skills && pip install -e . && python3 tools/validate_manifests.py && python3 tools/check_links.py && PYTHONPATH=src python3 -m unittest discover -s tests)
+(cd src/vibey_tools/skills && pip install -e ".[dev]" && python3 tools/validate_manifests.py && python3 tools/check_links.py && PYTHONPATH=src python3 -m unittest discover -s tests)
 (cd src/vibey_tools/bootstrap && pip install -e ../gh && pip install -e ".[test,all]" && pytest test/ -m "not integration" --cov=vibey_bootstrap --cov-report=term)
 # ...and on each tenant's floor row, its own static gates (the row's `static` key), e.g.
 (cd src/vibey_runners/claude && pip install -e ../common && pip install -e ".[dev]" && mypy --strict src/claudeloop && lint-imports && bandit -q -r src/claudeloop)
@@ -192,11 +253,16 @@ uv run pip-audit
 (cd src/vibey_tools/gh && python -m black --check vibey_gh test && isort --check-only vibey_gh test && python -m mypy vibey_gh)
 ```
 
-CI (`.github/workflows/ci.yml`) also runs `image` (amd64 and arm64 builds; each
-`Image contract - …` step asserts one claim the Dockerfile makes) and
-`cluster-smoke` (Helm install on minikube; each `Contract - …` step asserts one
-cluster behaviour). `tools-lint` additionally checks that vibey-gh's managed
-automation has no drift.
+CI (`.github/workflows/ci.yml`) also runs `noloss` (the no-loss property suite
+at 10,000 examples), `postgres-compatibility` (the database suite on PostgreSQL
+14–18), `krypton-app`, `vibey-core` (`@vibey/core`), `app` (Krypton mobile and
+web), `vscode-extension` (Ubuntu and macOS), `desktop` (Krypton desktop on
+Ubuntu and Arch), `image` (amd64 and arm64 builds; each `Image contract - …`
+step asserts one claim the Dockerfile makes), `chart` (Helm lint and golden
+render of every profile) and `cluster-smoke` (Helm install on minikube; each
+`Contract - …` step asserts one cluster behaviour). `tools-lint` additionally
+checks that both rendered copies of vibey-gh's managed automation — vibey-gh's
+own and the repository root's — have no drift.
 
 ## Where to go for everything else
 
@@ -206,7 +272,7 @@ automation has no drift.
 | Comprehensive architecture diagram (layers, phases, data flow, security boundary, release channels) | `docs/project.mmd` |
 | The formal model: ledger invariant, queue semantics, gate soundness | The research paper — source `docs/paper.md`; published at https://the-vibey-project.github.io/vibey/main/paper/ and https://the-vibey-project.github.io/vibey/main/paper.pdf |
 | The whole documentation, offline, in reading order | The book — https://the-vibey-project.github.io/vibey/main/book.pdf · https://the-vibey-project.github.io/vibey/main/book.epub · https://the-vibey-project.github.io/vibey/main/book-print.html (built from `properdocs.yml` nav on every release) |
-| The governing law: the Twelve Doctrines, sub-doctrines, the Constitution | `src/vibey_tools/gh/docs/doctrines.md`, `constitution.md` (index: `corpus-index.json`) |
+| The governing law: the Twelve Doctrines, sub-doctrines, the Constitution | `src/vibey_tools/gh/docs/doctrines.md`, `constitution.md` (index: `src/vibey_tools/gh/corpus-index.json`) |
 | Every CLI command, subcommand, flag, default | `docs/reference/cli.md` |
 | Full `vibey.toml` schema | `docs/reference/configuration.md` |
 | Full architecture | `docs/plans/architecture-and-roadmap.md` |
@@ -216,7 +282,7 @@ automation has no drift.
 | Rotation & engines | `docs/plans/rotation-and-engines.md` |
 | Phase protocols | `docs/plans/phase-protocols.md` |
 | Implementation plan | `docs/plans/implementation-plan.md` |
-| System design and why each hard call was made | `docs/architecture/decisions/` (41 ADRs) |
+| System design and why each hard call was made | `docs/architecture/decisions/` (75 ADRs) |
 | User-facing docs | `README.md` Quickstart, `docs/guides/` |
 | Expansion workstreams (JIRA, clouds, k8s, clients, …) | `docs/runbooks/expansion/` (22 runbooks, `00-master-plan.md` first) |
 | Contribution workflow, hooks, branch flow, PR expectations | `CONTRIBUTING.md` |

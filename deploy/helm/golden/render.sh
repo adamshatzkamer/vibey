@@ -76,18 +76,29 @@ profile() {
 # is meant to reach every default install.
 profile default --
 # The in-cluster Ollama, whole: its volume, Service, Deployment, pull Job, and
-# the worker environment that points vibey and qwenloop at it.
+# the worker environment that points vibey and gptossloop at it.
 profile ollama -- --set ollama.enabled=true
-# The GPU branch and the qwenloop worker wiring, narrowed to what they touch.
-profile ollama-gpu-qwenloop \
+# The GPU branch and the local-runner worker wiring, narrowed to what they
+# touch: gptossloop as the provider, and qwenloop switched on beside it, so
+# its Qwen model is pulled and handed to it (ADR-0064).
+profile ollama-gpu-gptossloop \
   --show-only templates/ollama.yaml --show-only templates/worker.yaml -- \
   --set ollama.enabled=true --set ollama.gpu.enabled=true \
-  --set worker.provider=qwenloop --set worker.engines=qwenloop
+  --set ollama.qwenloopFeature=true \
+  --set worker.provider=gptossloop --set 'worker.engines=gptossloop\,qwenloop'
 # The KEDA claimable-work query, scoped to the project the worker serves:
 # unbound (the newest project, as the worker itself resolves it) and bound.
 profile keda-latest --show-only templates/keda-scaledobject.yaml -- \
   --set keda.enabled=true
 profile keda-project --show-only templates/keda-scaledobject.yaml -- \
   --set keda.enabled=true --set worker.project="$PROJECT"
+# All sovereign surfaces disabled: proves the chart still installs without
+# them and matches the non-surfaces baseline.
+profile surfaces-off -- --set surfaces.enabled=false
+# A managed database through an existing Secret (ADR-0055, review of #1100): no
+# `migrate` init container and no owner key unless the Secret names one, so an
+# upgrade never strands the worker on a key the Secret does not have.
+profile existing-secret --show-only templates/worker.yaml -- \
+  --set postgres.enabled=false --set dsn.existingSecret=vibey-db
 
 exit "$failed"

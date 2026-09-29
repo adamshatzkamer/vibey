@@ -21,7 +21,17 @@
     proposition: "Proposition",
     corollary: "Corollary",
     proof: "Proof",
+    plainwords: "In plain words",
   };
+
+  const MATH_ENVIRONMENTS = [
+    "equation", "equation*",
+    "align", "align*",
+    "gather", "gather*",
+    "multline", "multline*",
+    "eqnarray", "eqnarray*",
+    "alignat", "alignat*"
+  ];
 
   const escapeHtml = (text) =>
     text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -54,19 +64,43 @@
       pre.append(inner);
       return pre;
     }
-    const env = source.match(/^\\begin\{(\w+)\}(?:\[([^\]]*)\])?([\s\S]*?)\\end\{\1\}$/);
-    if (!env || !(env[1] in ENVIRONMENTS)) {
+    const env = source.match(/^\\begin\{([\w*]+)\}(?:\[([^\]]*)\])?([\s\S]*?)\\end\{\1\}$/);
+    if (!env) {
       return null;
     }
-    const [, name, title, body] = env;
-    counters[name] = (counters[name] || 0) + 1;
-    const block = document.createElement("div");
-    block.className = `latex-env latex-${name}`;
-    const label = name === "proof" ? ENVIRONMENTS[name] : `${ENVIRONMENTS[name]} ${counters[name]}`;
-    const heading = `<strong>${label}${title ? ` (${inlineMath(title)})` : ""}.</strong> `;
-    const paragraphs = body.trim().split(/\n\s*\n/).map((p) => inlineMath(p.replace(/\s+/g, " ")));
-    block.innerHTML = `<p>${heading}${paragraphs.join("</p><p>")}</p>`;
-    return block;
+    const name = env[1];
+    if (name in ENVIRONMENTS) {
+      const [, , title, body] = env;
+      counters[name] = (counters[name] || 0) + 1;
+      const block = document.createElement("div");
+      block.className = `latex-env latex-${name}`;
+      const label = name === "proof" ? ENVIRONMENTS[name] : `${ENVIRONMENTS[name]} ${counters[name]}`;
+      const heading = `<strong>${label}${title ? ` (${inlineMath(title)})` : ""}.</strong> `;
+      const paragraphs = body.trim().split(/\n\s*\n/).map((p) => inlineMath(p.replace(/\s+/g, " ")));
+      block.innerHTML = `<p>${heading}${paragraphs.join("</p><p>")}</p>`;
+      return block;
+    }
+    if (MATH_ENVIRONMENTS.includes(name)) {
+      const block = document.createElement("div");
+      block.className = "arithmatex";
+      block.innerHTML = `\\[ ${source} \\]`;
+      return block;
+    }
+    if (name === "figure" || name === "figure*") {
+      // A figure the build rendered arrives as an inline <figure> already; one that
+      // reaches the browser as TeX was not rendered, and a page of TikZ source helps
+      // nobody. Show the caption, and say where the drawing itself can be seen.
+      const captionMatch = source.match(/\\caption\{((?:[^{}]|\{[^{}]*\})*)\}/);
+      const block = document.createElement("figure");
+      block.className = "paper-figure paper-figure-unrendered";
+      counters.figure = (counters.figure || 0) + 1;
+      const caption = captionMatch ? inlineMath(captionMatch[1].replace(/\s+/g, " ")) : "";
+      block.innerHTML =
+        `<figcaption><strong>Figure ${counters.figure}.</strong> ${caption} ` +
+        `<em>(This figure is drawn in the PDF edition of the paper.)</em></figcaption>`;
+      return block;
+    }
+    return null;
   };
 
   const convertLatexFences = () => {

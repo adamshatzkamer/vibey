@@ -16,6 +16,7 @@ interface beside it (ADR-0016), following tests/meta/: the rule is about product
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -93,6 +94,18 @@ async def _seed(pool: asyncpg.Pool) -> UUID:
         )
         for key in ("n-1", "n-2", "n-3"):
             await _job(conn, newest, key)
+    # A job in a phase this release does not know (a newer vibey wrote it): the claim
+    # never takes it (vibey#287), so the scaler must not count it either.
+    # ALTER TYPE is the owner's (ADR-0055); `pool` is the application role's.
+    owner = await asyncpg.connect(os.environ["VIBEY_TEST_DATABASE_URL"])
+    try:
+        await owner.execute("ALTER TYPE phase ADD VALUE IF NOT EXISTS 'triage'")
+    finally:
+        await owner.close()
+    async with pool.acquire() as conn:
+        for pid, key in ((BOUND, "unknown-phase"), (newest, "n-unknown-phase")):
+            stranger = await _job(conn, pid, key)
+            await conn.execute("UPDATE job SET phase = 'triage' WHERE id = $1", stranger)
     return newest
 
 
@@ -128,6 +141,20 @@ async def test_an_unbound_scaler_counts_the_project_an_unbound_worker_binds_to(
     claimed = await _claim_all(migrated_pool, latest.project_id)
 
     assert (latest.project_id, counted, claimed) == (newest, 3, 3)
+
+
+def test_the_scaler_counts_exactly_the_phases_the_claim_takes() -> None:
+    """The chart spells the known phases out; the claim reads them from `Phase`. Pin the
+    two together so a new phase cannot reach one and not the other."""
+    import re
+
+    from vibey.infrastructure.db.job_repository import KNOWN_PHASES
+
+    for profile in ("keda-project", "keda-latest"):
+        listed = re.search(r"j\.phase::text IN \(([^)]*)\)", _scaler_query(profile))
+        assert listed is not None, f"{profile}: the scaler has no known-phase filter"
+        phases = tuple(p.strip().strip("'") for p in listed.group(1).split(","))
+        assert phases == KNOWN_PHASES
 
 
 async def test_an_unbound_scaler_with_no_project_counts_nothing(

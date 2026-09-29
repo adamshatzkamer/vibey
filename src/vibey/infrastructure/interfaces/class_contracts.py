@@ -8,25 +8,34 @@ without making application code depend on a concrete implementation.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from vibey.application.dto import ProjectRecord
 from vibey.application.interfaces import (
     BuildLedger,
+    CallerIdentity,
     DesignProvider,
     EngineAdapter,
     EngineHealthRepository,
+    JobPriorityStore,
     JobRepository,
     LedgerSearch,
     LedgerShardStore,
     LedgerSiteWriter,
     PhaseLedger,
+    PriorityGrantReader,
     ProjectStore,
     RotationCursorRepository,
     RunFeasibilityEvaluatorInterface,
     SkillsContextCompiler,
     WorkPlanProducer,
 )
+from vibey.domain.interfaces.config_interface import QueueConfigInterface
+
+if TYPE_CHECKING:
+    from vibey.domain.config import VibeyConfig
 from vibey.infrastructure.build.interfaces import (
     ConfigurableAutomatedReviewRunnerInterface,
     ConfigurableGateRunnerInterface,
@@ -67,6 +76,41 @@ class PostgresEngineHealthRepositoryInterface(EngineHealthRepository, Protocol):
 @runtime_checkable
 class PostgresJobRepositoryInterface(JobRepository, Protocol):
     """The Postgres implementation of the durable job repository port."""
+
+
+@runtime_checkable
+class PostgresJobPriorityStoreInterface(JobPriorityStore, Protocol):
+    """The Postgres implementation of the queue-priority store (ADR-0054)."""
+
+
+@runtime_checkable
+class ProjectPriorityGrantReaderInterface(PriorityGrantReader, Protocol):
+    """Reads a project's grant from `<repo_path>/vibey.toml`, and nowhere else."""
+
+
+@runtime_checkable
+class ProcessCallerInterface(CallerIdentity, Protocol):
+    """The account this process runs as: uid from the OS, name from pwd."""
+
+
+@runtime_checkable
+class EnvironmentConfigLoaderInterface(Protocol):
+    """What the environment alone declares, for a process with no vibey.toml."""
+
+    def load(self, environ: Mapping[str, str] = ...) -> VibeyConfig:
+        """The environment overlay parsed on its own; raises on a malformed value."""
+        ...
+
+
+@runtime_checkable
+class QueueConfigLoaderInterface(Protocol):
+    """Reads `[queue]` from a vibey.toml, and only `[queue]`."""
+
+    def load(self, path: Path, *, environ: Mapping[str, str] | None = None) -> QueueConfigInterface:
+        """The declared queue policy. A missing file declares nothing -- the operator
+        alone may reorder -- and a malformed one raises rather than being read as
+        empty, so a broken declaration is never mistaken for none."""
+        ...
 
 
 @runtime_checkable
@@ -122,6 +166,11 @@ class PostgresProjectRepositoryInterface(ProjectStore, Protocol):
 
     async def get_latest(self) -> object: ...
 
+    async def list_all(self) -> tuple[ProjectRecord, ...]:
+        """Every project, newest first: `created_at` descending, then id, so the order
+        is the same on every read. What `vibey projects` lists."""
+        ...
+
 
 @runtime_checkable
 class PostgresReviewLedgerInterface(PhaseLedger, Protocol):
@@ -151,7 +200,21 @@ class LocalEngineSwitchInterface(Protocol):
     @property
     def feature_key(self) -> str: ...
 
+    @property
+    def on_by_default(self) -> bool: ...
+
     def env_var(self) -> str: ...
+
+
+@runtime_checkable
+class LocalRunnerVariablesInterface(Protocol):
+    """The variables one local runner reads for its endpoint (ADR-0064)."""
+
+    @property
+    def base_url(self) -> str: ...
+
+    @property
+    def model(self) -> str: ...
 
 
 @runtime_checkable

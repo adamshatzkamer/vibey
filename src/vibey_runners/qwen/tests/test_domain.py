@@ -1,18 +1,29 @@
 # Made with ❤️ by [Vibey](https://the-vibey-project.github.io/vibey/), Developed by [Adam Matthew Steinberger](https://vibewithadam.matthewsteinberger.com/) ([@adammatthewsteinberger](https://github.com/adammatthewsteinberger/)).
 import pytest
 
-from qwenloop.application.backend_selection import BackendSelector, Hardware
+from qwenloop.application.backend_selection import BackendChoice, BackendSelector, Hardware
 from qwenloop.application.interfaces import BackendSelectorInterface
 from qwenloop.domain.config import (
+    DEFAULT_EMPTY_REPLY_REASONING_EXCERPT_CHARS,
     DEFAULT_ENDPOINT_BASE_URL,
     DEFAULT_ENDPOINT_MODEL,
+    DEFAULT_MAX_EMPTY_REPLY_RETRIES,
+    DEFAULT_MAX_RECORDED_ARGUMENT_CHARS,
+    DEFAULT_SKIP_DIRS,
+    Effort,
     QwenConfig,
     QwenConfigParser,
+    ToolLimits,
 )
-from qwenloop.domain.interfaces import QwenConfigParserInterface
+from qwenloop.domain.interfaces import (
+    ChatChunkInterface,
+    QwenConfigInterface,
+    QwenConfigParserInterface,
+)
 from qwenloop.domain.model import (
     Backend,
     CapacityKind,
+    ChatChunk,
     RunStatus,
     ServerInfo,
     terminal_status,
@@ -36,6 +47,77 @@ def test_config_validation() -> None:
         parser.parse({"backend": "unknown"})
     with pytest.raises(ValueError, match="positive"):
         parser.parse({"endpoint_timeout_seconds": 0})
+    with pytest.raises(ValueError, match="turn_dispatch_mode"):
+        parser.parse({"turn_dispatch_mode": "unknown"})
+    with pytest.raises(ValueError, match="turn_queue_url"):
+        parser.parse({"turn_dispatch_mode": "rabbitmq"})
+    with pytest.raises(ValueError, match="turn_queue_name"):
+        parser.parse({"turn_queue_name": "   "})
+
+
+def test_rabbitmq_turn_dispatch_is_explicitly_configured() -> None:
+    configured = parser.parse(
+        {
+            "turn_dispatch_mode": "rabbitmq",
+            "turn_queue_url": "amqp://broker/vibey",
+            "turn_queue_name": "custom.turns",
+        }
+    )
+    assert (
+        configured.turn_dispatch_mode,
+        configured.turn_queue_url,
+        configured.turn_queue_name,
+    ) == ("rabbitmq", "amqp://broker/vibey", "custom.turns")
+
+
+def test_hybrid_turn_dispatch_accepts_a_positive_concurrency() -> None:
+    configured = parser.parse({"turn_dispatch_mode": "hybrid", "hybrid_concurrency": 4})
+    assert configured.turn_dispatch_mode == "hybrid"
+    assert configured.hybrid_concurrency == 4
+
+
+def test_hybrid_turn_dispatch_rejects_non_positive_concurrency() -> None:
+    with pytest.raises(ValueError, match="hybrid_concurrency"):
+        parser.parse({"turn_dispatch_mode": "hybrid", "hybrid_concurrency": 0})
+
+
+def test_tool_limits_default_and_come_from_the_tools_table() -> None:
+    default = parser.parse({})
+    assert isinstance(default, QwenConfigInterface)
+    assert default.tools == ToolLimits()
+    assert default.tools.skip_dirs == DEFAULT_SKIP_DIRS
+    assert ".git" in DEFAULT_SKIP_DIRS
+    configured = parser.parse(
+        {"tools": {"max_search_matches": 7, "max_read_chars": "50", "skip_dirs": ["vendor"]}}
+    )
+    assert configured.tools == ToolLimits(
+        max_search_matches=7, max_read_chars=50, skip_dirs=("vendor",)
+    )
+    assert default.tools.search_timeout_seconds == 10.0
+    timed = parser.parse({"tools": {"search_timeout_seconds": 2, "max_skipped_examples": 3}})
+    assert (timed.tools.search_timeout_seconds, timed.tools.max_skipped_examples) == (2.0, 3)
+
+
+@pytest.mark.parametrize(
+    ("tools", "message"),
+    [
+        ("100", "tools must be a table"),
+        ({"max_matches": 5}, "unknown qwenloop tools key\\(s\\): max_matches"),
+        ({"max_find_results": 0}, "tools.max_find_results must be positive"),
+        ({"max_line_chars": -1}, "tools.max_line_chars must be positive"),
+        ({"skip_dirs": ".git"}, "tools.skip_dirs must be a list"),
+        ({"skip_dirs": [".git", 3]}, "tools.skip_dirs must be a list"),
+        ({"skip_dirs": [""]}, "tools.skip_dirs must be a list"),
+        ({"max_skipped_examples": 0}, "tools.max_skipped_examples must be positive"),
+        ({"search_timeout_seconds": 0}, "tools.search_timeout_seconds must be a positive"),
+        ({"search_timeout_seconds": float("inf")}, "tools.search_timeout_seconds must be a"),
+        ({"search_timeout_seconds": float("nan")}, "tools.search_timeout_seconds must be a"),
+        ({"search_timeout_seconds": "soon"}, "tools.search_timeout_seconds must be a"),
+    ],
+)
+def test_tool_limits_refuse_what_they_cannot_honour(tools: object, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        parser.parse({"tools": tools})
 
 
 def test_config_refuses_unknown_keys_instead_of_ignoring_them() -> None:
@@ -47,7 +129,7 @@ def test_endpoint_is_unconfigured_by_default_and_falls_back_to_ollama() -> None:
     config = parser.parse({})
     assert not config.endpoint_configured
     assert config.endpoint_url == DEFAULT_ENDPOINT_BASE_URL == "http://127.0.0.1:11434/v1"
-    assert config.model == DEFAULT_ENDPOINT_MODEL == "qwen2.5-coder:14b"
+    assert config.model == DEFAULT_ENDPOINT_MODEL == "gpt-oss:20b"
 
 
 def test_endpoint_settings_are_parsed_and_normalised() -> None:
@@ -147,3 +229,125 @@ def test_capacity_outranks_completion() -> None:
     assert terminal_status(CapacityKind.LOCAL_BUSY, True) is RunStatus.FAILED
     assert terminal_status(CapacityKind.AVAILABLE, True) is RunStatus.COMPLETED
     assert terminal_status(CapacityKind.AVAILABLE, False) is RunStatus.RUNNING
+
+
+def test_a_running_local_ollama_is_the_default_backend_when_nothing_is_configured() -> None:
+    linux_gpu = Hardware("Linux", nvidia_vram_bytes=80 * 1024**3)
+    chosen = selector.select(
+        Backend.AUTO,
+        linux_gpu,
+        vllm_installed=True,
+        endpoint_configured=False,
+        ollama_available=True,
+    )
+    assert chosen == BackendChoice(
+        Backend.OPENAI_COMPAT, "a local Ollama is running: the default backend"
+    )
+    # an explicit backend and a configured endpoint still decide first
+    assert (
+        selector.select(
+            Backend.LLAMA_CPP,
+            linux_gpu,
+            vllm_installed=True,
+            endpoint_configured=False,
+            ollama_available=True,
+        ).reason
+        == "explicit configuration"
+    )
+    assert (
+        selector.select(
+            Backend.AUTO,
+            linux_gpu,
+            vllm_installed=True,
+            endpoint_configured=True,
+            ollama_available=True,
+        ).reason
+        == "an OpenAI-compatible endpoint is configured"
+    )
+    # without a running Ollama nothing changes
+    assert (
+        selector.select(
+            Backend.AUTO, linux_gpu, vllm_installed=True, endpoint_configured=False
+        ).backend
+        is Backend.VLLM
+    )
+
+
+def test_empty_reply_retries_are_declared_configuration() -> None:
+    # declared, not compiled in: the default lives on QwenConfig and a file can change it
+    assert QwenConfig().max_empty_reply_retries == DEFAULT_MAX_EMPTY_REPLY_RETRIES == 2
+    assert parser.parse({"max_empty_reply_retries": 5}).max_empty_reply_retries == 5
+    # zero is meaningful: the first empty reply fails the run, as it did before
+    assert parser.parse({"max_empty_reply_retries": 0}).max_empty_reply_retries == 0
+    with pytest.raises(ValueError, match="max_empty_reply_retries must be a non-negative integer"):
+        parser.parse({"max_empty_reply_retries": -1})
+
+
+def test_changed_value_objects_conform_to_their_declared_contracts() -> None:
+    # ADR-0016: every class this change touched has its seam beside it, and meets it
+    assert isinstance(QwenConfig(), QwenConfigInterface)
+    chunk = ChatChunk(finish_reason="stop", reasoning="thinking")
+    assert isinstance(chunk, ChatChunkInterface)
+    assert (chunk.finish_reason, chunk.reasoning) == ("stop", "thinking")
+
+
+def test_recording_caps_are_declared_configuration() -> None:
+    config = QwenConfig()
+    assert config.max_recorded_argument_chars == DEFAULT_MAX_RECORDED_ARGUMENT_CHARS == 200
+    assert (
+        config.empty_reply_reasoning_excerpt_chars
+        == DEFAULT_EMPTY_REPLY_REASONING_EXCERPT_CHARS
+        == 400
+    )
+    parsed = parser.parse(
+        {"max_recorded_argument_chars": 0, "empty_reply_reasoning_excerpt_chars": 0}
+    )
+    # zero is meaningful for both: record no argument values, and no excerpt at all
+    assert (parsed.max_recorded_argument_chars, parsed.empty_reply_reasoning_excerpt_chars) == (
+        0,
+        0,
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "max_empty_reply_retries",
+        "max_recorded_argument_chars",
+        "empty_reply_reasoning_excerpt_chars",
+    ],
+)
+@pytest.mark.parametrize("value", [-1, float("inf"), float("nan"), 1.5, True, "many"])
+def test_recording_bounds_must_be_finite_non_negative_integers(key: str, value: object) -> None:
+    # a TOML file can say `inf` or `nan`; a bound either of those is no bound at all
+    with pytest.raises(ValueError, match=f"{key} must be a non-negative integer"):
+        parser.parse({key: value})
+
+
+def test_the_two_engines_differ_only_in_name_prefix_and_model() -> None:
+    """ADR-0064: one runner, two engines; each derives its own variable names."""
+    from qwenloop.domain.config import GPTOSSLOOP, QWENLOOP
+    from qwenloop.domain.interfaces import RunnerIdentityInterface
+
+    assert isinstance(GPTOSSLOOP, RunnerIdentityInterface)
+    assert (GPTOSSLOOP.name, GPTOSSLOOP.default_model) == ("gptossloop", "gpt-oss:20b")
+    assert (QWENLOOP.name, QWENLOOP.default_model) == ("qwenloop", "qwen3:14b")
+    assert (
+        GPTOSSLOOP.env_config,
+        GPTOSSLOOP.env_base_url,
+        GPTOSSLOOP.env_model,
+        GPTOSSLOOP.env_api_key,
+    ) == ("GPTOSSLOOP_CONFIG", "GPTOSSLOOP_BASE_URL", "GPTOSSLOOP_MODEL", "GPTOSSLOOP_API_KEY")
+    assert QWENLOOP.env_model == "QWENLOOP_MODEL"
+    assert QwenConfigParser(default_model="qwen3:14b").parse({}).model == "qwen3:14b"
+
+
+def test_extreme_is_finite_and_matches_ultra_budget() -> None:
+    assert Effort.EXTREME.default_max_turns == Effort.ULTRA.default_max_turns
+    assert Effort.EXTREME.default_max_turns > Effort.STANDARD.default_max_turns
+
+
+def test_effort_parser_rejects_unknown_values() -> None:
+    assert Effort.parse("EXTREME") is Effort.EXTREME
+    with pytest.raises(ValueError, match="expected one of"):
+        Effort.parse("eternal")

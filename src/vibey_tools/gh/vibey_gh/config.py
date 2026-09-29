@@ -19,9 +19,9 @@ Every project-specific decision lives here so the logic beside it can stay gener
 
     [install]
     workflows = []            # omit for all of them; [] for hooks and the CLI only
-    fallback_package = "vibey"  # the distribution a rendered workflow or hook installs
+    fallback_package = "vibey-engine"  # the distribution a rendered workflow or hook installs
                               # this tooling from when the repository has no copy of it
-    pin_version = false       # pin that rendered `pip install vibey` to the exact
+    pin_version = false       # pin that rendered `pip install vibey-engine` to the exact
                               # version that rendered it, instead of the latest release
 
     [issue_automation]
@@ -30,8 +30,8 @@ Every project-specific decision lives here so the logic beside it can stay gener
     required_label = "vibey-gh:solve"   # what opts an outside author's issue in
 
     [platform]
-    kind = "github"         # which forge the repository lives on; github is the one adapter
-    host = "github.com"     # that forge's host, for GitHub Enterprise Server and its like
+    kind = "forgejo"        # the sovereign, self-hosted default forge; github/gitlab declared-only
+    host = ""               # that forge's host; empty means the adapter's own default, forgejo.local
     repository = "owner/name"  # optional namespace; otherwise read origin's URL
     token_env = "GITLAB_TOKEN"  # name of the environment variable, never the secret itself
 
@@ -43,8 +43,10 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -101,7 +103,7 @@ DEFAULT_SOURCES = ("tools/*.py", "src/**/*.py", ".github/workflows/*.yml")
 # an adopter's workflow at all — it is this project's own five-surface self-test, so every
 # adopter had to notice it and take it back out.
 # This list is two things at once, and the second is easy to miss: it names the workflows
-# whose completion re-triggers evaluation, *and* it is rendered into `pr-automation.yml`'s
+# whose completion re-triggers evaluation, *and* it is rendered into `pr-evaluate.yml`'s
 # `workflow_run` trigger. So a workflow whose check gates a merge but is absent here can
 # never announce that it finished — the rollup counts it as pending, the last scan to
 # complete triggers the final evaluation, and if this one finishes after that, nothing
@@ -119,7 +121,18 @@ DEFAULT_SCAN_WORKFLOWS = (
 # Git's built-in `union` driver keeps both sides instead of reporting a conflict, which is
 # exactly right for an append-only log and wrong for anything with structure.
 DEFAULT_UNION_MERGE_PATHS = ("CHANGELOG.md",)
-DEFAULT_IGNORED_CHECKS = ("PR automation / gate", "gate", "Merge train / merge")
+DEFAULT_IGNORED_CHECKS = (
+    # The two gates the split PR automation renders: the scan gate (`pr-evaluate.yml`)
+    # and the review gate (`pr-review.yml`). `PR automation / gate` is kept for the
+    # check runs a pre-split workflow left on today's heads: ignoring them costs
+    # nothing, and a green run of an automation that no longer exists must never be
+    # counted as a scan that repaired itself.
+    "PR evaluate / gate",
+    "PR review / gate",
+    "PR automation / gate",
+    "gate",
+    "Merge train / merge",
+)
 # A required status check names a *check run* — for Actions, a job's `name:` — not the
 # workflow that contains it. `DEFAULT_SCAN_WORKFLOWS` above names workflows and must never
 # be reused here, however tempting the overlap looks: "CI" and "Docs" are workflows whose
@@ -136,7 +149,10 @@ DEFAULT_RULESET_CHECKS = (
     "Analyze Python",
     "Documentation contract",
 )
-DEFAULT_INTEGRATION_RULESET_CHECKS = DEFAULT_RULESET_CHECKS + ("PR automation / gate",)
+DEFAULT_INTEGRATION_RULESET_CHECKS = DEFAULT_RULESET_CHECKS + (
+    "PR evaluate / gate",
+    "PR review / gate",
+)
 DEFAULT_RELEASE_RULESET_CHECKS = DEFAULT_RULESET_CHECKS
 # The repository admin role. A required check can always stop reporting — an outage, an
 # exhausted budget, a renamed job, a workflow the repository chose not to install — and
@@ -231,7 +247,8 @@ class WorkflowNamesConfig:
     release: str = "Release"
     # vibey-gh's own templates.
     provenance: str = "Provenance"
-    pr_automation: str = "PR automation"
+    pr_evaluate: str = "PR evaluate"
+    pr_review: str = "PR review"
     merge_train: str = "Merge train"
     promote: str = "Promote"
     release_surfaces: str = "Release surfaces"
@@ -241,11 +258,11 @@ class WorkflowNamesConfig:
 
 
 # The forges `[platform] kind` accepts today: the ones with an adapter. `ForgeKind` names
-# more, because the standard is written for every forge (#138), but a kind with no adapter
-# is refused here, at load, rather than accepted and then quietly driven as GitHub by every
-# module that has not moved onto the adapter yet. `ForgeSelector.kinds` must equal this,
-# and a test holds them together.
-ADAPTED_PLATFORM_KINDS = tuple(kind.value for kind in ForgeKind)
+# more (such as `bitbucket`, #138), because the standard is written for every forge, but a
+# kind with no adapter is refused here, at load, rather than accepted and then quietly
+# driven as forgejo by every module that has not moved onto the adapter yet.
+# `ForgeSelector.kinds` must equal this, and a test holds them together.
+ADAPTED_PLATFORM_KINDS = ("github", "gitlab", "forgejo")
 
 # A bare host name, optionally with a port: what `gh` takes as `GH_HOST`. No scheme, path,
 # user or whitespace, so the value cannot smuggle anything else into the client's reading.
@@ -257,17 +274,21 @@ class PlatformConfig:
     """Which forge this repository lives on, and where (#138).
 
     `kind` selects the forge adapter, which is the only code allowed to know what platform
-    it is speaking to. `host` is that forge's host: `github.com`, the default, is the host
-    `gh` assumes on its own and changes nothing; any other host (a GitHub Enterprise Server)
-    is handed to `gh` as `GH_HOST`, so every call the adapter makes goes there.
+    it is speaking to. The sovereign, self-hosted default is `forgejo` (ADR 0002); `github`
+    and `gitlab` are declared-only — an adopter writes the kind explicitly. `host` is that
+    forge's host. With `forgejo` it defaults to the adapter's own `forgejo.local` (a bare
+    self-hosted instance); with `github` the `gh` client's own `github.com` is assumed when
+    `host` is empty, so the default changes neither the argv nor the environment of any
+    `gh` call. Any other host is handed to the transport it belongs to, so every call the
+    adapter makes goes there.
 
     Only the calls that have moved onto the adapter read this — today the clean-repo
     survey's two forge reads. Every other command still runs `gh` the way it always has,
     which is exactly why a kind without an adapter is refused rather than half-honoured.
     """
 
-    kind: str = ForgeKind.GITHUB.value
-    host: str = "github.com"
+    kind: str = ForgeKind.FORGEJO.value
+    host: str = ""
     repository: str = ""
     token_env: str = ""
 
@@ -279,10 +300,10 @@ class PlatformConfig:
             self.kind not in ADAPTED_PLATFORM_KINDS
         ):  # pragma: no cover - enum and adapters move together
             raise ValueError(self.not_adapted(self.kind))
-        if not isinstance(self.host, str) or not _HOST_RE.fullmatch(self.host):
+        if not isinstance(self.host, str) or not (self.host == "" or _HOST_RE.fullmatch(self.host)):
             raise ValueError(
-                "platform.host must be a bare host name, optionally with a port "
-                f"(no scheme or path): {self.host!r}"
+                "platform.host must be empty (the adapter's own default) or a bare host name,"
+                f" optionally with a port (no scheme or path): {self.host!r}"
             )
         if self.repository and (
             self.repository.startswith("/")
@@ -450,6 +471,13 @@ class SocialSignalsConfig:
             raise ValueError("social_signals.enabled with no entries renders nothing honest")
 
 
+def _unique_nonempty(name: str, values: tuple[str, ...]) -> None:
+    if any(not value.strip() for value in values):
+        raise ValueError(f"{name} entries must be non-empty")
+    if len(set(values)) != len(values):
+        raise ValueError(f"{name} entries must be unique")
+
+
 @dataclass(frozen=True)
 class PrAutomationObservabilityConfig:
     sanitized_progress: bool = True
@@ -480,15 +508,62 @@ class PrAutomationFallbackConfig:
 
     enabled: bool = True
     runner_label: str = "vibey-local"
-    model: str = "qwen2.5-coder:14b"
+    model: str = "gpt-oss:20b"
     base_url: str = "http://127.0.0.1:11434"
     trusted_only: bool = True
     max_diff_chars: int = 60000
+    # The most characters of `context_paths` documents a WHOLE review is shown, whatever
+    # the window would allow. Its own key, never `max_diff_chars`: tied to the diff's
+    # 60,000, this repository's two pages already took 59,607 of it, and a few hundred more
+    # characters of README cut a page and turned every gate red. 120,000 is about twice what
+    # those two pages hold today; the window, not this, is what usually binds.
+    max_document_chars: int = 120000
     timeout_seconds: int = 600
     heartbeat_ref: str = "refs/vibey-gh/sovereign-heartbeat"
     heartbeat_max_age_minutes: int = 15
+    # The documents the sovereign lane judges the documentation contract against when it
+    # answers the WHOLE review because no paid review is declared (8.b). Fetched read-only
+    # from the exact head through the contents API -- never a checkout -- and handed to the
+    # model beside the diff, so the opening and onboarding judgments are made on the pages
+    # they are about. A path absent at that head is skipped and the verdict says which
+    # documents it saw.
+    context_paths: tuple[str, ...] = ("README.md", "docs/index.md")
+    # The model's window, as this host measured it -- never a number compiled into the
+    # sizer. A request is sized from everything it sends and refused, or its optional
+    # documents trimmed, rather than sent over this: left to its defaults Ollama does not
+    # refuse an oversized prompt, it cuts it to about half the window and answers about
+    # the rest. 65536 is what docs/plans/qwenstorm-3.0.0/bench/host-tuning.toml chose for
+    # gpt-oss:20b. Kept equal to `vibey_gh.fit`'s defaults by a test.
+    context_window: int = 65536
+    # Room kept free for the model's reasoning AND its answer. #1090's whole review read its
+    # whole 31,765-token prompt and then ran out of room to answer in the 1,004 tokens a
+    # 32,768 window left it; re-run with room, it spent 3,676 tokens on both at default
+    # reasoning (471 with `think = "low"`).
+    reasoning_reserve_tokens: int = 8192
+    # Characters per token when estimating a prompt: pessimistic for prose and code
+    # (measured: 3.95), optimistic for dense text such as a lockfile (about 2.1). The
+    # estimate only decides what to trim; truncation is refused by the request itself.
+    chars_per_token: int = 3
+    # Ollama's `think` for a reasoning model: "low", "medium" or "high", or empty to send
+    # nothing and keep the model's default. Empty by default: on #1090 "low" returned the
+    # same verdict in an eighth of the tokens, but one sample is not a fidelity study.
+    think: str = ""
 
     def __post_init__(self) -> None:
+        _unique_nonempty("pr_automation.fallback.context_paths", self.context_paths)
+        for entry in self.context_paths:
+            # Word-split in the workflow's shell loop and spliced into a contents-API URL,
+            # so the shape is held tight: repository-relative, never climbing, no glob, no
+            # whitespace, no query.
+            if (
+                entry.startswith(("/", "~"))
+                or ".." in Path(entry).parts
+                or any(char.isspace() or char in "*?[]#&=" for char in entry)
+            ):
+                raise ValueError(
+                    "pr_automation.fallback.context_paths entries must be plain"
+                    f" repository-relative paths: {entry!r}"
+                )
         if not self.enabled:
             return
         for name, value in (
@@ -500,6 +575,10 @@ class PrAutomationFallbackConfig:
                 raise ValueError(f"pr_automation.fallback.{name} must not be empty")
         if self.max_diff_chars < 1000:
             raise ValueError("pr_automation.fallback.max_diff_chars must be at least 1000")
+        if type(self.max_document_chars) is not int or self.max_document_chars < 1000:
+            raise ValueError(
+                "pr_automation.fallback.max_document_chars must be a whole number, at least 1000"
+            )
         if not 30 <= self.timeout_seconds <= 3600:
             raise ValueError("pr_automation.fallback.timeout_seconds must be between 30 and 3600")
         if not self.heartbeat_ref.startswith("refs/"):
@@ -509,10 +588,348 @@ class PrAutomationFallbackConfig:
                 "pr_automation.fallback.heartbeat_ref must not be a branch — a heartbeat"
                 " under refs/heads/ becomes a branch every tidy pass has to reason about"
             )
+        if self.heartbeat_ref.startswith("refs/tags/"):
+            raise ValueError(
+                "pr_automation.fallback.heartbeat_ref must not be a tag — every clone fetches"
+                " tags, a release is cut from them, and the pre-push gate judges every tag in"
+                " full, so a heartbeat there could never be published through it"
+            )
         if not 1 <= self.heartbeat_max_age_minutes <= 1440:
             raise ValueError(
                 "pr_automation.fallback.heartbeat_max_age_minutes must be between 1 and 1440"
             )
+        if not 4096 <= self.context_window <= 1_048_576:
+            raise ValueError(
+                "pr_automation.fallback.context_window must be between 4096 and 1048576"
+            )
+        if not 1024 <= self.reasoning_reserve_tokens < self.context_window // 2:
+            raise ValueError(
+                "pr_automation.fallback.reasoning_reserve_tokens must be at least 1024 and"
+                " under half of context_window, so a prompt still fits beside it"
+            )
+        # A whole number from 1 to 8 (`vibey_gh.fit.MAX_CHARS_PER_TOKEN`, kept equal by a
+        # test). `type(...) is int`: TOML hands a float or a bool through unchanged, and a
+        # nan compares false against both bounds.
+        if type(self.chars_per_token) is not int or not 1 <= self.chars_per_token <= 8:
+            raise ValueError(
+                "pr_automation.fallback.chars_per_token must be a whole number from 1 to 8"
+            )
+        if self.think not in ("", "low", "medium", "high"):
+            raise ValueError(
+                f"pr_automation.fallback.think must be empty, low, medium or high: {self.think!r}"
+            )
+
+
+_RUNNER_SLUG_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+_RUNNER_PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]*$")
+_RUNNER_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+@dataclass(frozen=True)
+class RunnersConfig:
+    """The sovereign review runner this repository registers, declared (sub-doctrine 12.c).
+
+    `[pr_automation.fallback]` says a sovereign lane exists and which label it schedules
+    onto; this says how the machine that serves it is stood up -- which repository it
+    registers with, what its LaunchAgent is called, where its supervisor lives, and which
+    credential it may use. `vibey-gh runner install` renders all of it from here, so the
+    runner can be restored from a clone rather than from one operator's home directory.
+    The label is `[pr_automation.fallback] runner_label` and is never declared twice (10.e).
+    """
+
+    # owner/name the runner registers with. Empty derives it from `[platform] repository`,
+    # so a repository that already names itself there says nothing twice.
+    repository: str = ""
+    # The launchd Label is `<unit_prefix>-<repository name>`. A prefix rather than a whole
+    # label so `runner cleanup` can find every agent this family ever installed, including
+    # ones for repositories the tree no longer declares.
+    unit_prefix: str = "org.vibey.runner"
+    # Where the supervisor, its Dockerfile and entrypoint are installed on the host.
+    install_dir: str = "~/.local/share/vibey-runner"
+    launch_agents_dir: str = "~/Library/LaunchAgents"
+    log_dir: str = "~/Library/Logs"
+    # The runner's OWN gh configuration: a file-based login made with
+    # `gh auth login --insecure-storage`, separate from the operator's keyring login,
+    # holding a fine-grained token scoped to this one repository.
+    gh_config_dir: str = "~/.config/gh-runner"
+    image: str = "vibey-runner:latest"
+    # The actions/runner release the image is built from; the Dockerfile has no default.
+    runner_version: str = "2.337.0"
+    # The model endpoint as the CONTAINER sees it. The host side is
+    # `[pr_automation.fallback] base_url`; only the name of the host differs.
+    container_model_url: str = "http://host.docker.internal:11434"
+    # Refuse to hold a laptop awake on battery just to idle-poll for a job.
+    require_ac: bool = True
+    # launchd's ThrottleInterval: every refusal resolves on a human timescale.
+    throttle_seconds: int = 120
+    # Consecutive runner failures before the supervisor stops rather than spins.
+    max_failures: int = 5
+    # launchd starts a job with a near-empty PATH; docker and gh must be reachable from it.
+    # The heartbeat timer runs with the same PATH, and git must be reachable from it too.
+    path: str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+    # The heartbeat timer (`vibey-gh heartbeat install`, ADR-0060). Which service manager
+    # runs it: "launchd", "systemd", or empty to pick by platform (macOS launchd, Linux
+    # systemd).
+    heartbeat_scheduler: str = ""
+    # Minutes between beats. 0 takes half of `[pr_automation.fallback]
+    # heartbeat_max_age_minutes`; anything over half is refused at install, so one missed
+    # beat never stales the lane.
+    heartbeat_interval_minutes: int = 0
+    # The interpreter the timer runs `python -m vibey_gh.cli` with, and the one the clone's
+    # pre-push hook asks for its scope decision. The default is where `uv tool install vibey-engine`
+    # puts it on macOS and Linux alike; empty is the one running the install. Either way it,
+    # and the vibey_gh it imports, must live outside any temporary directory and any git work
+    # tree -- which is why `uv run` inside a checkout cannot be it.
+    heartbeat_python: str = "~/.local/share/uv/tools/vibey-engine/bin/python"
+    # Where the timer logs and records each beat. Empty is `log_dir` under launchd and
+    # `~/.local/state/vibey-gh` under systemd.
+    heartbeat_log_dir: str = ""
+    # The repository the heartbeat timer owns and pushes from: a clone with no working tree,
+    # the repository's remote, the runner's own credential and a pre-push gate rendered by
+    # the timer's own vibey-gh. Empty is `<install_dir>/heartbeat-<repository name>`, durable
+    # beside the runner's files. Refused under a temporary directory or inside a checkout.
+    heartbeat_clone_dir: str = ""
+    # Where the systemd user units are written.
+    systemd_user_dir: str = "~/.config/systemd/user"
+
+    def __post_init__(self) -> None:
+        if self.repository and not _RUNNER_SLUG_RE.fullmatch(self.repository):
+            raise ValueError(f"runners.repository must be owner/name: {self.repository!r}")
+        if not _RUNNER_PREFIX_RE.fullmatch(self.unit_prefix):
+            raise ValueError(
+                "runners.unit_prefix must be letters, digits, dots and dashes:"
+                f" {self.unit_prefix!r}"
+            )
+        for name in (
+            "install_dir",
+            "launch_agents_dir",
+            "log_dir",
+            "gh_config_dir",
+            "systemd_user_dir",
+        ):
+            value = getattr(self, name)
+            if not value.startswith(("/", "~/")):
+                raise ValueError(f"runners.{name} must be absolute or start with ~/: {value!r}")
+        for name in ("heartbeat_python", "heartbeat_log_dir", "heartbeat_clone_dir"):
+            value = getattr(self, name)
+            if value and not value.startswith(("/", "~/")):
+                raise ValueError(
+                    f"runners.{name} must be empty, absolute, or start with ~/: {value!r}"
+                )
+        if self.heartbeat_scheduler not in ("", "launchd", "systemd"):
+            raise ValueError(
+                "runners.heartbeat_scheduler must be empty, launchd or systemd:"
+                f" {self.heartbeat_scheduler!r}"
+            )
+        # `type(...) is int`: TOML hands a float or a bool through unchanged.
+        if (
+            type(self.heartbeat_interval_minutes) is not int
+            or not 0 <= self.heartbeat_interval_minutes <= 720
+        ):
+            raise ValueError("runners.heartbeat_interval_minutes must be a whole number 0-720")
+        if self.shares_operator_gh_dir(Path(os.path.expanduser("~")), os.environ):
+            raise ValueError(
+                f"runners.gh_config_dir {self.gh_config_dir!r} must be a directory of its own,"
+                " not gh's default (whose login the macOS keyring holds, where launchd cannot"
+                " read it)"
+            )
+        for name in ("image", "path"):
+            if not getattr(self, name).strip():
+                raise ValueError(f"runners.{name} must not be empty")
+        if not _RUNNER_VERSION_RE.fullmatch(self.runner_version):
+            raise ValueError(f"runners.runner_version must be X.Y.Z: {self.runner_version!r}")
+        if not self.container_model_url.startswith(("http://", "https://")):
+            url = self.container_model_url
+            raise ValueError(f"runners.container_model_url must be an http(s) URL: {url!r}")
+        if not 10 <= self.throttle_seconds <= 3600:
+            raise ValueError("runners.throttle_seconds must be between 10 and 3600")
+        if not 1 <= self.max_failures <= 100:
+            raise ValueError("runners.max_failures must be between 1 and 100")
+
+    def resolved_gh_config_dir(self, home: Path) -> Path:
+        """`gh_config_dir` against `home`, with `..` and every symlink resolved."""
+        declared = self.gh_config_dir
+        path = home / declared[2:] if declared.startswith("~/") else Path(declared)
+        return Path(os.path.realpath(path))
+
+    def shares_operator_gh_dir(self, home: Path, environ: Mapping[str, str]) -> bool:
+        """Whether `gh_config_dir` IS gh's own default directory, however it is spelled.
+
+        gh's default is `$XDG_CONFIG_HOME/gh` when that is set, else `~/.config/gh`. Both are
+        refused, since an operator with XDG set may still keep a login in the other. The
+        comparison is between resolved paths, so an absolute spelling, a `..` or a symlink
+        cannot route the runner onto the operator's keyring-backed login.
+        """
+        defaults = [home / ".config" / "gh"]
+        if environ.get("XDG_CONFIG_HOME"):
+            defaults.append(Path(environ["XDG_CONFIG_HOME"]) / "gh")
+        mine = self.resolved_gh_config_dir(home)
+        return any(Path(os.path.realpath(default)) == mine for default in defaults)
+
+    def registration(self, platform: PlatformConfig) -> tuple[str, str, str]:
+        """`(owner/name, registration URL, problem)`; the problem is empty when resolvable."""
+        if platform.kind != ForgeKind.GITHUB.value:
+            kind = platform.kind
+            return (
+                "",
+                "",
+                f"the sovereign runner is a GitHub Actions runner; [platform] kind is {kind}",
+            )
+        slug = self.repository or platform.repository
+        if not slug:
+            return (
+                "",
+                "",
+                "runners.repository is empty and [platform] names no repository to derive it from",
+            )
+        return slug, f"https://{platform.host or 'github.com'}/{slug}", ""
+
+
+DEFAULT_APPROVAL_FORBIDDEN: tuple[str, ...] = (
+    "src/vibey_tools/gh/docs/**",
+    ".vibey-gh.toml",
+    ".claude/settings.json",
+    ".github/**",
+    "CODEOWNERS",
+)
+# The one entry an `unattended_approval.authors` list may carry instead of naming every
+# maintainer a second time. It expands from `.github/CODEOWNERS`, which already records who
+# may approve a change to an owned path, so the two lists cannot drift apart by one of them
+# being edited alone and nobody noticing.
+CODEOWNERS_SENTINEL = "@codeowners"
+
+
+@dataclass(frozen=True)
+class UnattendedApprovalConfig:
+    """The operator's grant to a delegated approver (sub-doctrine 12.f, ADR-0049).
+
+    12.f puts the judgement here rather than in the approver: an operator fixes what may be
+    approved and what never may, once, and the approver applies a standard it did not choose
+    and cannot alter. This dataclass is that standard as the repository declares it -- the
+    DECLARED half of the grant (12.c). The live half is the repository variable
+    `switch_variable` names (`VIBEY_UNATTENDED_APPROVAL` by default), whose value is
+    deliberately not here: withdrawal must need no merge. `vibey-gh approve-check`
+    (`vibey_gh.approval_check`) is what reads both halves.
+
+    Defaults refuse. `enabled` is False and `branches` and `authors` are empty, so a
+    repository that has merely upgraded vibey-gh has granted nothing -- absence of a grant is
+    refusal, never permission, and a default that approved anything would make the upgrade
+    itself a grant.
+    """
+
+    enabled: bool = False
+    # Branch globs a delegated approver may act on. Empty means none, which is why
+    # `enabled = true` with no branches is rejected below rather than silently doing nothing.
+    branches: tuple[str, ...] = ()
+    # Forge logins whose pull requests a delegated approver may act on. `branches` bounds
+    # WHERE a change may land; this bounds WHOSE change may be approved there, and the two
+    # are not the same bound -- a lane glob says nothing about who pushed to it. An entry may
+    # be `CODEOWNERS_SENTINEL`, expanded by `expand_authors` below. Empty means nobody, which
+    # is why `enabled = true` with no authors is rejected rather than quietly meaning anyone.
+    authors: tuple[str, ...] = ()
+    # Paths that no delegated approval may ever touch. A change touching one is refused
+    # WHOLE: an approver does not approve the safe subset of a pull request.
+    forbidden_paths: tuple[str, ...] = DEFAULT_APPROVAL_FORBIDDEN
+    # A delegated approval is added to the deterministic gates and never substituted for one.
+    # Configurable because an adopter may gate differently, but off is a decision to state,
+    # not a default to inherit.
+    require_all_gates: bool = True
+    # The LIVE half of the grant: the repository variable `vibey-gh approve-check` reads on
+    # every check, and the exact value it must hold. The variable's VALUE is deliberately not
+    # a key -- withdrawal must need no merge -- but which variable, and what "on" is spelled
+    # as, are facts about the repository and are declared here rather than compiled in
+    # (12.h). Anything but exactly `switch_value`, including a variable nobody can read, is
+    # refusal.
+    switch_variable: str = "VIBEY_UNATTENDED_APPROVAL"
+    switch_value: str = "on"
+
+    def __post_init__(self) -> None:
+        # The switch is validated whether or not the grant is on: a switch that could never
+        # be set is wrong the day somebody turns the grant on, and that is the worst day to
+        # find out. Everything below the early return binds only an enabled grant.
+        if not SECRET_NAME_PATTERN.fullmatch(self.switch_variable):
+            raise ValueError(
+                "unattended_approval.switch_variable must be a repository variable name "
+                "(letters, digits and underscores, not starting with a digit) -- a switch "
+                "nobody can set is a grant nobody can withdraw"
+            )
+        if not self.switch_value or self.switch_value != self.switch_value.strip():
+            raise ValueError(
+                "unattended_approval.switch_value must be non-empty with no surrounding "
+                "whitespace -- it is compared exactly, and whitespace nobody can see is a "
+                "value nobody can match"
+            )
+        if not self.enabled:
+            return
+        _unique_nonempty("unattended_approval.branches", self.branches)
+        _unique_nonempty("unattended_approval.authors", self.authors)
+        _unique_nonempty("unattended_approval.forbidden_paths", self.forbidden_paths)
+        if not self.branches:
+            raise ValueError(
+                "unattended_approval.branches must not be empty when enabled -- "
+                "an approver with no branch to act on is a grant that says nothing"
+            )
+        if not self.authors:
+            raise ValueError(
+                "unattended_approval.authors must not be empty when enabled -- "
+                "a grant that names nobody authorises nobody, and the absence of a grant "
+                "is refusal and never permission (12.f)"
+            )
+        if not self.forbidden_paths:
+            raise ValueError(
+                "unattended_approval.forbidden_paths must not be empty when enabled -- "
+                "it is the bound, and a grant with no bound is not a grant"
+            )
+        if ".vibey-gh.toml" not in self.forbidden_paths:
+            raise ValueError(
+                "unattended_approval.forbidden_paths must contain '.vibey-gh.toml' -- "
+                "12.f: an approver may never approve a change to its own grant"
+            )
+
+
+def expand_authors(authors: tuple[str, ...], root: Path) -> tuple[str, ...]:
+    """Resolve `@codeowners` in an author allowlist to the logins CODEOWNERS names.
+
+    A tuple without the sentinel comes back unchanged, so a repository that spells its
+    maintainers out pays nothing for this. Where the sentinel is present, it is replaced in
+    place by every distinct owner `.github/CODEOWNERS` names, order preserved and duplicates
+    dropped -- so a list that both spells a login out and inherits it through the sentinel
+    yields that login once, where it first appeared.
+
+    The leading `@` is stripped from each owner because CODEOWNERS writes a login the way a
+    mention does and a forge reports an author the way an account is named:
+    `adammatthewsteinberger`, never `@adammatthewsteinberger`. Comparing the two spellings
+    would match nobody while looking like a populated allowlist.
+
+    This is a module-level function rather than a method because it reads the filesystem and
+    `UnattendedApprovalConfig` is the declared grant -- a frozen value that validates itself
+    and touches no disk. Expansion is a separate act, performed where a root is in hand.
+    """
+    if CODEOWNERS_SENTINEL not in authors:
+        return authors
+    # A repository with no CODEOWNERS expands the sentinel to NOTHING rather than raising.
+    # That is defensible only because it fails CLOSED, and so does the neighbouring case of a
+    # CODEOWNERS that names nobody: both leave the allowlist empty, and an empty allowlist
+    # authorises nobody -- never everybody. `__post_init__` refuses an enabled grant with no
+    # authors, so a silent expansion to nothing can never become a silent widening.
+    codeowners = root / ".github" / "CODEOWNERS"
+    owners: list[str] = []
+    if codeowners.is_file():
+        for line in codeowners.read_text(encoding="utf-8").splitlines():
+            # An owner is a whitespace-delimited token beginning with `@`. Matching the token
+            # rather than the `@` itself is what keeps the domain of an email owner -- which
+            # CODEOWNERS also permits -- out of a list that is compared against forge logins.
+            owners.extend(
+                token[1:]
+                for token in line.partition("#")[0].split()
+                if token.startswith("@") and len(token) > 1
+            )
+    expanded: list[str] = []
+    for entry in authors:
+        for login in owners if entry == CODEOWNERS_SENTINEL else [entry]:
+            if login not in expanded:
+                expanded.append(login)
+    return tuple(expanded)
 
 
 @dataclass(frozen=True)
@@ -546,10 +963,42 @@ class PrAutomationConfig:
     # missing one. Set it false where the author should pick the type themselves; the
     # check still runs and still fails, just without rewriting anybody's history.
     normalise_commit_subjects: bool = True
+    # The declaration sub-doctrine 8.b asks for before a paid counterparty is reached: may
+    # the exact-head review call the paid model (`anthropics/claude-code-action`, holding
+    # `[ai] auth_secret`)? FALSE by default, because 8.b makes paid declared-only --
+    # undeclared means sovereign only. False, the sovereign lane answers the WHOLE review
+    # (both halves of `vibey_gh.review_contract`) for a trusted author whose head is in
+    # this repository, the paid `review` job never runs, and every other pull request --
+    # an outside author, a fork, or one arriving while the sovereign runner is down -- is
+    # told plainly that it needs a human review. True keeps the two-lane review exactly as
+    # it was: the sovereign lane carries the diff half for a trusted author and the paid
+    # reviewer the rest, or the whole review for anyone else.
+    #
+    # One key per paid use, like `review_untrusted_authors` / `repair_untrusted_authors`
+    # beside it: whether the review may be paid is a different question from whether an
+    # agent may edit the branch, and a repository may well answer them differently.
+    paid_review: bool = False
+    # May the repair job hand failing scans (or the paid review's findings) to the paid
+    # model to edit the branch? False by default (8.b). Undeclared, the job is never
+    # scheduled and the gate says a human is needed for the failing scans.
+    paid_repair: bool = False
+    # May the conflict-resolution job hand a merge conflict to the paid model? False by
+    # default (8.b). Undeclared, the job is never scheduled and the run says a human is
+    # needed to resolve the conflict.
+    paid_conflict_resolution: bool = False
     observability: PrAutomationObservabilityConfig = PrAutomationObservabilityConfig()
     fallback: PrAutomationFallbackConfig = PrAutomationFallbackConfig()
 
     def __post_init__(self) -> None:
+        for key in ("paid_review", "paid_repair", "paid_conflict_resolution"):
+            value = getattr(self, key)
+            if not isinstance(value, bool):
+                # A declaration is a human writing `true`. A string or a number read as
+                # truthy would reach for a paid counterparty on a typo. ValueError, like
+                # every other refusal of a configuration value here: callers handle one.
+                raise ValueError(  # noqa: TRY004
+                    f"pr_automation.{key} must be true or false, not {value!r}"
+                )
         _unique_nonempty("pr_automation.scan_workflows", self.scan_workflows)
         _unique_nonempty("pr_automation.ignored_checks", self.ignored_checks)
         _unique_nonempty("pr_automation.plugin_marketplaces", self.plugin_marketplaces)
@@ -584,13 +1033,6 @@ class PrAutomationConfig:
             raise ValueError("pr_automation.max_repair_attempts must be between 1 and 10")
         if not self.model.strip():
             raise ValueError("pr_automation.model must not be empty")
-
-
-def _unique_nonempty(name: str, values: tuple[str, ...]) -> None:
-    if any(not value.strip() for value in values):
-        raise ValueError(f"{name} entries must be non-empty")
-    if len(set(values)) != len(values):
-        raise ValueError(f"{name} entries must be unique")
 
 
 def _merge_queue(section: dict, default_merge_method: str) -> MergeQueueConfig:
@@ -775,6 +1217,63 @@ class BranchSyncConfig:
             raise ValueError("branch_sync.max_self_heals must be between 0 and 10")
 
 
+_WALL_CLOCK = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
+_IANA_ZONE = re.compile(r"[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*")
+
+
+@dataclass(frozen=True)
+class SabbathConfig:
+    """Sub-doctrine 8.i, fitted to the machine it runs on (vibey ADR-0070).
+
+    The window is sundown Friday to sundown Saturday wherever this host stands; see
+    `vibey_gh.sabbath` for the formula and `vibey_gh.sabbath_location` for how the host is
+    found. Nothing here names a place: coordinates are per host and never committed, so
+    they live in `local_config` (a TOML file with `latitude` and `longitude`) or the
+    `VIBEY_SABBATH_LATITUDE`/`VIBEY_SABBATH_LONGITUDE` environment.
+
+    `enabled` defaults to true: 8.i has no exception, and turning it off is a declared
+    act, never a missing key. An unresolvable host is not "not the Sabbath": the window
+    falls back to `fallback_opens`/`fallback_closes` in the host's zone, and says so.
+    """
+
+    enabled: bool = True
+    # The IANA zone the civil day is read in; empty reads the host's own zone.
+    timezone: str = ""
+    local_config: str = "~/.config/vibey/sabbath.toml"
+    # An explicit override for a caller holding a LOCAL, never-committed file -- the
+    # operator's own vibey.toml. A committed file names no place.
+    latitude: float | None = None
+    longitude: float | None = None
+    # Widens every window toward rest, both edges. Never narrows one.
+    offset_minutes: int = 0
+    # Extra widening when the location is only a time zone's reference city.
+    coarse_margin_minutes: int = 90
+    fallback_opens: str = "14:00"
+    fallback_closes: str = "23:00"
+    # Ask CoreLocation (macOS) or GeoClue (Linux) when their helpers are installed.
+    location_service: bool = True
+    # At the first beat after the window closes, re-fire the held merge train and promotion.
+    resume_dispatch: bool = True
+    # Where lanes register "paused for the Sabbath, resume with X" (one JSON file each).
+    lanes_dir: str = "~/.local/state/vibey/sabbath-lanes"
+
+    def __post_init__(self) -> None:
+        for key in ("fallback_opens", "fallback_closes"):
+            if _WALL_CLOCK.fullmatch(getattr(self, key)) is None:
+                raise ValueError(f"sabbath.{key} must be a 24-hour HH:MM wall clock")
+        for key in ("offset_minutes", "coarse_margin_minutes"):
+            if not 0 <= getattr(self, key) <= 240:
+                raise ValueError(f"sabbath.{key} must be between 0 and 240")
+        if self.timezone and _IANA_ZONE.fullmatch(self.timezone) is None:
+            raise ValueError("sabbath.timezone must be an IANA zone name such as Europe/London")
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("sabbath.latitude and sabbath.longitude are set together")
+        if self.latitude is not None and not -90 <= self.latitude <= 90:
+            raise ValueError("sabbath.latitude must be between -90 and 90")
+        if self.longitude is not None and not -180 <= self.longitude <= 180:
+            raise ValueError("sabbath.longitude must be between -180 and 180")
+
+
 @dataclass(frozen=True)
 class RealignConfig:
     """What happens to open topic branches when realign rewrites the integration branch.
@@ -825,6 +1324,230 @@ class GithubReleaseConfig:
             raise ValueError(
                 "github_release.tag_prefix must be non-empty and contain no whitespace"
             )
+
+
+# Discord's own ceiling on a message's `content`, and the reason `max_message_chars` may be
+# set lower but never higher: a longer body is refused by the API, not truncated.
+DISCORD_CONTENT_LIMIT = 2000
+
+# Which Conventional Commit types land in which named group, in the order the groups are
+# shown. A type named nowhere lands in `other_group`; a breaking change of ANY type lands in
+# `breaking_group`, which always leads.
+DEFAULT_ANNOUNCE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Added", ("feat",)),
+    ("Fixed", ("fix",)),
+)
+
+# The word a type prefix becomes on the announced line: `fix(paper): x` reads `Fix · paper: x`.
+DEFAULT_ANNOUNCE_TYPE_WORDS: tuple[tuple[str, str], ...] = (
+    ("feat", "Feature"),
+    ("fix", "Fix"),
+    ("docs", "Docs"),
+    ("perf", "Performance"),
+    ("refactor", "Refactor"),
+    ("test", "Tests"),
+    ("build", "Build"),
+    ("ci", "CI"),
+    ("chore", "Chore"),
+    ("style", "Style"),
+    ("revert", "Revert"),
+)
+
+# Subjects that are bookkeeping rather than change: hidden from the list, but COUNTED on the
+# line after it, so a reader can see that something was left out and how much.
+DEFAULT_ANNOUNCE_NOISE: tuple[str, ...] = (
+    r"^Merge (pull request|branch|remote-tracking branch) ",
+    r"^chore\(merge\)",
+    r"^chore\(release\)",
+    r"^chore\(heartbeat\)",
+    r"^chore: (resolve merge conflicts|sync with |merge )",
+)
+
+_ANNOUNCE_TYPE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+# The keys of `[announce]` that are plain scalars, read as given; the three structured ones
+# are frozen by `AnnounceConfig.from_table` itself.
+_ANNOUNCE_SCALARS = (
+    "enabled",
+    "webhook_secret",
+    "username",
+    "max_changes",
+    "max_subject_chars",
+    "max_message_chars",
+    "include_other",
+    "breaking_group",
+    "other_group",
+    "link_pull_requests",
+    "link_compare",
+    "link_surfaces",
+    "suppress_embeds",
+    "changelog_path",
+    "max_history_pages",
+    "max_history_candidates",
+)
+
+# Substrings Discord refuses in a webhook's username, which it answers with HTTP 400: the
+# announcement would fail on every deploy, so the value is refused here instead.
+_DISCORD_USERNAME_FORBIDDEN = ("discord", "clyde", "@", "#", ":", "```")
+_CHANGELOG_PATH = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+@dataclass(frozen=True)
+class AnnounceConfig:
+    """`[announce]`: the changelog `vibey-gh announce` posts after a docs deploy (12.e).
+
+    The webhook is a repository secret named by `webhook_secret`, never a value in this
+    file. Every key has a default that is a working announcement, so an adopter writes only
+    what differs (ADR-0018):
+
+    - `max_changes` (8): lines listed before `…and N more`. A breaking change is never
+      counted against it and never dropped: it is listed first, and only when breaking
+      changes alone overflow the message are the rest counted, by name, as breaking.
+    - `max_subject_chars` (100): a longer description is cut with an ellipsis.
+    - `max_message_chars` (2000): Discord's content limit, and the ceiling of this key.
+    - `include_other` (true): whether types in no named group are listed under
+      `other_group` or only counted.
+    - `groups`: `[announce.groups]` maps a group's label to its types, in display order.
+    - `type_words`: `[announce.type_words]` overrides the word a type prefix becomes.
+    - `noise_patterns`: regular expressions over the subject; a match is hidden and counted.
+    - `link_pull_requests`, `link_compare`, `link_surfaces`: which links the message carries.
+    - `suppress_embeds` (true): post with Discord's no-link-preview flag.
+    - `changelog_path` (CHANGELOG.md): a release announces this file's section for its
+      version, the release's own notes.
+    - `max_history_pages` (10): how many pages of 100 runs, and of 100 compared commits,
+      are read looking for the previous announcement and the commits since it; 10 is also
+      the most, because the Actions API serves a status-filtered run listing only to its
+      1000th result. Commits beyond are counted; a history with no accepted announcement
+      inside the window re-anchors, and says so (10.g).
+    - `max_history_candidates` (20): how many runs for the branch whose announcement was
+      NOT accepted are read (one jobs call each) before the history is called structural
+      and the announcement re-anchors, saying so, rather than paging on or staying unknown
+      on every run from then on.
+    """
+
+    enabled: bool = True
+    webhook_secret: str = "DISCORD_WEBHOOK_URL"
+    username: str = "vibey"
+    max_changes: int = 8
+    max_subject_chars: int = 100
+    max_message_chars: int = DISCORD_CONTENT_LIMIT
+    include_other: bool = True
+    breaking_group: str = "Breaking"
+    other_group: str = "Other"
+    groups: tuple[tuple[str, tuple[str, ...]], ...] = DEFAULT_ANNOUNCE_GROUPS
+    type_words: tuple[tuple[str, str], ...] = DEFAULT_ANNOUNCE_TYPE_WORDS
+    noise_patterns: tuple[str, ...] = DEFAULT_ANNOUNCE_NOISE
+    link_pull_requests: bool = True
+    link_compare: bool = True
+    link_surfaces: bool = True
+    suppress_embeds: bool = True
+    changelog_path: str = "CHANGELOG.md"
+    max_history_pages: int = 10
+    max_history_candidates: int = 20
+
+    def __post_init__(self) -> None:
+        for name in (
+            "enabled",
+            "include_other",
+            "link_pull_requests",
+            "link_compare",
+            "link_surfaces",
+            "suppress_embeds",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"announce.{name} must be true or false")
+        if (
+            not isinstance(self.webhook_secret, str)
+            or not SECRET_NAME_PATTERN.fullmatch(self.webhook_secret)
+            # GitHub reserves the prefix: no repository secret can be named GITHUB_*.
+            or self.webhook_secret.upper().startswith("GITHUB_")
+        ):
+            raise ValueError(
+                f"announce.webhook_secret is not a valid secret name: {self.webhook_secret!r}"
+            )
+        if not isinstance(self.username, str) or not self.username.strip():
+            raise ValueError("announce.username must be 1 to 80 characters")
+        if len(self.username) > 80:
+            raise ValueError("announce.username must be 1 to 80 characters")
+        lowered = self.username.lower()
+        if lowered.strip() in ("everyone", "here") or any(
+            word in lowered for word in _DISCORD_USERNAME_FORBIDDEN
+        ):
+            raise ValueError(
+                f"announce.username {self.username!r} is one Discord refuses: no"
+                f" {', '.join(_DISCORD_USERNAME_FORBIDDEN)}, 'everyone' or 'here'"
+            )
+        for name, low, high in (
+            ("max_changes", 1, 50),
+            ("max_subject_chars", 20, 400),
+            ("max_message_chars", 200, DISCORD_CONTENT_LIMIT),
+            ("max_history_pages", 1, 10),
+            ("max_history_candidates", 1, 100),
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"announce.{name} must be an integer from {low} to {high}")
+        labels = [self.breaking_group, self.other_group, *(label for label, _ in self.groups)]
+        if not all(isinstance(label, str) for label in labels):
+            raise TypeError("announce group labels, breaking_group and other_group are text")
+        if any(not label.strip() for label in labels) or len(set(labels)) != len(labels):
+            raise ValueError(
+                "announce group labels, breaking_group and other_group must be non-empty"
+                " and distinct"
+            )
+        seen: set[str] = set()
+        for label, types in self.groups:
+            if not types:
+                raise ValueError(f"announce.groups.{label} names no type")
+            for kind in types:
+                if not _ANNOUNCE_TYPE.fullmatch(kind):
+                    raise ValueError(f"announce.groups.{label}: {kind!r} is not a commit type")
+                if kind in seen:
+                    raise ValueError(f"announce.groups: {kind!r} is in more than one group")
+                seen.add(kind)
+        for kind, word in self.type_words:
+            if not _ANNOUNCE_TYPE.fullmatch(kind) or not word.strip():
+                raise ValueError(f"announce.type_words: {kind!r} = {word!r} is not usable")
+        for pattern in self.noise_patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"announce.noise_patterns: {pattern!r}: {exc}") from exc
+        path = PurePosixPath(self.changelog_path)
+        # It is also written, raw, into a link the message carries: nothing that could close
+        # the link's `(<…>)` or start another is allowed in it.
+        if (
+            not _CHANGELOG_PATH.fullmatch(self.changelog_path)
+            or path.is_absolute()
+            or ".." in path.parts
+        ):
+            raise ValueError(
+                "announce.changelog_path must be a repository-relative path of letters,"
+                " digits and . _ / -"
+            )
+
+    @classmethod
+    def from_table(cls, section: dict) -> AnnounceConfig:
+        """`[announce]` as TOML hands it over, with its structured keys frozen in order."""
+        groups = section.get("groups", {label: list(types) for label, types in cls.groups})
+        words = section.get("type_words", {})
+        noise = section.get("noise_patterns", list(cls.noise_patterns))
+        if not isinstance(groups, dict) or not all(isinstance(v, list) for v in groups.values()):
+            raise ValueError('announce.groups must be a table of label = ["type", ...]')
+        if not isinstance(words, dict) or not all(isinstance(v, str) for v in words.values()):
+            raise ValueError('announce.type_words must be a table of type = "Word"')
+        if not isinstance(noise, list) or not all(isinstance(v, str) for v in noise):
+            raise ValueError("announce.noise_patterns must be a list of strings")
+        # An override replaces one word and keeps the rest, so naming `docs = "Guide"` does
+        # not silently turn every other type back into its bare prefix.
+        merged = dict(cls.type_words) | words
+        scalars = {name: section[name] for name in _ANNOUNCE_SCALARS if name in section}
+        return cls(
+            **scalars,
+            groups=tuple((str(label), tuple(types)) for label, types in groups.items()),
+            type_words=tuple(merged.items()),
+            noise_patterns=tuple(noise),
+        )
 
 
 @dataclass(frozen=True)
@@ -1076,6 +1799,10 @@ class DocumentationConfig:
     bottom_nav: bool = True
     author_name: str = "Adam Matthew Steinberger"
     author_url: str = "https://vibewithadam.matthewsteinberger.com"
+    # The paper's corresponding-author details. Both are stated in the rendered paper's
+    # byline and provenance note when set, and omitted when empty; neither is invented.
+    author_email: str = ""
+    author_affiliation: str = ""
     # Everything below describes what a repository requires of ITS OWN documentation.
     # A project that installs vibey-gh documents its product, not this tool, so each of
     # these is empty until the repository declares it.
@@ -1088,6 +1815,12 @@ class DocumentationConfig:
     require_provenance: bool = False
     provenance_files: tuple[str, ...] = ("README.md", "docs/index.md")
     google_analytics_id: str = ""
+    # Cookie consent for the analytics snippet. When set and a GA4 measurement ID is
+    # configured, every published page and the channel-picker index deny analytics
+    # storage by default (Google Consent Mode v2) and show an accept/decline banner
+    # whose choice is remembered per browser. Off renders the plain gtag snippet,
+    # and with no measurement ID nothing renders either way.
+    cookie_consent: bool = True
     # --- Search & LLM optimisation for the published site. Every field is optional and
     # generic; the defaults derive from the repository so an unconfigured site still ships
     # complete metadata. ---
@@ -1108,6 +1841,12 @@ class DocumentationConfig:
     # index, which is what makes it survive redeploys; an uploaded verification FILE is
     # wiped every time release-surfaces rebuilds the Pages root.
     google_site_verification: str = ""
+    # Repository-relative files copied by basename into the Pages root on every
+    # release-surfaces deploy — the declared answer to Search Console's "HTML file"
+    # verification, which a hand-uploaded file cannot give because the rebuild wipes
+    # the Pages root. Empty copies nothing. A declared file that is missing from the
+    # checkout fails the deploy rather than publishing without it.
+    site_root_files: tuple[str, ...] = ()
     # What the published-site build installs. ProperDocs renders whatever the repository's
     # `properdocs.yml` declares, and a site that declares plugins or markdown extensions
     # cannot build without them — `properdocs` and its theme pull in none of that, so a
@@ -1230,11 +1969,20 @@ class DocumentationConfig:
             ("twitter_site", self.twitter_site),
             ("twitter_creator", self.twitter_creator),
             ("author", self.author),
+            ("author_affiliation", self.author_affiliation),
             ("theme_color", self.theme_color),
             ("locale", self.locale),
         ):
             if any(ch in value for ch in '<>"\n'):
                 raise ValueError(f"documentation.{name} must not contain HTML or quotes")
+        # The address lands in a byline and a shell command line: one mailbox, one host,
+        # nothing that could close a quote or start a second argument.
+        if self.author_email and not re.match(
+            r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$", self.author_email
+        ):
+            raise ValueError(
+                f"documentation.author_email must be empty or a plain address: {self.author_email!r}"
+            )
         for word in self.keywords:
             if any(ch in word for ch in '<>"\n,'):
                 raise ValueError("documentation.keywords entries must be plain words")
@@ -1246,6 +1994,23 @@ class DocumentationConfig:
             raise ValueError(
                 "documentation.google_site_verification must be the bare token from the "
                 "HTML-tag method (the content= value), not the whole tag"
+            )
+        _unique_nonempty("documentation.site_root_files", self.site_root_files)
+        for entry in self.site_root_files:
+            if (
+                entry.startswith(("/", "~"))
+                or ".." in PurePosixPath(entry).parts
+                or any(char.isspace() or char in "'\"$`\\" for char in entry)
+            ):
+                raise ValueError(
+                    "documentation.site_root_files entries must be repository-relative paths"
+                    f" without '..', whitespace or shell metacharacters: {entry!r}"
+                )
+        basenames = [PurePosixPath(entry).name for entry in self.site_root_files]
+        if len(set(basenames)) != len(basenames):
+            raise ValueError(
+                "documentation.site_root_files entries must have unique file names:"
+                " each is copied by basename into the Pages root"
             )
         if self.google_analytics_id and not GOOGLE_ANALYTICS_ID_PATTERN.match(
             self.google_analytics_id
@@ -1448,6 +2213,81 @@ class EstimateConfig:
 
 
 @dataclass(frozen=True)
+class LocalModelsConfig:
+    """`[local_models]`: how many runs of one local model run at once on a device (8.c, 8.j).
+
+    `concurrent_runs` is the declaration (12.c), and it is checked against the device's own
+    evidence by `vibey_gh.slots.SlotGate` rather than trusted:
+
+    - `1` (the default) is 8.c as written -- one run at a time -- and needs no evidence.
+    - `"measured"` takes whatever the calibration recorded for THIS device supports. No
+      evidence, or evidence for a device this no longer is (another model digest, runner
+      version, memory, accelerator or context window), means one, said out loud, with a
+      calibration requested.
+    - A number above one is refused -- one runs instead -- unless this device's evidence
+      measured that number inside every bound below and faster than one.
+
+    The bounds are declared here, not recorded with the evidence, so tightening one takes
+    effect on the next decision without recalibrating: the gate re-judges the stored
+    measurements against what this file says now.
+
+    - `model` (empty): the model calibrated and gated. Empty means `[pr_automation.fallback]
+      model`, the model the local lane runs.
+    - `context_window` (65536): the context every slot is calibrated at -- the window the
+      loop declares, so every recorded turn fits one slot.
+    - `evidence_dir` (empty): where evidence lives. Empty means `$VIBEY_GH_SLOTS_DIR`, else
+      `~/.local/state/vibey-gh/slots` -- on the device the evidence describes.
+    - `max_runs` (8): the sweep's upper limit; it normally stops earlier, at a broken bound
+      or a plateau.
+    - `calibration_port` (11435): where the calibration runner listens, beside production.
+    - `ollama_binary` (empty): the runner binary; empty means `ollama` on `PATH`, else the
+      macOS app's bundled one.
+    - `lock` (empty): a `mkdir` lock held for the whole calibration, shared with anything
+      else that must not use the model at the same time. Empty takes no lock.
+    """
+
+    concurrent_runs: int | str = 1
+    model: str = ""
+    context_window: int = 65536
+    evidence_dir: str = ""
+    max_runs: int = 8
+    calibration_port: int = 11435
+    ollama_binary: str = ""
+    lock: str = ""
+    wired_ceiling_fraction: float = 0.80
+    swap_growth_factor: float = 2.0
+    swap_floor_mb_per_minute: float = 64.0
+    fidelity_tolerance: float = 0.05
+    min_throughput_gain: float = 0.10
+    max_evidence_age_days: float = 30.0
+
+    def __post_init__(self) -> None:
+        runs = self.concurrent_runs
+        if runs != "measured" and not (type(runs) is int and runs >= 1):
+            raise ValueError(
+                'local_models.concurrent_runs must be a whole number of at least 1, or "measured"'
+            )
+        if self.context_window < 1 or self.max_runs < 1:
+            raise ValueError("local_models.context_window and max_runs must be at least 1")
+        if not 0 < self.wired_ceiling_fraction <= 1:
+            raise ValueError("local_models.wired_ceiling_fraction must be above 0 and at most 1")
+        for name in (
+            "swap_growth_factor",
+            "swap_floor_mb_per_minute",
+            "fidelity_tolerance",
+            "min_throughput_gain",
+            "max_evidence_age_days",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"local_models.{name} must not be negative")
+
+    @classmethod
+    def from_table(cls, section: dict) -> LocalModelsConfig:
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{key: value for key, value in section.items() if key in known})
+
+
+@dataclass(frozen=True)
 class GhConfig:
     root: Path
     text: str = DEFAULT_TEXT
@@ -1475,11 +2315,14 @@ class GhConfig:
     protected_paths: tuple[str, ...] = ()
     ai: AiConfig = AiConfig()
     pr_automation: PrAutomationConfig = PrAutomationConfig()
+    unattended_approval: UnattendedApprovalConfig = UnattendedApprovalConfig()
     issue_automation: IssueAutomationConfig = IssueAutomationConfig()
     realign: RealignConfig = RealignConfig()
     branch_sync: BranchSyncConfig = BranchSyncConfig()
+    sabbath: SabbathConfig = SabbathConfig()
     conversation: ConversationConfig = ConversationConfig()
     github_release: GithubReleaseConfig = GithubReleaseConfig()
+    announce: AnnounceConfig = AnnounceConfig()
     yank: YankConfig = YankConfig()
     social_signals: SocialSignalsConfig = SocialSignalsConfig()
     tidy: TidyConfig = TidyConfig()
@@ -1490,6 +2333,8 @@ class GhConfig:
     documentation: DocumentationConfig = DocumentationConfig()
     marketplace: MarketplaceConfig = MarketplaceConfig()
     estimate: EstimateConfig = EstimateConfig()
+    local_models: LocalModelsConfig = LocalModelsConfig()
+    runners: RunnersConfig = RunnersConfig()
     # Which bundled workflow templates this repository wants installed and kept current.
     # None means all of them, which is the right default for a repository adopting the
     # whole thing. A repository with its own richer workflows sets `workflows = []` and
@@ -1508,7 +2353,7 @@ class GhConfig:
     # that `installed()` then reports as drift. One key, because the workflow fallback and
     # the pre-push hook's recovery advice must never name different packages -- they did,
     # and the hook kept telling people to install a distribution that no longer existed.
-    fallback_package: str = "vibey"
+    fallback_package: str = "vibey-engine"
     # Pin every rendered `pip install <fallback_package>` to the exact version that
     # rendered it. False keeps the historical floating install, so upgrading this
     # package changes nothing in an adopting repository until this is turned on.
@@ -1668,6 +2513,21 @@ def _workflow_names(raw: dict) -> WorkflowNamesConfig:
     )
 
 
+def _runners(table: dict) -> RunnersConfig:
+    """`[runners]`, every key defaulting to the dataclass's own value.
+
+    A module function rather than a method: it is the loader's parsing step for one table,
+    the same shape as `_workflow_names` and `_social_signals` beside it.
+    """
+    defaults = RunnersConfig()
+    return RunnersConfig(
+        **{
+            field.name: table.get(field.name, getattr(defaults, field.name))
+            for field in dataclasses.fields(RunnersConfig)
+        }
+    )
+
+
 def load_config(root: Path | None = None, config: Path | None = None) -> GhConfig:
     """This repository's configuration, or an alternate one describing a second
     distribution that the same repository publishes.
@@ -1698,11 +2558,13 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
     protected = tr.get("protected_paths", ())
     inst = data.get("install", {})
     auto = data.get("pr_automation", {})
+    approval = data.get("unattended_approval", {})
     observability = auto.get("observability", {})
     fallback = auto.get("fallback", {})
     issues = data.get("issue_automation", {})
     realigning = data.get("realign", {})
     syncing = data.get("branch_sync", {})
+    resting = data.get("sabbath", {})
     talking = data.get("conversation", {})
     release = data.get("github_release", {})
     yanking = data.get("yank", {})
@@ -1722,6 +2584,9 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
         replace_fork_prs=auto.get("replace_fork_prs", True),
         retain_schedule_backstop=auto.get("retain_schedule_backstop", True),
         normalise_commit_subjects=auto.get("normalise_commit_subjects", True),
+        paid_review=auto.get("paid_review", False),
+        paid_repair=auto.get("paid_repair", False),
+        paid_conflict_resolution=auto.get("paid_conflict_resolution", False),
         plugin_marketplaces=tuple(auto.get("plugin_marketplaces", ())),
         plugins=tuple(auto.get("plugins", ())),
         observability=PrAutomationObservabilityConfig(
@@ -1732,13 +2597,19 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
         fallback=PrAutomationFallbackConfig(
             enabled=fallback.get("enabled", True),
             runner_label=fallback.get("runner_label", "vibey-local"),
-            model=fallback.get("model", "qwen2.5-coder:14b"),
+            model=fallback.get("model", "gpt-oss:20b"),
             base_url=fallback.get("base_url", "http://127.0.0.1:11434"),
             trusted_only=fallback.get("trusted_only", True),
             max_diff_chars=fallback.get("max_diff_chars", 60000),
+            max_document_chars=fallback.get("max_document_chars", 120000),
             timeout_seconds=fallback.get("timeout_seconds", 600),
             heartbeat_ref=fallback.get("heartbeat_ref", "refs/vibey-gh/sovereign-heartbeat"),
             heartbeat_max_age_minutes=fallback.get("heartbeat_max_age_minutes", 15),
+            context_paths=tuple(fallback.get("context_paths", ("README.md", "docs/index.md"))),
+            context_window=fallback.get("context_window", 65536),
+            reasoning_reserve_tokens=fallback.get("reasoning_reserve_tokens", 8192),
+            chars_per_token=fallback.get("chars_per_token", 3),
+            think=fallback.get("think", ""),
         ),
     )
     return GhConfig(
@@ -1752,7 +2623,7 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
         code_paths=tuple(ver.get("code_paths", ("src/",))),
         managed_workflows=(tuple(inst["workflows"]) if "workflows" in inst else None),
         union_merge_paths=tuple(inst.get("union_merge_paths", DEFAULT_UNION_MERGE_PATHS)),
-        fallback_package=_fallback_package(inst.get("fallback_package", "vibey")),
+        fallback_package=_fallback_package(inst.get("fallback_package", "vibey-engine")),
         pin_version=inst.get("pin_version", False),
         self_source=_self_source(inst.get("self_source", ".")),
         integration_branch=br.get("integration", "develop"),
@@ -1769,6 +2640,17 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
             auth_secret=data.get("ai", {}).get("auth_secret", AiConfig.auth_secret),
         ),
         pr_automation=automation,
+        unattended_approval=UnattendedApprovalConfig(
+            enabled=approval.get("enabled", False),
+            branches=tuple(approval.get("branches", ())),
+            authors=tuple(approval.get("authors", ())),
+            forbidden_paths=tuple(approval.get("forbidden_paths", DEFAULT_APPROVAL_FORBIDDEN)),
+            require_all_gates=approval.get("require_all_gates", True),
+            switch_variable=approval.get(
+                "switch_variable", UnattendedApprovalConfig.switch_variable
+            ),
+            switch_value=approval.get("switch_value", UnattendedApprovalConfig.switch_value),
+        ),
         issue_automation=IssueAutomationConfig(
             enabled=issues.get("enabled", True),
             model=issues.get("model", "claude-sonnet-5"),
@@ -1799,6 +2681,13 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
             update_contributor_branches=syncing.get("update_contributor_branches", True),
             max_self_heals=syncing.get("max_self_heals", 2),
         ),
+        sabbath=SabbathConfig(
+            **{
+                field.name: resting[field.name]
+                for field in dataclasses.fields(SabbathConfig)
+                if field.name in resting
+            }
+        ),
         realign=RealignConfig(
             reconcile_branches=realigning.get("reconcile_branches", True),
             automation_prefixes=tuple(
@@ -1809,7 +2698,10 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
             notify_contributor_branches=realigning.get("notify_contributor_branches", True),
         ),
         social_signals=_social_signals(data.get("social_signals", {})),
+        announce=AnnounceConfig.from_table(data.get("announce", {})),
         estimate=EstimateConfig.from_table(data.get("estimate", {})),
+        local_models=LocalModelsConfig.from_table(data.get("local_models", {})),
+        runners=_runners(data.get("runners", {})),
         workflow_names=_workflow_names(data.get("workflow_names", {})),
         tidy=TidyConfig(
             enabled=data.get("tidy", {}).get("enabled", True),
@@ -1889,6 +2781,8 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
             author_url=documentation.get(
                 "author_url", "https://vibewithadam.matthewsteinberger.com"
             ),
+            author_email=documentation.get("author_email", ""),
+            author_affiliation=documentation.get("author_affiliation", ""),
             readme_sections=tuple(documentation.get("readme_sections", ())),
             automation_doc=documentation.get("automation_doc", DEFAULT_AUTOMATION_DOC),
             # The former names are still read. They described a file this no longer points
@@ -1908,6 +2802,7 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
                 documentation.get("provenance_files", ("README.md", "docs/index.md"))
             ),
             google_analytics_id=documentation.get("google_analytics_id", ""),
+            cookie_consent=documentation.get("cookie_consent", True),
             favicon=documentation.get("favicon", "📘"),
             og_image=documentation.get("og_image", ""),
             twitter_site=documentation.get("twitter_site", ""),
@@ -1917,6 +2812,7 @@ def load_config(root: Path | None = None, config: Path | None = None) -> GhConfi
             theme_color=documentation.get("theme_color", "#080b14"),
             locale=documentation.get("locale", "en_US"),
             google_site_verification=documentation.get("google_site_verification", ""),
+            site_root_files=tuple(documentation.get("site_root_files", ())),
             site_requirements=tuple(documentation.get("site_requirements", ())),
             governance_source=documentation.get("governance_source", ""),
             corpus_index=documentation.get("corpus_index", "corpus-index.json"),

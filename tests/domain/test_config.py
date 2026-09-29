@@ -75,7 +75,13 @@ def test_architecture_doc_example_parses_every_field() -> None:
     assert config.budget.max_dollars_total == 250.0
     assert config.budget.max_turns_per_item == 60
 
-    assert config.engines.enabled == ("claudeloop", "codexloop", "cursorloop", "agyloop")
+    assert config.engines.enabled == (
+        "claudeloop",
+        "codexloop",
+        "cursorloop",
+        "agyloop",
+        "gptossloop",
+    )
     assert config.engines.weights == {
         "claudeloop": 3,
         "codexloop": 2,
@@ -107,16 +113,12 @@ def test_minimal_config_applies_defaults() -> None:
     assert config.project.name == "tiny"
     assert config.project.max_cycles == 10
     assert config.isolation.level == "worktree"
-    assert config.engines.enabled == (
-        "claudeloop",
-        "codexloop",
-        "cursorloop",
-        "agyloop",
-    )
+    assert config.engines.enabled == ("gptossloop",)
     assert config.phases.design.effort == "high"
     assert config.phases.build.effort == "low"
     assert config.phases.review.effort == "high"
     assert config.deploy.enabled is False
+    assert config.features.gptossloop is True
     assert config.features.qwenloop is False
     assert config.qwenloop.backend == "auto"
     assert config.notifications.enabled is False
@@ -164,13 +166,39 @@ def test_qwenloop_feature_auto_includes_standby() -> None:
         '[project]\nname = "x"\n\n[features]\nqwenloop = true\n\n'
         '[qwenloop]\nbackend = "llama.cpp"\n'
     )
-    assert config.engines.enabled[-1] == "qwenloop"
+    assert "qwenloop" in config.engines.enabled
     assert config.qwenloop.backend == "llama.cpp"
 
 
-def test_qwenloop_request_requires_feature() -> None:
-    with pytest.raises(ConfigError, match="must be true"):
+def test_gptossloop_request_is_always_allowed() -> None:
+    config = load_config_from_string(
+        '[project]\nname = "x"\n\n[engines]\nenabled = ["gptossloop"]\n'
+    )
+    assert config.engines.enabled == ("gptossloop",)
+
+
+def test_qwenloop_request_requires_its_feature_and_says_what_it_became() -> None:
+    """ADR-0064: qwenloop is the opt-in Qwen engine now, and the gpt-oss one is gptossloop."""
+    with pytest.raises(ConfigError, match="features.qwenloop.*gptossloop, on by default"):
         load_config_from_string('[project]\nname = "x"\n\n[engines]\nenabled = ["qwenloop"]\n')
+    config = load_config_from_string(
+        '[project]\nname = "x"\n\n[features]\nqwenloop = true\n\n'
+        '[engines]\nenabled = ["qwenloop"]\n'
+    )
+    assert config.engines.enabled == ("qwenloop", "gptossloop")
+
+
+def test_gptossloop_is_switched_off_only_by_its_feature() -> None:
+    """The sovereign default leaves the pool only by the declaration its switch is for; a
+    request for it while it is switched off is refused like any local engine's."""
+    off = load_config_from_string('[project]\nname = "x"\n\n[features]\ngptossloop = false\n')
+    assert off.engines.enabled == ()
+    assert not off.features.enables("gptossloop")
+    with pytest.raises(ConfigError, match="features.gptossloop"):
+        load_config_from_string(
+            '[project]\nname = "x"\n\n[features]\ngptossloop = false\n\n'
+            '[engines]\nenabled = ["gptossloop"]\n'
+        )
 
 
 def test_invalid_qwenloop_config_is_rejected() -> None:
@@ -281,7 +309,7 @@ def test_both_local_features_join_the_pool_in_order() -> None:
         '[project]\nname = "x"\n\n[features]\nqwenloop = true\nclaudeloop_local = true\n'
     )
 
-    assert config.engines.enabled[-2:] == ("qwenloop", "claudeloop-local")
+    assert config.engines.enabled == ("gptossloop", "qwenloop", "claudeloop-local")
 
 
 def test_claudeloop_local_request_requires_its_feature() -> None:
@@ -301,7 +329,7 @@ def test_an_explicit_pool_is_kept_as_written() -> None:
         '[engines]\nenabled = ["claudeloop-local"]\n'
     )
 
-    assert config.engines.enabled == ("claudeloop-local",)
+    assert config.engines.enabled == ("claudeloop-local", "gptossloop")
 
 
 @pytest.mark.parametrize(
@@ -317,3 +345,186 @@ def test_an_explicit_pool_is_kept_as_written() -> None:
 def test_an_invalid_claudeloop_local_table_is_refused(table: str, match: str) -> None:
     with pytest.raises(ConfigError, match=match):
         load_config_from_string(f'[project]\nname = "x"\n\n[engines.claudeloop_local]\n{table}\n')
+
+
+# -- [queue.priority] (ADR-0054) ----------------------------------------------------
+
+
+def test_queue_priority_declares_no_source_by_default() -> None:
+    from vibey.domain.config import QueueConfig
+
+    config = load_config_from_string('[project]\nname = "demo"\n')
+    assert config.queue.priority.sources == ()
+    assert QueueConfig.from_data({}).priority.sources == ()
+
+
+def test_queue_priority_sources_parse_in_the_order_written() -> None:
+    config = load_config_from_string(
+        '[project]\nname = "demo"\n[queue.priority]\nsources = ["storm", " nightly "]\n'
+    )
+    assert config.queue.priority.sources == ("storm", "nightly")
+
+
+def test_the_queue_table_parses_without_a_project_table() -> None:
+    """`vibey queue` reads only `[queue]`: a vibey.toml holding nothing else is valid
+    for it, so the reader must not demand `[project].name`."""
+    from vibey.domain.config import QueueConfig, parse_toml_string
+
+    data = parse_toml_string('[queue.priority]\nsources = ["storm"]\n')
+    assert QueueConfig.from_data(data).priority.sources == ("storm",)
+
+
+@pytest.mark.parametrize(
+    ("fragment", "match"),
+    [
+        ("queue = 3", "queue: 'queue' must be a dict"),
+        ("[queue]\npriority = 3", "queue.priority: 'priority' must be a dict"),
+        ("[queue.priority]\nsources = 'storm'", "queue.priority.sources: 'sources' must be a list"),
+        ("[queue.priority]\nsources = [3]", r"queue.priority.sources\[0\]: must be a string"),
+        ("[queue.priority]\nsources = ['  ']", r"queue.priority.sources\[0\]: must name a source"),
+        (
+            "[queue.priority]\nsources = ['operator']",
+            r"queue.priority.sources\[0\]: 'operator' is reserved",
+        ),
+        (
+            "[queue.priority]\nsources = ['storm', 'storm']",
+            r"queue.priority.sources\[1\]: 'storm' is declared twice",
+        ),
+    ],
+)
+def test_an_invalid_queue_priority_table_is_refused(fragment: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        load_config_from_string(f'{fragment}\n[project]\nname = "demo"\n')
+
+
+# -- [queue.reap] (ADR-0056) ---------------------------------------------------------
+
+
+def test_queue_reap_defaults_are_the_declared_ones() -> None:
+    from vibey.domain.config import QueueReapConfig
+    from vibey.domain.interfaces import QueueReapConfigInterface
+    from vibey.domain.queue_reap import ReapThresholds
+
+    reap = load_config_from_string('[project]\nname = "demo"\n').queue.reap
+    assert reap == QueueReapConfig()
+    assert isinstance(reap, QueueReapConfigInterface)
+    assert reap.enabled is True
+    assert reap.interval_seconds == 60
+    assert reap.dead_letter_peek_limit == 100
+    assert reap.thresholds() == ReapThresholds()
+    policy = reap.broker_policy()
+    assert policy.name == "vibey-reap"
+    assert [d.body() for d in policy.documents()] == [
+        {
+            "pattern": r"^vibey\.",
+            "definition": {"consumer-timeout": 21_600_000, "delivery-limit": 20},
+            "priority": 0,
+            "apply-to": "quorum_queues",
+        },
+        {
+            "pattern": r"^vibey\.",
+            "definition": {"consumer-timeout": 21_600_000},
+            "priority": 0,
+            "apply-to": "classic_queues",
+        },
+    ]
+    assert policy.is_dead_letter("vibey.jobs.dead")
+
+
+def test_queue_reap_reads_every_key() -> None:
+    config = load_config_from_string(
+        '[project]\nname = "demo"\n'
+        "[queue.reap]\n"
+        "enabled = false\n"
+        "interval_seconds = 30\n"
+        "lease_grace_seconds = 5\n"
+        "stale_ready_seconds = 120\n"
+        "dead_letter_min_depth = 2\n"
+        "dead_letter_peek_limit = 10\n"
+        "owned_queue_pattern = '^mine\\.'\n"
+        "dead_letter_queue_pattern = '\\.parked$'\n"
+        "policy_name = 'mine'\n"
+        "policy_priority = 4\n"
+        "consumer_timeout_seconds = 7200\n"
+        "delivery_limit = 3\n"
+    )
+    reap = config.queue.reap
+    assert reap.enabled is False
+    assert reap.thresholds().lease_grace_seconds == 5
+    assert reap.thresholds().stale_ready_seconds == 120
+    assert reap.thresholds().dead_letter_min_depth == 2
+    policy = reap.broker_policy()
+    assert policy.owns("mine.q") and not policy.owns("vibey.q")
+    assert policy.is_dead_letter("x.parked")
+    quorum, classic = policy.documents()
+    assert quorum.definition == {"consumer-timeout": 7_200_000, "delivery-limit": 3}
+    assert (quorum.name, classic.name, quorum.priority) == ("mine", "mine-classic", 4)
+
+
+@pytest.mark.parametrize(
+    ("fragment", "match"),
+    [
+        ("[queue]\nreap = 3", "queue.reap: 'reap' must be a dict"),
+        ("[queue.reap]\ninterval_seconds = 0", r"queue.reap.interval_seconds: must be at least 1"),
+        ("[queue.reap]\ndelivery_limit = -1", r"queue.reap.delivery_limit: must be at least 1"),
+        (
+            "[queue.reap]\nlease_grace_seconds = -1",
+            r"queue.reap.lease_grace_seconds: must be from 0 to 86400",
+        ),
+        ("[queue.reap]\nstale_ready_seconds = true", r"must be a int, got bool"),
+        ("[queue.reap]\nenabled = 1", r"queue.reap.enabled: must be a bool, got int"),
+        ("[queue.reap]\npolicy_name = 3", r"must be a str, got int"),
+        ("[queue.reap]\nsurprise = 1", r"queue.reap.surprise: is not a \[queue.reap\] key"),
+        ("[queue.reap]\nowned_queue_pattern = '('", r"queue.reap: pattern is not a regular"),
+        ("[queue.reap]\npolicy_name = ' '", r"queue.reap: a broker policy needs a name"),
+    ],
+)
+def test_an_invalid_queue_reap_table_is_refused(fragment: str, match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        load_config_from_string(f'{fragment}\n[project]\nname = "demo"\n')
+
+
+def test_the_bus_vhost_defaults_to_the_root_and_reads_as_written() -> None:
+    assert load_config_from_string('[project]\nname = "demo"\n').bus.vhost == "/"
+    config = load_config_from_string('[project]\nname = "demo"\n[bus]\nvhost = "vibey"\n')
+    assert config.bus.vhost == "vibey"
+
+
+def test_bus_dispatch_policy_is_configurable_and_validated() -> None:
+    config = load_config_from_string(
+        '[project]\nname = "demo"\n[bus]\nmode = "hybrid"\nhybrid_concurrency = 3\n'
+    )
+    assert (config.bus.mode, config.bus.hybrid_concurrency) == ("hybrid", 3)
+    with pytest.raises(ConfigError, match="bus.mode"):
+        load_config_from_string('[project]\nname = "demo"\n[bus]\nmode = "other"\n')
+    with pytest.raises(ConfigError, match="bus.hybrid_concurrency"):
+        load_config_from_string('[project]\nname = "demo"\n[bus]\nhybrid_concurrency = 0\n')
+
+
+@pytest.mark.parametrize(
+    ("fragment", "match"),
+    [
+        ("owned_queue_pattern = ''", r"pattern '' matches every queue name"),
+        ("owned_queue_pattern = '.*'", r"pattern '\.\*' matches every queue name"),
+        ("owned_queue_pattern = 'cel'", r"would own 'celery', a queue vibey does not own"),
+        ("owned_queue_pattern = '^amq\\.'", r"would own 'amq.gen-canary'"),
+        ("dead_letter_queue_pattern = ''", r"dead_letter_pattern '' matches every queue name"),
+        ("dead_letter_queue_pattern = 'x*'", r"matches every queue name"),
+        ("policy_priority = -5", r"queue.reap.policy_priority: must not be negative"),
+        ("dead_letter_peek_limit = 10000000", r"dead_letter_peek_limit: must be at most 1000"),
+        ("lease_grace_seconds = 1000000000", r"lease_grace_seconds: must be from 0 to 86400"),
+        ("consumer_timeout_seconds = 1", r"consumer_timeout_seconds: must be at least 7200"),
+    ],
+)
+def test_the_review_found_values_are_refused(fragment: str, match: str) -> None:
+    """#1108 review, finding 6 (probe_config.py): every one of these was accepted."""
+    with pytest.raises(ConfigError, match=match):
+        load_config_from_string(f'[queue.reap]\n{fragment}\n[project]\nname = "demo"\n')
+
+
+def test_the_bounds_themselves_are_accepted() -> None:
+    reap = load_config_from_string(
+        '[project]\nname = "demo"\n[queue.reap]\nlease_grace_seconds = 86400\n'
+        "dead_letter_peek_limit = 1000\nconsumer_timeout_seconds = 7200\npolicy_priority = 0\n"
+    ).queue.reap
+    assert (reap.lease_grace_seconds, reap.dead_letter_peek_limit) == (86_400, 1_000)

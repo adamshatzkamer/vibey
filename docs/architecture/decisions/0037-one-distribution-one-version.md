@@ -1,6 +1,6 @@
 # 0037 — One distribution, one version: the whole family ships inside `vibey`
 
-**Status:** accepted · **Date:** 2026-09-18 · **Supersedes in part:** ADR-0021, ADR-0019, ADR-0034, ADR-0015 · **Implementation corrected:** #259 (2026-09-18: decision 5's `pin_version` had stopped pinning adopters; it now pins the installed `vibey` release that `vibey-gh` runs from)
+**Status:** accepted; superseded in part by ADR-0069 (the package is `vibey-engine`, not `vibey`) · **Date:** 2026-09-18 · **Supersedes in part:** ADR-0021, ADR-0019, ADR-0034, ADR-0015 · **Implementation corrected:** #259 (2026-09-18: decision 5's `pin_version` had stopped pinning adopters; it now pins the installed `vibey` release that `vibey-gh` runs from)
 
 **Owes:** nothing — mechanism (ADR-0020). The conduct rule this applies already
 exists: sub-doctrine 2.b, *installable wherever its users already are*, ratified
@@ -70,7 +70,7 @@ Both halves of that objection are answered below rather than dodged.
 ## Decision
 
 **The repository publishes one distribution, `vibey`, and it carries the whole
-family.** `pip install vibey` delivers the conductor, all five `*loop` engines,
+family.** `pip install vibey` delivers the conductor, all six `*loop` engines,
 `vibey-gh`, `vibey-skills`, `vibey-bootstrap` and `vibey-runners-common`, with
 every console script on `PATH`. Concretely:
 

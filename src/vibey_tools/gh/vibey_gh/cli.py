@@ -20,6 +20,7 @@ from vibey_gh import (
     github_release,
     install,
     issue_automation,
+    issue_triage,
     merge_train,
     operation_estimate,
     pr_automation,
@@ -30,10 +31,13 @@ from vibey_gh import (
     surfaces,
     versioning,
 )
+from vibey_gh.announce import Announcer
+from vibey_gh.approval_check import ApprovalCheck
 from vibey_gh.config import load_config
 from vibey_gh.fallback_pin import FallbackPinResolver
 from vibey_gh.interfaces.fallback_pin_resolver_interface import FallbackPinResolverInterface
 from vibey_gh.interfaces.marketplace_renderer_interface import MarketplaceRendererInterface
+from vibey_gh.interfaces.paper_interface import RevisionReaderInterface
 from vibey_gh.review_composition import PAID_HALVES, REVIEW_COMPOSER
 
 
@@ -183,11 +187,29 @@ def _conventional_message(args) -> int:
     return 0
 
 
+def _provenance_message(args) -> int:
+    message = args.file.read_text(encoding="utf-8") if args.file else sys.stdin.read()
+    normalized = fingerprints.normalize_provenance_message(message)
+    if args.file:
+        args.file.write_text(normalized, encoding="utf-8")
+    else:
+        print(normalized, end="")
+    return 0
+
+
 def _conventional_check(args) -> int:
     invalid = fingerprints.commits_with_invalid_subject(args.commits, load_config())
     for commit in invalid:
         print(commit)
     return 1 if invalid else 0
+
+
+def _provenance_check(args) -> int:
+    cfg = load_config()
+    missing = fingerprints.commits_missing_trailer(args.commits, cfg)
+    for commit in missing:
+        print(commit)
+    return 1 if missing else 0
 
 
 def _version(args) -> int:
@@ -219,8 +241,76 @@ def _summary_rows(rows: list[tuple[int, str, str]], merged: int, skipped: int) -
     return "\n".join(lines) + "\n"
 
 
+def _sabbath_guard(cfg):
+    """This host's Sabbath guard. A module function because argparse dispatches to
+    functions and every writer below builds the guard the same way."""
+    from vibey_gh.sabbath_guard import SabbathGuard
+
+    return SabbathGuard(cfg.sabbath, home=Path.home())
+
+
+def _sabbath_lanes(cfg):
+    from vibey_gh.sabbath_guard import SabbathLanes
+
+    declared = cfg.sabbath.lanes_dir
+    return SabbathLanes(Path(os.path.expanduser(declared)))
+
+
+def _sabbath_resume(cfg, cwd: str | None, *, ended: bool) -> list[str]:
+    """What the heartbeat re-arms outside the window. `ended` marks the first beat after
+    one: that beat writes the SabbathEnded line and re-fires the held workflows."""
+    from vibey_gh.sabbath_guard import resume_dispatch
+
+    lines: list[str] = []
+    if ended:
+        lines.append("SabbathEnded: the window has closed; re-arming what it held")
+        if cfg.sabbath.resume_dispatch:
+            lines += resume_dispatch(cfg, cwd=cwd)
+    resumed: list[str] = _sabbath_lanes(cfg).resume()
+    return lines + resumed
+
+
+def _sabbath(args) -> int:
+    """`vibey-gh sabbath status|register-lane|resume` (sub-doctrine 8.i)."""
+    cfg = load_config()
+    if args.action == "status":
+        for line in _sabbath_guard(cfg).describe():
+            print(line)
+        for name, command, _cwd in _sabbath_lanes(cfg).pending():
+            print(f"paused lane: {name}: {' '.join(command) or '(unreadable)'}")
+        return 0
+    if args.action == "register-lane":
+        if not args.name or not args.resume_command:
+            print(
+                "vibey-gh sabbath: register-lane needs --name and a resume command", file=sys.stderr
+            )
+            return 2
+        path = _sabbath_lanes(cfg).register(args.name, args.resume_command, args.cwd)
+        print(f"vibey-gh sabbath: lane {args.name} paused; resumes at sundown ({path})")
+        return 0
+    if _sabbath_guard(cfg).hold() is not None:
+        print("vibey-gh sabbath: still resting; nothing resumes until the window closes")
+        return 0
+    for line in _sabbath_resume(cfg, None, ended=args.dispatch):
+        print(f"vibey-gh sabbath: {line}")
+    return 0
+
+
+def _held_for_the_sabbath(args, cfg) -> bool:
+    """Sub-doctrine 8.i: stand down, visibly. A held run prints the hold, writes it to the
+    job summary and returns 0 -- paused, not failed, not silently skipped (10.f)."""
+    held = _sabbath_guard(cfg).hold()
+    if held is None:
+        return False
+    print(f"vibey-gh: {held.report()}")
+    _write_summary(args, held.summary())
+    return True
+
+
 def _merge_train(args) -> int:
     cfg = load_config()
+    if _held_for_the_sabbath(args, cfg):
+        return 0
     prs = (
         merge_train.open_pull_requests(cfg, number=args.pr)
         if args.pr is not None
@@ -263,9 +353,12 @@ def _merge_train(args) -> int:
                     skipped += 1
                     continue
                 v.reason = f"{v.reason} (restack declined: {detail})"
-            # Only a pull request held on the owner's approval gets labelled and
-            # announced. A draft or a red build is the contributor's to fix and needs no
-            # notification; this one is waiting on somebody who does not know yet.
+            # Only a pull request holding outside code -- an author not in
+            # `trusted_authors`, or the external-repair label -- gets labelled and
+            # announced, approved or not and whatever its gates say: the train will never
+            # merge it, so a person must. A draft or a red build is the contributor's to
+            # fix and needs no notification; this one waits on somebody who does not
+            # know yet (ADR-0053).
             if v.held_for_review and not args.dry_run and args.label != "":
                 merge_train.hold_for_review(v, cfg, label=args.label)
             print(f"  #{v.number} skipped — {v.reason}")
@@ -287,7 +380,9 @@ def _merge_train(args) -> int:
         if method == "squash" and cfg.trailer not in (pr.get("body") or ""):
             existing = (pr.get("body") or "").strip()
             squash_body = (existing + "\n\n" if existing else "") + cfg.trailer
-        ok, bypassed, error = merge_train.merge(v.number, method, squash_body)
+        ok, bypassed, error = merge_train.merge(
+            v.number, method, squash_body, admin_fallback=args.admin_fallback
+        )
         if ok:
             note = " (review requirement bypassed)" if bypassed else ""
             cleanup = ""
@@ -303,9 +398,11 @@ def _merge_train(args) -> int:
         else:
             # The stderr is the diagnosis: "refused it" alone once cost an hour of
             # ruleset archaeology when the real cause was a token missing the repository.
-            reason = error or "the ruleset refused it"
-            print(f"  #{v.number} could not be merged — {reason}")
-            rows.append((v.number, v.title, f"blocked: {reason[:120]}"))
+            # Without `--admin-fallback` a refusal is the gate working, not a fault: the
+            # pull request waits for a person and the pass carries on (ADR-0053, 12.d).
+            reason = f"needs a human merge: {error or 'the ruleset refused it'}"
+            print(f"  #{v.number} {reason}")
+            rows.append((v.number, v.title, reason[:160]))
             skipped += 1
 
     print(f"vibey-gh: merged {merged}, skipped {skipped}")
@@ -335,10 +432,12 @@ def _pr_automation(args) -> int:
         elif args.action == "combine":
             # An empty --sovereign is how the workflow says the sovereign lane produced no
             # verdict; the composer then refuses a wider-half-only answer rather than
-            # passing a review whose diff half nobody carried.
+            # passing a review whose diff half nobody carried. An empty --paid is the paid
+            # lane returning nothing -- or, under `--half none`, no paid review declared.
             sovereign = _read_json(args.sovereign) if args.sovereign else None
+            paid = _read_json(args.paid) if args.paid else None
             envelope = REVIEW_COMPOSER.compose(
-                _read_json(args.paid), half=args.half, sovereign=sovereign, head_sha=args.head_sha
+                paid, half=args.half, sovereign=sovereign, head_sha=args.head_sha
             )
             print(json.dumps(envelope, ensure_ascii=False))
         elif args.action == "mirror-fork":
@@ -394,6 +493,27 @@ def _issue_automation(args) -> int:
     return 0
 
 
+def _issue_triage(args) -> int:
+    try:
+        if args.action == "sweep":
+            items = issue_triage.triage()
+            print(issue_triage.summary(items), end="")
+        elif args.action in {"bump", "unbump"}:
+            issue_triage.set_bump(args.issue, args.action == "bump")
+            print(
+                f"vibey-gh: {'bumped' if args.action == 'bump' else 'unbumped'} issue #{args.issue}"
+            )
+        elif args.action == "ensure-labels":
+            issue_triage.ensure_labels()
+            print("vibey-gh: issue triage labels are ready")
+        else:  # pragma: no cover
+            raise ValueError(f"unknown action: {args.action}")
+    except (RuntimeError, ValueError, TypeError) as exc:
+        print(f"vibey-gh: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _github_release(args) -> int:
     cfg = load_config()
     try:
@@ -439,9 +559,21 @@ def _flatten(args) -> int:
 
 
 def _promote(args) -> int:
+    if args.admin_fallback and not args.wait:
+        # Without --wait nothing merges here (the merge train does), so the flag would be
+        # accepted and silently ignored -- refused instead, so nobody believes it applied.
+        print("vibey-gh: --admin-fallback only applies with --wait", file=sys.stderr)
+        return 2
+    cfg = load_config()
+    if _held_for_the_sabbath(args, cfg):
+        return 0
     try:
         result = promote.promote(
-            load_config(), dry_run=args.dry_run, method=args.method, wait=args.wait
+            cfg,
+            dry_run=args.dry_run,
+            method=args.method,
+            wait=args.wait,
+            admin_fallback=args.admin_fallback,
         )
     except RuntimeError as exc:
         print(f"vibey-gh: {exc}", file=sys.stderr)
@@ -675,21 +807,105 @@ def _marketplace(args, renderer: MarketplaceRendererInterface | None = None) -> 
     return 0
 
 
+def _push_scope(args) -> int:
+    """Judge the refs a pre-push hook was handed: does this push carry code at all?
+
+    Reads git's pre-push standard input. Prints `NO_CODE` on stdout and exits 0 only when
+    every ref is the declared `[pr_automation.fallback] heartbeat_ref` and every commit is
+    an empty tree with no parents that brings nothing else; the reason goes to stderr so the
+    person pushing sees why the heavy stage did not run. Any other push -- or a
+    configuration that cannot be read, so that nothing is declared -- prints nothing on
+    stdout and exits 1, and the gate runs in full.
+    """
+    from vibey_gh.push_scope import NO_CODE, PushScope
+
+    try:
+        declared = load_config().pr_automation.fallback.heartbeat_ref
+    except (OSError, ValueError) as exc:
+        print(f"vibey-gh push-scope: no heartbeat ref could be read ({exc})", file=sys.stderr)
+        return 1
+    verdict = PushScope(refs=(declared,)).judge(sys.stdin.read())
+    if verdict.carries_code:
+        return 1
+    print(
+        f"vibey-gh push-scope: {verdict.reason}; nothing for the pre-push gate to judge",
+        file=sys.stderr,
+    )
+    print(NO_CODE)
+    return 0
+
+
+def _lane_readiness(cfg):
+    """The sovereign lane's readiness as this machine can read it: the runner `[runners]`
+    declares, listed with its own credential, and the model `[pr_automation.fallback]`
+    names, read through the fit's sampler. One function so a test can hand `--beat` an exact
+    answer instead of a runner and a model endpoint."""
+    from vibey_gh.fit import OllamaModelSampler
+    from vibey_gh.sovereign_lane import SovereignLaneReadiness
+    from vibey_gh.sovereign_runner import SovereignRunner
+
+    fallback = cfg.pr_automation.fallback
+    runner = SovereignRunner(cfg, home=Path.home(), uid=os.getuid())
+    return SovereignLaneReadiness(
+        fallback, runner=runner, model=OllamaModelSampler(fallback.base_url)
+    )
+
+
 def _sovereign(args) -> int:
     """Publish or read the sovereign heartbeat (doctrine 8.a).
 
-    `--beat` is what the operator's supervisor runs on a timer; the bare form is what
-    a workflow runs to decide whether it may schedule the sovereign lane at all. The
-    probe prints its verdict and, under Actions, writes `ready=` to `$GITHUB_OUTPUT`
-    so a job `if:` can consume it.
+    `--beat` is what the heartbeat timer runs (`vibey-gh heartbeat install`); the bare form
+    is what a workflow runs to decide whether it may schedule the sovereign lane at all.
+    `--beat` pushes from the timer's own clone, through that clone's gate, and only when the
+    lane can serve -- the runner registered and online, the model endpoint answering -- and
+    with `--record` writes what it did for `heartbeat status`. The probe prints its verdict
+    and, under Actions, writes `ready=` to `$GITHUB_OUTPUT` so a job `if:` can consume it.
     """
-    import os
-
     from vibey_gh import sovereign
 
-    fallback = load_config().pr_automation.fallback
+    cfg = load_config()
+    fallback = cfg.pr_automation.fallback
+    held = _sabbath_guard(cfg).hold()
     if args.beat:
-        result = sovereign.beat(fallback.heartbeat_ref, remote=args.remote)
+        from vibey_gh.heartbeat_timer import BeatRecord
+
+        now = datetime.now(UTC).timestamp()
+        if held is not None:
+            # 8.i: the heartbeat keeps beating through the window -- publishing nothing,
+            # but recording that it rests and until when, so a liveness check reads rest
+            # rather than death (10.f), and exiting 0 so the unit is never marked failed.
+            reason = f"resting for the Sabbath until {held.resumes.isoformat()} ({held.basis})"
+            if args.record:
+                BeatRecord(now, False, reason, held.resumes.timestamp()).write(Path(args.record))
+            print(f"vibey-gh sovereign: {reason}")
+            return 0
+        clone, problem = _heartbeat_timer(cfg).clone_dir()
+        previous = BeatRecord.read(Path(args.record)) if args.record else None
+        ended = previous is not None and previous.resting_until is not None
+        # Re-arm what the window held: the workflows once, on the first beat after it; the
+        # paused lanes on every beat until each one's resume has succeeded.
+        for line in _sabbath_resume(cfg, None if clone is None else str(clone), ended=ended):
+            print(f"vibey-gh sabbath: {line}")
+        if clone is None:
+            result = sovereign.Readiness(False, f"heartbeat withheld: {problem}")
+        else:
+            result = sovereign.beat(
+                fallback.heartbeat_ref,
+                readiness=_lane_readiness(cfg),
+                remote=args.remote,
+                cwd=str(clone),
+            )
+        if args.record:
+            BeatRecord(now, result.ready, result.reason).write(Path(args.record))
+    elif held is not None:
+        result = sovereign.Readiness(
+            False, f"resting for the Sabbath until {held.resumes.isoformat()}"
+        )
+        output = os.environ.get("GITHUB_OUTPUT")
+        if output:
+            with open(output, "a", encoding="utf-8") as handle:
+                handle.write("ready=false\n")
+                handle.write(f"reason={' '.join(result.reason.split())}\n")
     else:
         result = sovereign.probe(
             fallback.heartbeat_ref,
@@ -700,10 +916,128 @@ def _sovereign(args) -> int:
         if output:
             with open(output, "a", encoding="utf-8") as handle:
                 handle.write(f"ready={'true' if result.ready else 'false'}\n")
+                # Why, as well as whether: the gate names it when the lane is not offered.
+                # Every reason is this module's own one-line sentence, never forge text.
+                handle.write(f"reason={' '.join(result.reason.split())}\n")
     print(f"vibey-gh sovereign: {result.reason}")
     # A probe that finds no runner is a fact, not a failure: exiting non-zero would
     # turn "the sovereign lane is not available right now" into a red job.
     return 0 if (result.ready or not args.beat) else 1
+
+
+def _heartbeat_timer(cfg, service=None):
+    """The heartbeat timer as this machine runs it. A module function because argparse
+    dispatches to functions, and `heartbeat`, `runner` and `sovereign --beat` all build the
+    timer the same way."""
+    from vibey_gh.heartbeat_timer import HeartbeatTimer
+
+    return HeartbeatTimer(cfg, home=Path.home(), uid=os.getuid(), service=service)
+
+
+def _install_heartbeat(timer, *, load: bool) -> int:
+    """Render and install the heartbeat timer, printing each act; 0 only when it is in place
+    (and loaded, with `load`). A module function: `heartbeat install` and `runner install`
+    share it, and argparse dispatches to functions."""
+    plan, problem = timer.render()
+    if plan is None:
+        print(f"vibey-gh heartbeat: {problem}", file=sys.stderr)
+        return 1
+    lines, loaded = timer.install(plan, load=load)
+    for line in lines:
+        print(line)
+    if not loaded:
+        return 1
+    if not load:
+        print("the heartbeat timer was not loaded. Next, in order:")
+        for number, step in enumerate(timer.next_steps(plan), start=1):
+            print(f"  {number}. {step}")
+    return 0
+
+
+def _heartbeat(args, service=None) -> int:
+    """Stand the sovereign heartbeat's timer up from the tree, report on it, or remove it.
+
+    launchd on macOS, a systemd user timer on Linux. Only `install --load` and
+    `uninstall --apply` touch the service manager; `service` is the seam tests replace.
+    """
+    timer = _heartbeat_timer(load_config(), service)
+    if args.action == "install":
+        return _install_heartbeat(timer, load=args.load)
+    if args.action == "status":
+        lines, healthy = timer.status()
+        for line in lines:
+            print(line)
+        return 0 if healthy else 1
+    for line in timer.uninstall(apply=args.apply):
+        print(line)
+    if not args.apply:
+        print("dry run: nothing was changed; pass --apply to do it")
+    return 0
+
+
+def _runner(args, launchctl=None) -> int:
+    """Stand the sovereign review runner up from `[runners]`, or check or remove it (12.c).
+
+    Only `install --load` and `--apply` touch launchd; every other form reads or writes
+    files and prints what the operator runs next. `launchctl` is the seam tests replace.
+    `install` and `uninstall` do the same for the heartbeat timer, which is what tells the
+    gate the runner is there.
+    """
+    from vibey_gh.sovereign_runner import PAT_PERMISSION, SovereignRunner
+
+    cfg = load_config()
+    runner = SovereignRunner(cfg, home=Path.home(), uid=os.getuid(), launchctl=launchctl)
+    plan, problem = runner.render()
+    if plan is None:
+        print(f"vibey-gh runner: {problem}", file=sys.stderr)
+        return 1
+    if args.action == "check":
+        problems = runner.check(plan)
+        for line in problems:
+            print(line, file=sys.stderr)
+        if problems:
+            return 1
+        print(f"vibey-gh runner: {plan.label} matches the tree and its credential is usable")
+        return 0
+    if args.action == "install":
+        lines, loaded = runner.install(plan, load=args.load)
+        for line in lines:
+            print(line)
+        if not loaded:
+            return 1
+        if not args.load:
+            print("nothing was loaded. Next, in order:")
+            print(
+                f"  0. create a fine-grained token: repository {plan.repository} only,"
+                f" {PAT_PERMISSION} (docs/runbooks/sovereign-review-runner.md)"
+            )
+            for number, step in enumerate(runner.next_steps(plan), start=1):
+                print(f"  {number}. {step}")
+        # The runner is finished above whatever happens here; a heartbeat that cannot be
+        # installed is reported on its own, with what to do next, and the exit status says
+        # the lane will not be offered yet (10.f).
+        print("the heartbeat timer:")
+        if _install_heartbeat(_heartbeat_timer(cfg, launchctl), load=args.load) == 0:
+            return 0
+        done = "installed and loaded" if args.load else "installed"
+        print(
+            f"vibey-gh runner: the runner is {done}, but its heartbeat timer is not, so the"
+            " gate will not offer the sovereign lane yet. Fix what is named above, then run"
+            f" `vibey-gh heartbeat install{' --load' if args.load else ''}`"
+            " (docs/runbooks/sovereign-review-runner.md).",
+            file=sys.stderr,
+        )
+        return 1
+    if args.action == "cleanup":
+        lines = runner.remove(runner.strays(plan), apply=args.apply)
+    else:
+        lines = runner.uninstall(plan, apply=args.apply)
+        lines += _heartbeat_timer(cfg, launchctl).uninstall(apply=args.apply)
+    for line in lines:
+        print(line)
+    if not args.apply:
+        print("dry run: nothing was changed; pass --apply to do it")
+    return 0
 
 
 def _fit(args) -> int:
@@ -769,6 +1103,21 @@ def _fit(args) -> int:
     if advice:
         print(f"vibey-gh fit: ACTION NEEDED — {advice}")
     return 0 if verdict.ok else 1
+
+
+def _slots(args) -> int:
+    # Module-level like every other handler here: argparse dispatches through
+    # `set_defaults(func=...)`. It only resolves configuration; the work is `SlotCommands`'
+    # (ADR-0016).
+    from vibey_gh.slot_commands import SlotCommands
+
+    cfg = load_config()
+    commands = SlotCommands(
+        cfg.local_models,
+        fallback_model=cfg.pr_automation.fallback.model,
+        fallback_url=cfg.pr_automation.fallback.base_url,
+    )
+    return int(getattr(commands, args.slots_action)(args))
 
 
 def _estimate(args) -> int:
@@ -952,7 +1301,36 @@ def _doctor(args) -> int:
     return 0
 
 
-def _paper(args) -> int:
+def _paper_provenance(args, reader: RevisionReaderInterface | None = None):
+    """The article's provenance from the flags and, with `--provenance`, from git and the clock.
+
+    Nothing here is typed by a person: the revision and its commit time come from the
+    checkout (or the `--revision` the workflow already holds), the render time from the
+    clock, and the names, addresses and links from configuration.
+    """
+    from vibey_gh import paper
+
+    if not args.provenance:
+        return None
+    selected = reader if reader is not None else paper.RevisionReader(Path.cwd())
+    sha, committed_at, committed_unix = selected.read(args.revision or "HEAD")
+    now = datetime.now(UTC).replace(microsecond=0)
+    return paper.Provenance(
+        author=args.author,
+        email=args.email,
+        affiliation=args.affiliation,
+        author_url=args.author_url,
+        site_url=args.site,
+        repository_url=args.repository,
+        revision=sha,
+        committed_at=committed_at,
+        committed_unix=committed_unix,
+        rendered_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        rendered_unix=int(now.timestamp()),
+    )
+
+
+def _paper(args, reader: RevisionReaderInterface | None = None) -> int:
     from vibey_gh import paper
     from vibey_gh.docx import DocxError
 
@@ -961,6 +1339,7 @@ def _paper(args) -> int:
     output_format = args.format or ("docx" if out.suffix.casefold() == ".docx" else "tex")
     try:
         markdown = source.read_text(encoding="utf-8")
+        provenance = _paper_provenance(args, reader)
         out.parent.mkdir(parents=True, exist_ok=True)
         if output_format == "docx":
             paper.write_docx(
@@ -969,6 +1348,7 @@ def _paper(args) -> int:
                 author=args.author,
                 journal=args.journal,
                 keywords=args.keywords,
+                provenance=provenance,
             )
             print(f"docx: {out}")
             return 0
@@ -977,12 +1357,65 @@ def _paper(args) -> int:
             author=args.author,
             journal=args.journal,
             keywords=args.keywords,
+            provenance=provenance,
         )
     except (paper.PaperError, DocxError, OSError) as error:
         print(f"vibey-gh paper: {error}", file=sys.stderr)
         return 1
     out.write_text(tex, encoding="utf-8")
     print(f"tex: {out}")
+    return 0
+
+
+def _paper_figures(args) -> int:
+    """Emit the paper's figures as standalone TeX, or inline their SVG renderings.
+
+    Two halves of one pipeline that a TeX engine sits between. `--emit DIR` writes one
+    standalone document per figure plus a manifest; the workflow compiles each with the
+    pinned Tectonic and converts the page to SVG. `--inline SVGDIR --output FILE` then
+    writes the paper with every rendered figure embedded, for the site and the book.
+    """
+    from vibey_gh import paper
+
+    source = Path(args.source)
+    try:
+        markdown = source.read_text(encoding="utf-8")
+        found = paper.figures(markdown)
+        if args.emit is not None:
+            target = Path(args.emit)
+            target.mkdir(parents=True, exist_ok=True)
+            manifest = []
+            for figure in found:
+                stem = figure.label.replace(":", "-")
+                (target / f"{stem}.tex").write_text(paper.figure_document(figure), encoding="utf-8")
+                manifest.append(
+                    {
+                        "label": figure.label,
+                        "file": f"{stem}.tex",
+                        "environment": figure.environment,
+                    }
+                )
+            (target / "manifest.json").write_text(
+                json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+            )
+            print(f"figures: {len(manifest)} emitted into {target}")
+            return 0
+        svg_dir = Path(args.inline)
+        rendered = {}
+        for figure in found:
+            candidate = svg_dir / f"{figure.label.replace(':', '-')}.svg"
+            if candidate.is_file():
+                rendered[figure.label] = candidate.read_text(encoding="utf-8")
+        output = Path(args.output) if args.output else source
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(paper.inline_figures(markdown, rendered), encoding="utf-8")
+        missing = [f.label for f in found if f.label not in rendered]
+        print(f"figures: {len(rendered)} of {len(found)} inlined into {output}")
+        if missing:
+            print("figures without a rendering, kept as source: " + ", ".join(missing))
+    except (paper.PaperError, OSError) as error:
+        print(f"vibey-gh paper-figures: {error}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1084,6 +1517,14 @@ def _local_review(args) -> int:
         ("--max-chars", args.max_chars),
         ("--timeout", args.timeout),
         ("--role", args.role),
+        ("--scope", args.scope),
+        ("--context-dir", args.context_dir),
+        ("--max-document-chars", args.max_document_chars),
+        ("--context-paths", args.context_paths),
+        ("--context-window", args.context_window),
+        ("--reasoning-reserve", args.reasoning_reserve),
+        ("--chars-per-token", args.chars_per_token),
+        ("--think", args.think),
     ):
         if value is not None:
             forwarded += [flag, str(value)]
@@ -1284,11 +1725,39 @@ def main(argv: list[str] | None = None) -> int:
     conventional.add_argument("--file", type=Path, help="rewrite this commit-message file")
     conventional.set_defaults(func=_conventional_message)
 
+    provenance_message = sub.add_parser(
+        "provenance-message", help="normalize a commit subject and add the provenance trailer"
+    )
+    provenance_message.add_argument("--file", type=Path, help="rewrite this commit-message file")
+    provenance_message.set_defaults(func=_provenance_message)
+
     conventional_check = sub.add_parser(
         "conventional-check", help="verify Conventional Commit subjects in a range"
     )
     conventional_check.add_argument("--commits", required=True, metavar="RANGE")
     conventional_check.set_defaults(func=_conventional_check)
+
+    provenance_check = sub.add_parser(
+        "provenance-check", help="verify provenance trailers in a commit range"
+    )
+    provenance_check.add_argument("--commits", required=True, metavar="RANGE")
+    provenance_check.set_defaults(func=_provenance_check)
+
+    sab = sub.add_parser("sabbath", help="the Sabbath window on this host (sub-doctrine 8.i)")
+    sab.add_argument("action", choices=("status", "register-lane", "resume"))
+    sab.add_argument("--name", help="register-lane: the paused lane's name")
+    sab.add_argument("--cwd", help="register-lane: where its resume command runs")
+    sab.add_argument(
+        "--dispatch",
+        action="store_true",
+        help="resume: also re-fire the held merge train and promotion",
+    )
+    sab.add_argument(
+        "resume_command",
+        nargs="*",
+        help="register-lane: the command that resumes the lane, after --",
+    )
+    sab.set_defaults(func=_sabbath)
 
     m = sub.add_parser("merge-train", help="merge every ready pull request")
     m.add_argument("--method", default="squash", choices=("squash", "rebase", "merge"))
@@ -1304,6 +1773,15 @@ def main(argv: list[str] | None = None) -> int:
         "--summary",
         metavar="FILE",
         help="write a markdown table here (default: $GITHUB_STEP_SUMMARY)",
+    )
+    # A flag and never a configuration key: a declared default-on would re-enable the
+    # bypass for every unattended caller (CI, the storm tools). ADR-0053, sub-doctrine 12.d.
+    m.add_argument(
+        "--admin-fallback",
+        action="store_true",
+        help="retry a merge GitHub refuses with `gh pr merge --admin`, bypassing the "
+        "ruleset. Off by default; for a person at the keyboard, for this run only. "
+        "Unattended callers must never pass it",
     )
     m.set_defaults(func=_merge_train)
 
@@ -1331,20 +1809,30 @@ def main(argv: list[str] | None = None) -> int:
         help="compose one review verdict from the lane or lanes that answered it",
     )
     combine.add_argument(
-        "--paid", required=True, help="the paid reviewer's answer: JSON object, file, or -"
+        "--paid",
+        default="",
+        help=(
+            "the paid reviewer's answer: JSON object, file, or -; empty when it returned"
+            " nothing, and always empty with --half none"
+        ),
     )
     combine.add_argument(
         "--half",
         required=True,
         choices=PAID_HALVES,
-        help="what the paid reviewer answered: the full schema, or the wider half alone",
+        help=(
+            "what the paid reviewer answered: the full schema, the wider half alone, or"
+            " 'none' when no paid review is declared and the sovereign verdict is the whole"
+            " review (8.b)"
+        ),
     )
     combine.add_argument(
         "--sovereign",
         default="",
         help=(
-            "the sovereign lane's diff-half verdict (JSON object or file); required with"
-            " --half requires-wider-context, empty when that lane produced none"
+            "the sovereign lane's verdict (JSON object or file): its diff half, required with"
+            " --half requires-wider-context; its whole review, required with --half none;"
+            " empty when that lane produced none"
         ),
     )
     combine.add_argument("--head-sha", required=True)
@@ -1393,6 +1881,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     issue_labels.set_defaults(func=_issue_automation)
 
+    issue_triage_parser = sub.add_parser("issue-triage", help="classify and order all open issues")
+    triage_sub = issue_triage_parser.add_subparsers(dest="action", required=True)
+    triage_sweep = triage_sub.add_parser("sweep", help="reconcile every open issue")
+    triage_sweep.set_defaults(func=_issue_triage)
+    for action, help_text in (
+        ("bump", "promote an issue above ordinary priority"),
+        ("unbump", "remove an issue promotion"),
+    ):
+        triage_command = triage_sub.add_parser(action, help=help_text)
+        triage_command.add_argument("--issue", type=int, required=True)
+        triage_command.set_defaults(func=_issue_triage)
+    triage_labels = triage_sub.add_parser("ensure-labels", help="create triage labels")
+    triage_labels.set_defaults(func=_issue_triage)
+
     release = sub.add_parser(
         "github-release", help="idempotently create an immutable version tag and GitHub Release"
     )
@@ -1419,6 +1921,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--summary", metavar="FILE", help="write markdown here (default: $GITHUB_STEP_SUMMARY)"
+    )
+    # A flag and never a configuration key, as for merge-train (ADR-0053, 12.d).
+    p.add_argument(
+        "--admin-fallback",
+        action="store_true",
+        help="with --wait: retry a merge GitHub refuses with `gh pr merge --admin`, "
+        "bypassing the ruleset. Off by default; for a person at the keyboard, for this "
+        "run only. Unattended callers must never pass it",
     )
     p.set_defaults(func=_promote)
 
@@ -1500,6 +2010,49 @@ def main(argv: list[str] | None = None) -> int:
             "how the verdict labels itself: 'sovereign' when it carries the diff half,"
             " 'fallback' (the default) when it stands in for a paid review that failed"
         ),
+    )
+    local.add_argument(
+        "--scope",
+        choices=("diff-groundable", "full"),
+        help=(
+            "what to answer: the diff-groundable half (the default), or 'full' -- the whole"
+            " review, asked of the sovereign lane when no paid review is declared (8.b)"
+        ),
+    )
+    local.add_argument(
+        "--context-dir",
+        help="documents a whole review judges the documentation contract against",
+    )
+    local.add_argument(
+        "--max-document-chars",
+        type=int,
+        help=(
+            "override [pr_automation.fallback] max_document_chars: the most characters of"
+            " documents a whole review is shown"
+        ),
+    )
+    local.add_argument(
+        "--context-paths",
+        help=(
+            "override [pr_automation.fallback] context_paths, space-separated: the order the"
+            " documents give way in, the last first"
+        ),
+    )
+    local.add_argument(
+        "--context-window",
+        type=int,
+        help="override [pr_automation.fallback] context_window: the model's window, in tokens",
+    )
+    local.add_argument(
+        "--reasoning-reserve",
+        type=int,
+        help="override reasoning_reserve_tokens: room kept for reasoning and the answer",
+    )
+    local.add_argument("--chars-per-token", type=int, help="override chars_per_token")
+    local.add_argument(
+        "--think",
+        choices=("", "low", "medium", "high"),
+        help="override think: the reasoning effort sent to the model (empty sends none)",
     )
     local.set_defaults(func=_local_review)
 
@@ -1600,19 +2153,74 @@ def main(argv: list[str] | None = None) -> int:
     )
     mk.set_defaults(func=_marketplace)
 
+    ps = sub.add_parser(
+        "push-scope",
+        help="read pre-push refs on stdin; print carries-no-code only for the declared heartbeat",
+    )
+    ps.set_defaults(func=_push_scope)
+
     sv = sub.add_parser(
         "sovereign",
         help="sovereign readiness (8.a): publish or read the local runner's heartbeat",
     )
     sv.add_argument("--beat", action="store_true", help="publish a heartbeat (run on a timer)")
     sv.add_argument("--remote", default="origin", help="git remote carrying the heartbeat ref")
+    sv.add_argument(
+        "--record",
+        metavar="FILE",
+        help="with --beat, write what it did (published or withheld, and why) for status",
+    )
     sv.set_defaults(func=_sovereign)
+
+    hb = sub.add_parser(
+        "heartbeat",
+        help="stand the sovereign heartbeat's timer up from the tree, report on it, remove it",
+    )
+    hb_sub = hb.add_subparsers(dest="action", required=True)
+    hb_install = hb_sub.add_parser(
+        "install",
+        help="create the timer's clone and gate, test the gate, render the launchd agent or"
+        " systemd timer, and print the next commands",
+    )
+    hb_install.add_argument(
+        "--load", action="store_true", help="also (re)load it with launchctl or systemctl"
+    )
+    hb_sub.add_parser(
+        "status",
+        help="installed, current, the clone's gate, loaded, and the last beat's age and result",
+    )
+    hb_uninstall = hb_sub.add_parser(
+        "uninstall",
+        help="unload the timer and move its units and clone aside (dry run by default)",
+    )
+    hb_uninstall.add_argument("--apply", action="store_true", help="do it, rather than list it")
+    hb.set_defaults(func=_heartbeat, load=False, apply=False)
+
+    rn = sub.add_parser(
+        "runner",
+        help="stand the sovereign review runner up from [runners], or check or remove it",
+    )
+    rn_sub = rn.add_subparsers(dest="action", required=True)
+    rn_install = rn_sub.add_parser(
+        "install", help="render the LaunchAgent and supervisor; print the next commands"
+    )
+    rn_install.add_argument(
+        "--load", action="store_true", help="also (re)load the LaunchAgent with launchctl"
+    )
+    rn_sub.add_parser("check", help="compare the installed runner and its credential with the tree")
+    for action, helptext in (
+        ("cleanup", "unload agents under unit_prefix the tree no longer declares"),
+        ("uninstall", "unload the declared agent and delete the files install wrote"),
+    ):
+        removal = rn_sub.add_parser(action, help=f"{helptext} (dry run by default)")
+        removal.add_argument("--apply", action="store_true", help="do it, rather than list it")
+    rn.set_defaults(func=_runner, load=False, apply=False)
 
     ft = sub.add_parser(
         "fit",
         help="the fit calculus (#263): both sides measured, the projection stated",
     )
-    ft.add_argument("--model", default="qwen2.5-coder:14b", help="the model actually wanted")
+    ft.add_argument("--model", default="gpt-oss:20b", help="the model actually wanted")
     ft.add_argument("--queue", type=int, default=0, help="jobs already ahead of this one")
     ft.add_argument("--payload-bytes", type=int, default=8192, help="size of the work")
     ft.add_argument("--deadline", type=float, default=900.0, help="the caller's deadline")
@@ -1640,6 +2248,100 @@ def main(argv: list[str] | None = None) -> int:
         help="decide from this call alone: record nothing and read nothing back",
     )
     ft.set_defaults(func=_fit)
+
+    sl = sub.add_parser(
+        "slots",
+        help="how many runs of one local model fit on this device at once (8.c, 8.j):"
+        " measured per device, gated on the evidence",
+    )
+    sl_sub = sl.add_subparsers(dest="slots_action", required=True)
+    sl_corpus = sl_sub.add_parser(
+        "corpus", help="draw a stratified corpus of turn segments from a turn pool"
+    )
+    sl_corpus.add_argument("--pool", required=True, help="a vibey-gh/turn-pool/1 JSON-lines file")
+    sl_corpus.add_argument("--out", required=True, help="where the corpus is written")
+    sl_corpus.add_argument("--segments", type=int, default=16, help="segments to draw")
+    sl_corpus.add_argument(
+        "--segment-length", type=int, default=3, help="consecutive turns per segment"
+    )
+    sl_corpus.add_argument(
+        "--strata",
+        default="16384,32768,49152",
+        help="prompt-depth edges in tokens, comma-separated (default 16384,32768,49152)",
+    )
+    sl_corpus.add_argument(
+        "--min-per-stratum", type=int, default=2, help="segments every non-empty stratum keeps"
+    )
+    sl_corpus.add_argument("--seed", type=int, default=0, help="the sampling seed")
+    sl_allowed = sl_sub.add_parser(
+        "allowed",
+        help="print how many runs of the model may run at once on this device; the reason"
+        " goes to stderr, and missing or stale evidence requests a calibration",
+    )
+    sl_allowed.add_argument("--model", default="", help="default: [local_models] model")
+    sl_allowed.add_argument(
+        "--base-url", default="", help="the production runner (default: $VIBEY_OLLAMA_URL)"
+    )
+    sl_allowed.add_argument("--json", action="store_true", help="print the decision as JSON")
+    sl_allowed.add_argument(
+        "--strict", action="store_true", help="exit 2 when a declared number was refused"
+    )
+    sl_cal = sl_sub.add_parser(
+        "calibrate",
+        help="sweep N = 1, 2, ... concurrent runs on this device and record the evidence",
+    )
+    sl_cal.add_argument("--corpus", required=True, help="a corpus from `vibey-gh slots corpus`")
+    sl_cal.add_argument("--model", default="", help="default: [local_models] model")
+    sl_cal.add_argument(
+        "--context-window", type=int, default=0, help="default: [local_models] context_window"
+    )
+    sl_cal.add_argument(
+        "--base-url", default="", help="the production runner (default: $VIBEY_OLLAMA_URL)"
+    )
+    sl_cal.add_argument(
+        "--binary", default="", help="the runner binary (default: [local_models] ollama_binary)"
+    )
+    sl_cal.add_argument(
+        "--port", type=int, default=0, help="default: [local_models] calibration_port"
+    )
+    sl_cal.add_argument("--max-runs", type=int, default=0, help="default: [local_models] max_runs")
+    sl_cal.add_argument("--num-predict", type=int, default=768, help="output tokens per turn")
+    sl_cal.add_argument("--seed", type=int, default=42, help="the sampling seed (temperature 0)")
+    sl_cal.add_argument(
+        "--no-repeat-baseline",
+        action="store_true",
+        help="measure one slot once, not twice (fidelity is then judged against 1.0)",
+    )
+    sl_cal.add_argument(
+        "--extra",
+        action="append",
+        help="also measure N@CONTEXT after the sweep, e.g. 2@32768; recorded, never gating",
+    )
+    sl_cal.add_argument(
+        "--server-setting",
+        action="append",
+        help="an OLLAMA_NAME=VALUE the calibration runner starts with",
+    )
+    sl_cal.add_argument("--interval", type=float, default=1.0, help="seconds between samples")
+    sl_cal.add_argument("--lock", default="", help="default: [local_models] lock")
+    sl_cal.add_argument(
+        "--wait-idle",
+        type=float,
+        default=1800.0,
+        help="seconds to wait for the production runner to idle before giving up",
+    )
+    sl_cal.add_argument(
+        "--if-requested",
+        action="store_true",
+        help="calibrate only when `slots allowed` has requested it for this device",
+    )
+    sl_cal.add_argument("--log-dir", default="", help="where the calibration runner logs")
+    sl_cal.add_argument(
+        "--out",
+        default="",
+        help="also write the evidence (and a .md summary) here, after every step",
+    )
+    sl.set_defaults(func=_slots)
 
     es = sub.add_parser(
         "estimate",
@@ -1767,7 +2469,34 @@ def main(argv: list[str] | None = None) -> int:
     pp.add_argument("--author", required=True)
     pp.add_argument("--journal", action="store_true", help="journal layout instead of conference")
     pp.add_argument("--keywords", default="")
+    # What a submitted article states about itself, never typed by hand: with
+    # --provenance the revision and its commit time are read from git (or --revision),
+    # the render time from the clock, and the rest from these flags.
+    pp.add_argument(
+        "--provenance",
+        action="store_true",
+        help="state the revision, dates and authorship in the byline, first-page note and"
+        " wherever the source writes <!-- vibey:provenance -->",
+    )
+    pp.add_argument("--revision", default="", help="the revision to state (default: HEAD)")
+    pp.add_argument("--email", default="", help="the corresponding author's email address")
+    pp.add_argument("--affiliation", default="", help="the author's affiliation line")
+    pp.add_argument("--author-url", default="", help="the author's own address")
+    pp.add_argument("--site", default="", help="the published documentation site")
+    pp.add_argument("--repository", default="", help="the repository the revision belongs to")
     pp.set_defaults(func=_paper)
+    pf = sub.add_parser(
+        "paper-figures",
+        help="emit the paper's figures as standalone TeX, or inline their SVG renderings",
+    )
+    pf.add_argument("--source", default="docs/paper.md")
+    mode = pf.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--emit", help="write one standalone .tex per figure into this directory")
+    mode.add_argument("--inline", help="read <label>.svg files from this directory and inline them")
+    pf.add_argument(
+        "--output", default="", help="with --inline: where to write (default: the source)"
+    )
+    pf.set_defaults(func=_paper_figures)
     bk = sub.add_parser(
         "book",
         help="export the built docs site as an EPUB and a KDP print-ready HTML",
@@ -1870,6 +2599,22 @@ def main(argv: list[str] | None = None) -> int:
     rs = sub.add_parser("rulesets", help="reconcile the integration and release branch rulesets")
     rs.add_argument("--dry-run", action="store_true", help="decide without applying anything")
     rs.set_defaults(func=_rulesets)
+
+    # A thin delegate for people. The delegated approver never comes this way: it runs
+    # `python -m vibey_gh.approval_check`, so this module is not on its trust path.
+    ac = sub.add_parser(
+        "approve-check",
+        help="exit 0 only if every [unattended_approval] condition holds for a pull request",
+    )
+    ApprovalCheck.declare(ac).set_defaults(func=ApprovalCheck.dispatch)
+
+    # The release-surfaces workflow's announcement after a docs deploy: a concise changelog
+    # since the previous accepted announcement, grouped and capped, then the surface links.
+    an = sub.add_parser(
+        "announce",
+        help="post a published docs channel's concise changelog to the Discord webhook",
+    )
+    Announcer.declare(an).set_defaults(func=Announcer.dispatch)
 
     for surface in ("api", "mcp", "sdk", "webhook"):
         adapter = sub.add_parser(surface, help=f"invoke a capability through the {surface} adapter")

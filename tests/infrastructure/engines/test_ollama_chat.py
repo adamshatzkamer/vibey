@@ -8,19 +8,28 @@ from collections.abc import Mapping
 import pytest
 
 from vibey.domain.config import ConfigError
+from vibey.domain.errors import OutputBudgetExhausted
+from vibey.domain.job import FailureClass
 from vibey.infrastructure.engines.interfaces import (
     OllamaChatClientInterface,
     OllamaTransportInterface,
 )
 from vibey.infrastructure.engines.ollama_chat import (
+    DEFAULT_OLLAMA_CONTEXT,
     DEFAULT_OLLAMA_MODEL,
     DEFAULT_OLLAMA_TIMEOUT,
     DEFAULT_OLLAMA_URL,
+    OLLAMA_CONTEXT_ENV,
+    OLLAMA_FIT_ENV,
     OLLAMA_MODEL_ENV,
+    OLLAMA_OUTPUT_ENV,
+    OLLAMA_RETRY_THINK_ENV,
     OLLAMA_TIMEOUT_ENV,
     OLLAMA_URL_ENV,
+    VIBEY_REVISION_ENV,
     OllamaChatClient,
     UrllibOllamaTransport,
+    _load_fit,
 )
 
 
@@ -34,6 +43,18 @@ class FakeTransport:
     ) -> dict[str, object]:
         self.calls.append((url, dict(payload), timeout))
         return self.body
+
+
+class SequenceTransport(FakeTransport):
+    def __init__(self, bodies: list[dict[str, object]]) -> None:
+        super().__init__(bodies[0])
+        self.bodies = iter(bodies)
+
+    async def post_json(
+        self, url: str, payload: Mapping[str, object], *, timeout: int
+    ) -> dict[str, object]:
+        self.calls.append((url, dict(payload), timeout))
+        return next(self.bodies)
 
 
 def _answering(content: str) -> FakeTransport:
@@ -58,7 +79,7 @@ def test_the_defaults_are_todays_endpoint_and_model() -> None:
     """Configurable, and nothing about an unconfigured install changes (ADR-0018)."""
     client = OllamaChatClient()
     assert client.base_url == DEFAULT_OLLAMA_URL == "http://127.0.0.1:11434"
-    assert client.model == DEFAULT_OLLAMA_MODEL == "qwen2.5-coder:14b"
+    assert client.model == DEFAULT_OLLAMA_MODEL == "gpt-oss:20b"
     assert DEFAULT_OLLAMA_TIMEOUT == 900
     assert isinstance(client, OllamaChatClientInterface)
     assert isinstance(UrllibOllamaTransport(), OllamaTransportInterface)
@@ -75,11 +96,101 @@ def test_the_environment_chooses_the_endpoint_model_and_timeout() -> None:
             OLLAMA_URL_ENV: "https://gpu-box.internal:8443/",
             OLLAMA_MODEL_ENV: "qwen2.5-coder:32b",
             OLLAMA_TIMEOUT_ENV: "120",
+            OLLAMA_CONTEXT_ENV: "8192",
+            OLLAMA_OUTPUT_ENV: "1024",
         }
     )
     assert client.base_url == "https://gpu-box.internal:8443"
     assert client.model == "qwen2.5-coder:32b"
     assert client._timeout == 120
+    assert client._output_ceiling == 1024
+
+
+def test_invalid_context_configuration_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="VIBEY_OLLAMA_CONTEXT"):
+        OllamaChatClient(context_ceiling=1024)
+    with pytest.raises(ConfigError, match="VIBEY_OLLAMA_CONTEXT"):
+        OllamaChatClient.from_environment({OLLAMA_CONTEXT_ENV: "wide"})
+    with pytest.raises(ConfigError, match="VIBEY_OLLAMA_OUTPUT"):
+        OllamaChatClient(output_ceiling=0)
+    with pytest.raises(ConfigError, match="VIBEY_OLLAMA_OUTPUT"):
+        OllamaChatClient.from_environment({OLLAMA_OUTPUT_ENV: "many"})
+
+
+def test_valid_fit_overrides_defaults_and_stale_fit_is_ignored(tmp_path) -> None:
+    fit = tmp_path / "fit.json"
+    fit.write_text(
+        json.dumps(
+            {
+                "url": DEFAULT_OLLAMA_URL,
+                "model": DEFAULT_OLLAMA_MODEL,
+                "revision": "abc",
+                "prompt_shape": {"system_chars": 1, "user_chars": 1},
+                "selected_fit": {"valid": True, "context": 4096, "output": 1024},
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = OllamaChatClient.from_environment(
+        {OLLAMA_FIT_ENV: str(fit), VIBEY_REVISION_ENV: "abc"}
+    )
+    assert client.context_window(100) == 4096
+    assert client._output_ceiling == 1024
+    stale = OllamaChatClient.from_environment(
+        {OLLAMA_FIT_ENV: str(fit), VIBEY_REVISION_ENV: "different"}
+    )
+    assert stale._output_ceiling == 2048
+
+
+def test_the_probe_selected_fit_schema_is_consumed_without_translation(tmp_path) -> None:
+    """The probe persists ``valid``; the runtime must accept that exact record shape."""
+    fit = tmp_path / "fit.json"
+    fit.write_text(
+        json.dumps(
+            {
+                "url": DEFAULT_OLLAMA_URL,
+                "model": DEFAULT_OLLAMA_MODEL,
+                "revision": "probe-head",
+                "prompt_shape": {"system_chars": 22, "user_chars": 20},
+                "selected_fit": {
+                    "ok": True,
+                    "valid": True,
+                    "context": 8192,
+                    "output": 1024,
+                    "elapsed_seconds": 1.25,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _load_fit(str(fit), DEFAULT_OLLAMA_URL, DEFAULT_OLLAMA_MODEL, "probe-head") == {
+        "context": 8192,
+        "output": 1024,
+        "max_prompt_chars": 42,
+    }
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"url": "other", "model": DEFAULT_OLLAMA_MODEL},
+        {"url": DEFAULT_OLLAMA_URL, "model": DEFAULT_OLLAMA_MODEL, "selected_fit": {}},
+        {
+            "url": DEFAULT_OLLAMA_URL,
+            "model": DEFAULT_OLLAMA_MODEL,
+            "selected_fit": {"valid": True, "context": 1024, "output": 0},
+        },
+    ],
+)
+def test_invalid_fit_records_are_ignored(tmp_path, record) -> None:
+    fit = tmp_path / "fit.json"
+    fit.write_text(json.dumps(record), encoding="utf-8")
+    assert _load_fit(str(fit), DEFAULT_OLLAMA_URL, DEFAULT_OLLAMA_MODEL, None) is None
+    assert (
+        _load_fit(str(tmp_path / "missing.json"), DEFAULT_OLLAMA_URL, DEFAULT_OLLAMA_MODEL, None)
+        is None
+    )
 
 
 def test_an_explicit_model_beats_the_environment_and_empty_counts_as_unset() -> None:
@@ -111,6 +222,16 @@ def test_only_an_http_endpoint_with_a_host_is_accepted(url: str) -> None:
     startup, naming the variable to fix, not read a local file and call it an answer."""
     with pytest.raises(ConfigError, match="VIBEY_OLLAMA_URL: .*http\\(s\\) URL with a host"):
         OllamaChatClient(base_url=url)
+
+
+def test_a_refused_endpoint_is_named_and_never_echoed() -> None:
+    """A URL can carry `user:token@`, and this message reaches a terminal, a log and a CI
+    transcript: it names the variable, never the value."""
+    with pytest.raises(ConfigError) as refused:
+        OllamaChatClient(base_url="ftp://operator:s3cret-token@gpu-box/")
+
+    assert refused.value.path == "VIBEY_OLLAMA_URL"
+    assert "s3cret-token" not in str(refused.value)
 
 
 def test_the_environment_url_is_checked_too() -> None:
@@ -152,7 +273,7 @@ async def test_a_question_goes_out_constrained_and_deterministic() -> None:
     # is compiled to a grammar, so malformed JSON is unreachable rather than unlikely.
     assert payload["format"] == schema
     assert payload["stream"] is False
-    assert payload["options"] == {"temperature": 0, "num_ctx": 4096}
+    assert payload["options"] == {"temperature": 0, "num_ctx": 4096, "num_predict": 2048}
 
 
 @pytest.mark.asyncio
@@ -166,13 +287,61 @@ async def test_a_gateway_that_is_not_ollama_cannot_pass_for_an_answer() -> None:
             await OllamaChatClient(transport=FakeTransport(body)).ask("s", "u", {})
 
 
+@pytest.mark.asyncio
+async def test_empty_schema_reply_retries_once_in_json_mode() -> None:
+    transport = SequenceTransport(
+        [{"message": {"content": ""}}, {"message": {"content": '{"ok": true}'}}]
+    )
+    assert await OllamaChatClient(transport=transport).ask("s", "u", {"type": "object"}) == {
+        "ok": True
+    }
+    assert len(transport.calls) == 2
+    assert transport.calls[0][1]["format"] == {"type": "object"}
+    assert transport.calls[1][1]["format"] == "json"
+
+
+@pytest.mark.asyncio
+async def test_empty_json_fallback_is_rejected() -> None:
+    transport = SequenceTransport([{"message": {"content": ""}}, {"message": {"content": ""}}])
+    with pytest.raises(ValueError, match="empty message content"):
+        await OllamaChatClient(transport=transport).ask("s", "u", {"type": "object"})
+
+
+@pytest.mark.asyncio
+async def test_empty_json_mode_is_retried_once() -> None:
+    transport = SequenceTransport(
+        [{"message": {"content": ""}}, {"message": {"content": '{"ok": true}'}}]
+    )
+
+    result = await OllamaChatClient(transport=transport).ask("s", "u", "json")
+
+    assert result == {"ok": True}
+    assert len(transport.calls) == 2
+
+
 def test_the_context_window_is_sized_to_the_prompt() -> None:
     """Ollama's default window is far smaller than a full ledger, and overflowing it
     degrades generation from seconds to never-finishes rather than erroring."""
     client = OllamaChatClient()
     assert client.context_window(0) == 4096
-    assert client.context_window(300_000) == 32768
-    assert 4096 < client.context_window(60_000) < 32768
+    assert client.context_window(300_000) == DEFAULT_OLLAMA_CONTEXT == 8192
+    assert 4096 < client.context_window(10_000) < DEFAULT_OLLAMA_CONTEXT
+
+
+def test_the_context_ceiling_is_configurable_and_user_context_is_bounded() -> None:
+    transport = _answering('{"ok": true}')
+    client = OllamaChatClient(context_ceiling=8192, transport=transport)
+
+    import asyncio
+
+    asyncio.run(client.ask("system", "x" * 100_000, {"type": "object"}))
+    sent = transport.calls[0][1]
+    content = sent["messages"][1]["content"]
+    assert isinstance(content, str)
+    assert len(content) <= (8192 - client.CONTEXT_RESERVE) * client.CHARS_PER_TOKEN + 80
+    assert "context elided by sovereign client" in content
+    assert sent["options"]["num_ctx"] == 8192
+    assert sent["options"]["num_predict"] == 2048
 
 
 @pytest.mark.asyncio
@@ -218,3 +387,134 @@ async def test_the_transport_refuses_a_non_http_url_before_opening_anything() ->
     with pytest.raises(ValueError, match="refusing a non-HTTP model endpoint"):
         await UrllibOllamaTransport(opener=opener).post_json("file:///etc/passwd", {}, timeout=1)
     assert opened == []
+
+
+# A real reply from gpt-oss:20b, recorded from a local Ollama on 2026-09-22 (POST
+# /api/chat, stream false, the one user message below). GPT-OSS answers on two channels:
+# `thinking` carries its reasoning and `content` the answer, and only `content` is read.
+GPT_OSS_20B_REPLY: dict[str, object] = {
+    "model": "gpt-oss:20b",
+    "created_at": "2026-09-22T15:07:14.136724Z",
+    "message": {
+        "role": "assistant",
+        "content": '{"ok": true}',
+        "thinking": 'User says: "Reply with {"ok": true} and nothing else". So just '
+        "output that JSON exactly. No additional explanation.",
+    },
+    "done": True,
+    "done_reason": "stop",
+    "total_duration": 1850002459,
+    "load_duration": 39364084,
+    "prompt_eval_count": 77,
+    "prompt_eval_cached_count": 72,
+    "prompt_eval_duration": 116239000,
+    "eval_count": 41,
+    "eval_duration": 1616024000,
+}
+
+
+@pytest.mark.asyncio
+async def test_a_gpt_oss_reply_is_read_from_its_content_never_its_thinking() -> None:
+    message = GPT_OSS_20B_REPLY["message"]
+    assert isinstance(message, dict) and message["thinking"]  # a real reasoning channel
+    client = OllamaChatClient(transport=FakeTransport(GPT_OSS_20B_REPLY))
+    assert await client.ask("system", "user", {"type": "object"}) == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_thinking_alone_is_no_answer() -> None:
+    reply: dict[str, object] = {"message": {"role": "assistant", "thinking": '{"ok": true}'}}
+    client = OllamaChatClient(transport=FakeTransport(reply))
+    with pytest.raises(ValueError, match="no message content"):
+        await client.ask("system", "user", {"type": "object"})
+
+
+def _cut_short(content: str = "", *, prompt_tokens: int | None = 1000) -> dict[str, object]:
+    """gpt-oss:20b's reply when reasoning spends the whole budget (observed live)."""
+    body: dict[str, object] = {
+        "done_reason": "length",
+        "message": {"role": "assistant", "content": content, "thinking": "Let me think..."},
+    }
+    if prompt_tokens is not None:
+        body["prompt_eval_count"] = prompt_tokens
+    return body
+
+
+@pytest.mark.asyncio
+async def test_a_reply_cut_short_by_its_budget_is_retried_once_with_room_to_finish() -> None:
+    """done_reason=length with empty content: the reasoning ate the budget. The retry
+    doubles the budget within the context ceiling and asks for lighter reasoning."""
+    transport = SequenceTransport(
+        [_cut_short(), {"done_reason": "stop", "message": {"content": '{"ok": true}'}}]
+    )
+
+    result = await OllamaChatClient(transport=transport).ask("s", "u", "json")
+
+    assert result == {"ok": True}
+    first, second = (call[1] for call in transport.calls)
+    assert "think" not in first
+    assert first["options"] == {"temperature": 0, "num_ctx": 4096, "num_predict": 2048}
+    assert second["think"] == "low"
+    assert second["format"] == "json"
+    # 1000 prompt tokens (reported by the server) + a doubled 4096-token budget.
+    assert second["options"] == {"temperature": 0, "num_ctx": 5096, "num_predict": 4096}
+
+
+@pytest.mark.asyncio
+async def test_a_second_cut_short_reply_is_a_typed_capacity_failure() -> None:
+    transport = SequenceTransport([_cut_short(), _cut_short()])
+
+    with pytest.raises(OutputBudgetExhausted) as caught:
+        await OllamaChatClient(model="gpt-oss:20b", transport=transport).ask("s", "u", "json")
+
+    assert caught.value.failure_class is FailureClass.CAPACITY
+    assert (caught.value.output_tokens, caught.value.context_tokens) == (4096, 5096)
+    assert "VIBEY_OLLAMA_OUTPUT" in str(caught.value)
+    assert len(transport.calls) == 2  # bounded: never a third request
+
+
+@pytest.mark.asyncio
+async def test_truncated_json_or_a_missing_message_at_the_limit_is_cut_short_too() -> None:
+    for first in (_cut_short('{"questions": [{"te'), {"done_reason": "length"}):
+        transport = SequenceTransport([first, {"message": {"content": '{"ok": 1}'}}])
+        assert await OllamaChatClient(transport=transport).ask("s", "u", "json") == {"ok": 1}
+        assert len(transport.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_whole_answer_that_ends_at_the_limit_is_accepted_without_a_retry() -> None:
+    transport = SequenceTransport([_cut_short('{"ok": true}')])
+    assert await OllamaChatClient(transport=transport).ask("s", "u", "json") == {"ok": True}
+    assert len(transport.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_widened_budget_never_outgrows_the_context_ceiling() -> None:
+    """With the prompt estimated (no prompt_eval_count) and nearly filling the window,
+    the retry grows the budget only as far as the window allows, not to double."""
+    transport = SequenceTransport(
+        [_cut_short(prompt_tokens=None), {"message": {"content": '{"ok": true}'}}]
+    )
+    client = OllamaChatClient(context_ceiling=8192, retry_think=None, transport=transport)
+
+    await client.ask("s", "x" * 18_000, "json")  # ~6000 estimated prompt tokens
+
+    second = transport.calls[1][1]
+    assert "think" not in second  # "none" keeps the model's own reasoning default
+    assert second["options"]["num_predict"] == 2192
+    assert second["options"]["num_ctx"] == 8192
+
+
+def test_the_retry_reasoning_level_is_configurable_and_checked() -> None:
+    assert OLLAMA_RETRY_THINK_ENV == "VIBEY_OLLAMA_RETRY_THINK"
+    assert OllamaChatClient.from_environment({})._retry_think == "low"
+    high = OllamaChatClient.from_environment({OLLAMA_RETRY_THINK_ENV: " HIGH "})
+    assert high._retry_think == "high"
+    unset = OllamaChatClient.from_environment({OLLAMA_RETRY_THINK_ENV: "none"})
+    assert unset._retry_think is None
+    off = OllamaChatClient.from_environment({OLLAMA_RETRY_THINK_ENV: "false"})
+    assert off._retry_think is False
+    with pytest.raises(ConfigError, match="VIBEY_OLLAMA_RETRY_THINK: must be one of"):
+        OllamaChatClient.from_environment({OLLAMA_RETRY_THINK_ENV: "loud"})
+    with pytest.raises(ConfigError, match="VIBEY_OLLAMA_RETRY_THINK: must be one of"):
+        OllamaChatClient(retry_think="loud")

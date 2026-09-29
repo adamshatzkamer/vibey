@@ -8,6 +8,10 @@ tree. `.importlinter` enforces it.
 
 from __future__ import annotations
 
+from vibey_gh.interfaces.approval_check_interface import (
+    ApprovalCheckInterface,
+    ApprovalVerdictInterface,
+)
 from vibey_gh.interfaces.book_interface import (
     BookChapterInterface,
     BookErrorInterface,
@@ -34,6 +38,7 @@ from vibey_gh.interfaces.class_contracts import (
     ForgeCommentInterface,
     ForgeIssueInterface,
     ForgejoForgeInterface,
+    ForgejoTransportInterface,
     ForgeKindInterface,
     ForgeLabelInterface,
     ForgeReleaseInterface,
@@ -56,6 +61,7 @@ from vibey_gh.interfaces.class_contracts import (
     MarketplaceErrorInterface,
     MergeQueueConfigInterface,
     ModelInterface,
+    NotSupportedInterface,
     ObservationInterface,
     OllamaModelSamplerInterface,
     OperationEstimateInterface,
@@ -73,6 +79,7 @@ from vibey_gh.interfaces.class_contracts import (
     ReviewThreadInterface,
     RulesetConfigInterface,
     RulesetsConfigInterface,
+    RunnersConfigInterface,
     SampleInterface,
     SnapshotStoreErrorInterface,
     StageInterface,
@@ -112,7 +119,17 @@ from vibey_gh.interfaces.forge_snapshot_interface import (
     ChainHeadInterface,
     ForgeReadInterface,
 )
-from vibey_gh.interfaces.paper_interface import PaperDocumentInterface, PaperErrorInterface
+from vibey_gh.interfaces.local_review_interface import (
+    SizedChatInterface,
+    WholeReviewInterface,
+)
+from vibey_gh.interfaces.paper_interface import (
+    PaperDocumentInterface,
+    PaperErrorInterface,
+    PaperFigureInterface,
+    PaperProvenanceInterface,
+    RevisionReaderInterface,
+)
 from vibey_gh.interfaces.review_composition_interface import (
     ReviewComposerInterface,
     ReviewComposerPort,
@@ -124,6 +141,8 @@ from vibey_gh.interfaces.review_contract_interface import (
 
 __all__ = [
     "AppendOutcomeInterface",
+    "ApprovalCheckInterface",
+    "ApprovalVerdictInterface",
     "AutomationStateInterface",
     "BillingForecastInterface",
     "BillingLedgerReaderInterface",
@@ -167,6 +186,7 @@ __all__ = [
     "ForgeTransportInterface",
     "ForgeUserInterface",
     "ForgejoForgeInterface",
+    "ForgejoTransportInterface",
     "GapInterface",
     "GhConfigInterface",
     "GitHubForgeInterface",
@@ -186,11 +206,14 @@ __all__ = [
     "MergeQueueConfigInterface",
     "ModelInterface",
     "NavReaderInterface",
+    "NotSupportedInterface",
     "ObservationInterface",
     "OllamaModelSamplerInterface",
     "OperationEstimateInterface",
     "PaperDocumentInterface",
     "PaperErrorInterface",
+    "PaperFigureInterface",
+    "PaperProvenanceInterface",
     "PhiConfigInterface",
     "PipelineVerdictInterface",
     "PlatformConfigInterface",
@@ -210,9 +233,12 @@ __all__ = [
     "ReviewContractInterface",
     "ReviewContractPort",
     "ReviewThreadInterface",
+    "RevisionReaderInterface",
     "RulesetConfigInterface",
     "RulesetsConfigInterface",
+    "RunnersConfigInterface",
     "SampleInterface",
+    "SizedChatInterface",
     "SnapshotStoreErrorInterface",
     "StageInterface",
     "StageVerdictInterface",
@@ -221,6 +247,7 @@ __all__ = [
     "TidyConfigInterface",
     "TrackRecordInterface",
     "VerdictInterface",
+    "WholeReviewInterface",
     "WorkHistoryInterface",
     "_ChainInterface",
 ]

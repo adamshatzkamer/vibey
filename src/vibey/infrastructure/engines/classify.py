@@ -6,11 +6,11 @@ The four runners emit the *loop family's shared CapacityState shape in
 spirit (domain/capacity.py's docstring: "inherited from the *loop family,
 unchanged in spirit"), but each vendor's own error payload -- what actually
 comes back from the provider before the runner normalizes it -- has a
-different shape. No real captured vendor payloads were available while
-building this (no live accounts, no docker to run the real binaries), so
-the per-engine parsers below encode a plausible, clearly-documented shape
-per vendor; they are the seam a real captured-payload fixture would replace
-without touching anything above classify_capacity's call site.
+different shape. Most per-engine parsers below still encode a plausible,
+clearly-documented shape per vendor rather than a captured payload, because
+no live accounts were available for them; they are the seam a real
+captured-payload fixture would replace without touching anything above
+classify_capacity's call site.
 
 What is load-bearing and *is* tested exhaustively here: credits and window
 exhaustion are never confused, regardless of which engine's payload shape
@@ -109,7 +109,7 @@ def _classify_codexloop(raw: Mapping[str, object]) -> CapacityState:
         return CreditsExhausted(can_purchase=True)
     if code == "rate_limit_exceeded":
         return WindowExhausted(resets_at=_parse_dt(error.get("reset_at")), rate_limit_type="rpm")
-    if code in ("invalid_api_key", "unauthorized"):
+    if code in ("invalid_api_key", "unauthorized", "forbidden"):
         return AuthenticationFailed(detail=str(error.get("message", "")))
     return Available()
 
@@ -127,7 +127,7 @@ def _classify_cursorloop(raw: Mapping[str, object]) -> CapacityState:
 
             resets_at = datetime.now(UTC) + timedelta(seconds=retry_after)
         return WindowExhausted(resets_at=resets_at, rate_limit_type="requests")
-    if status == 401 or kind == "unauthorized":
+    if status in (401, 403) or kind == "unauthorized":
         return AuthenticationFailed(detail=str(raw.get("message", "")))
     return Available()
 
@@ -167,6 +167,8 @@ _CLASSIFIERS = {
     EngineId.CODEXLOOP: _classify_codexloop,
     EngineId.CURSORLOOP: _classify_cursorloop,
     EngineId.AGYLOOP: _classify_agyloop,
+    # The same runner, so the same lifecycle states (ADR-0064).
+    EngineId.GPTOSSLOOP: _classify_qwenloop,
     EngineId.QWENLOOP: _classify_qwenloop,
     EngineId.CLAUDELOOP_LOCAL: _classify_claudeloop,
 }
@@ -189,6 +191,7 @@ CREDITS_FIXTURES: dict[EngineId, dict[str, object]] = {
         "quota_metric": "billing.generate_content",
         "billing_exhausted": True,
     },
+    EngineId.GPTOSSLOOP: {"local_state": "credits_exhausted"},
     EngineId.QWENLOOP: {"local_state": "credits_exhausted"},
     # The class-name shape claudeloop really writes; claudeloop-local's runtime
     # never emits it, like qwenloop's, but the shared conformance check does.
@@ -212,6 +215,7 @@ WINDOW_FIXTURES: dict[EngineId, dict[str, object]] = {
         "quota_metric": "generate_content_free_tier_requests",
         "retry_after": "30s",
     },
+    EngineId.GPTOSSLOOP: {"local_state": "busy", "retry_at": "2026-01-01T00:05:00+00:00"},
     EngineId.QWENLOOP: {"local_state": "busy", "retry_at": "2026-01-01T00:05:00+00:00"},
     # A local server answering 503 (busy loading a model): claudeloop waits on it.
     EngineId.CLAUDELOOP_LOCAL: {
@@ -228,6 +232,7 @@ AUTH_FIXTURES: dict[EngineId, dict[str, object]] = {
     EngineId.CODEXLOOP: {"error": {"code": "invalid_api_key", "message": "bad key"}},
     EngineId.CURSORLOOP: {"status": 401, "type": "unauthorized", "message": "bad token"},
     EngineId.AGYLOOP: {"grpc_status": "UNAUTHENTICATED", "detail": "adc not found"},
+    EngineId.GPTOSSLOOP: {"local_state": "configuration_error", "detail": "model missing"},
     EngineId.QWENLOOP: {"local_state": "configuration_error", "detail": "model missing"},
     EngineId.CLAUDELOOP_LOCAL: {"capacity": "BackendMisconfigured"},
 }
@@ -237,6 +242,7 @@ AVAILABLE_FIXTURES: dict[EngineId, dict[str, object]] = {
     EngineId.CODEXLOOP: {},
     EngineId.CURSORLOOP: {"status": 200},
     EngineId.AGYLOOP: {"grpc_status": "OK"},
+    EngineId.GPTOSSLOOP: {"local_state": "available"},
     EngineId.QWENLOOP: {"local_state": "available"},
     EngineId.CLAUDELOOP_LOCAL: {"capacity": "Available"},
 }

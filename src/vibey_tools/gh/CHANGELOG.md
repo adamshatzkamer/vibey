@@ -5,6 +5,171 @@ This file follows Keep a Changelog and semantic versioning conventions.
 
 ## Unreleased
 
+- **Feature:** `[documentation] cookie_consent` (default on) keeps the GA4 snippet lawful:
+  with a measurement ID configured, every published page and the channel-picker index
+  deny analytics storage by default (Google Consent Mode v2) and show an accept/decline
+  banner whose choice is remembered per browser, so no analytics cookie is set before
+  the reader accepts. `false` renders the plain gtag snippet; with no measurement ID
+  nothing renders either way. See configuration.md.
+- **Feature:** `[documentation] site_root_files` declares repository-relative files copied
+  by basename into the Pages root on every release-surfaces deploy — the declared answer
+  to Search Console's "HTML file" verification, which a hand-uploaded file cannot give
+  because each rebuild wipes the Pages root. Entries must stay inside the repository,
+  carry no whitespace or shell metacharacters, and have unique file names; a declared
+  file missing from the checkout fails the deploy rather than publishing without it.
+  Empty (the default) copies nothing. See configuration.md.
+
+- **Feature:** `vibey-gh announce` posts a concise changelog with every documentation deploy,
+  replacing the release-surfaces workflow's inline announcement. It lists one line per merged
+  change (its Conventional Commit subject, the type turned into a word, the PR linked), grouped
+  Breaking / Added / Fixed / Other with breaking changes first and never dropped, and caps the
+  list at `[announce] max_changes` with `…and N more`. Merge and release chores are counted, not
+  listed, and the surface links follow. The message fits Discord's 2000 characters by
+  construction, and a hostile subject can neither ping nor format it. The range is the
+  commits since the previous accepted announcement, read from the Actions API through each
+  run's `run-name` and the `Record the announced position` marker step. A history that could
+  not be read is announced as unknown and never recorded, so the next announcement covers the
+  span again. The first announcement, a force-push, and an exhausted window re-anchor, and say
+  so. A re-run of an announced commit posts nothing. A release announces its `CHANGELOG.md`
+  section. Branches and tag prefixes may contain `/`. No
+  webhook is a notice and a failed post a `::warning::`. The deploy never fails and the URL is
+  never printed. New `[announce]` table; see configuration.md and operations.md.
+- **Fix:** a whole review's documents have a limit of their own, `[pr_automation.fallback]
+  max_document_chars` (default 120,000, at least 1000; `--max-document-chars`, passed by the
+  workflow), instead of sharing `max_diff_chars`. Tied to the diff's 60,000, this repository's
+  own README.md and docs/index.md already took 59,607 of it; 394 more characters of README cut
+  docs/index.md, the verdict claimed the diff half alone, and with no paid review declared every
+  pull request's gate went red for a human. The documents are now also budgeted from the request
+  as sent, check codes included, so documents trimmed to the window are never then refused for
+  not fitting it. A model-server error whose body breaks off mid-read (`IncompleteRead`) is
+  still a clean refusal in the status line's words.
+- **Fix:** an honest sovereign heartbeat that passes the pre-push gate by the gate's own rule
+  (vibey ADR-0060). `sovereign --beat` publishes only while a runner carrying `runner_label` is
+  registered and online and `base_url` answers with `model`, and says `heartbeat withheld: …`
+  otherwise; `--record FILE` writes what it did. It pushes without `--no-verify` and replaces
+  the previous heartbeat by `--force-with-lease` on the exact value read. New `push-scope`
+  command and pre-push hook rule: a push whose every ref is outside `refs/heads/` and
+  `refs/tags/` and whose every commit is the empty tree with no parents has nothing for the
+  heavy stage to judge; anything else runs the full gate. New `heartbeat install|status|
+  uninstall` (and `runner install`/`uninstall` do it too): a launchd agent or a systemd user
+  timer, beating at most every half trust window, with new `[runners]` keys
+  `heartbeat_scheduler`, `heartbeat_interval_minutes`, `heartbeat_python`, `heartbeat_log_dir`
+  and `systemd_user_dir`. `runner cleanup` never retires the declared heartbeat timer.
+
+- **Fix:** a local review never returns a verdict on a prompt the model did not read in full,
+  and says when the model ran out of room (#1090). What #1090 was: its whole review sent about
+  124,000 characters, which the model counted as 31,765 prompt tokens (about 3.95 characters
+  per token), and 31,765 read plus 1,004 generated is 32,769 -- the whole 32,768 window. It
+  read its whole prompt and ran out of GENERATION room (`done_reason=length`), which surfaced as
+  "Unterminated string". It was not truncated. `answer` now reads `done_reason` first and says
+  `the model ran out of room`. What the investigation found besides: truncation IS possible on
+  this host. Left to its defaults Ollama 0.34.2 does not refuse an oversized prompt; it cut a
+  36,798-token request (gpt-oss:20b, `num_ctx` 32768) to 16,386 tokens -- about half the window
+  -- with no error, and a model that read half a diff could return `{"pass": true}`. That is
+  now refused three ways. Requests are sized from everything sent and must fit the new declared
+  `[pr_automation.fallback] context_window` (default 65,536, this host's measured window) beside
+  `reasoning_reserve_tokens` (8,192), or are not sent. Every `/api/chat` payload -- review,
+  whole review and triage -- carries `truncate: false` and `shift: false`, so Ollama 0.34
+  answers an oversized prompt with HTTP 400, reported as `the model server refused the request
+  (HTTP 400): …` in the server's words, never as "unreachable". And every request carries a
+  random check code at the start of the system prompt and another after the diff, which the
+  answer must echo in a free-string schema field (never a `const`: constrained decoding would
+  fake it); on this host the cut prompt above echoed only the first. The upper-bound check on
+  `prompt_eval_count` stays. The diff half now refuses a diff past `max_diff_chars` instead of
+  cutting it: its `pass` is carried as the verdict on the diff. A whole review never cuts the
+  diff; its optional documents give way in the order `context_paths` declares (new
+  `--context-paths` flag, passed by the workflow), the model is told by name which were cut or
+  left out, and the verdict then claims the diff half alone, so the composer refuses it as the
+  whole review and the gate asks a human. New keys `chars_per_token` (3, 1–8) and `think` (empty:
+  the model's default), and `local-review` / `local-triage` flags `--context-window`,
+  `--reasoning-reserve`, `--chars-per-token` and `--think`, validated as the keys are, which
+  both workflows now pass from the declared table.
+
+- `runner install [--load]`, `runner check`, `runner cleanup [--apply]` and
+  `runner uninstall [--apply]`: the sovereign review runner stood up from the tree (12.c).
+  A new `[runners]` table declares the repository it registers with, its LaunchAgent prefix,
+  install and log paths, image, runner release, container model URL, AC rule, throttle,
+  failure limit, `PATH`, and `gh_config_dir`, the runner's own file-based gh login. The
+  supervisor, Dockerfile, entrypoint and LaunchAgent ship as templates under
+  `vibey_gh/templates/runner/`. The supervisor now takes every setting from its unit (no
+  repository default), uses only `GH_CONFIG_DIR`'s file-based token (clearing `GH_TOKEN` and
+  `GITHUB_TOKEN`, refusing a keyring-held or world-readable login), checks Docker and its
+  image explicitly instead of dying silently under `set -e`, and hands the registration
+  token to the container through the environment rather than the argv. It names the
+  configured host on every `gh` call, reaps only offline runners whose label equals its own
+  (passed to jq with `--arg`), refuses a `GH_CONFIG_DIR` that resolves to gh's default
+  directory, and stops on TERM or INT without registering again. The runner image installs
+  noble's `liblttng-ust1t64` and `libssl3t64`. `install` loads nothing without `--load`, and
+  exits non-zero when launchd refuses the agent; `check` asks GitHub whether the token is
+  accepted; `cleanup` and `uninstall` are dry runs without `--apply`, and cleanup moves
+  plists aside without ever replacing an earlier retired copy.
+
+- **Breaking:** `[pr_automation] paid_review` (default `false`) is the declaration sub-doctrine
+  8.b asks for before the exact-head review reaches a paid model. Undeclared, the paid
+  `review` job is skipped before it is scheduled and the sovereign lane answers the whole
+  review (`vibey-gh local-review --scope full --context-dir DIR`, judged against the new
+  `[pr_automation.fallback] context_paths`, default `["README.md", "docs/index.md"]`), recorded
+  by the new `Record the sovereign whole review` job through `vibey-gh pr-automation combine
+  --half none`, which refuses any verdict that did not answer both halves. An outside author,
+  a fork, a lane switched off, a runner with no fresh heartbeat or a local model with no
+  verdict each fail the gate with `needs a human review: <why> (no paid review is declared,
+  8.b)`. `true` keeps the two-lane review exactly as it was. `[pr_automation] paid_repair` and
+  `paid_conflict_resolution` (both default `false`) declare the repair and conflict-resolution
+  jobs the same way: undeclared, neither (nor `mirror-fork` on its behalf) is scheduled, and
+  failing scans or a conflict are reported as `needs a human: automated <repair|conflict
+  resolution> needs a paid model, and none is declared (8.b)`. Every local verdict now names
+  the halves it answered under `scope`, and `vibey-gh sovereign` writes its `reason=` to the
+  job output beside `ready=`. The review, repair and conflict-resolution jobs report an
+  `is_error` execution record as `the paid <job> was refused by the API: <reason or "no
+  reason given">`, and the gate repeats it; the facts line no longer reads `is_error: false`
+  as `unknown`.
+
+- `approve-check PR [--head SHA] [--approve] [--body TEXT]`: the delegated approver's grant,
+  enforced by code; `--approve` submits one approval pinned to `--head`, only after every
+  condition held. `python -m vibey_gh.approval_check` is the same command without the CLI,
+  and the form the delegated approver is granted; its whole import closure is forbidden to
+  it. Exits 0 only when every `[unattended_approval]` condition holds for the pull request — `enabled`,
+  the live switch reading exactly its value, the author in `authors` (expanded by
+  `expand_authors`), the base in `branches`, no changed file in `forbidden_paths` (a `**/`
+  also matches zero directories; one hit refuses the whole pull request; an unlistable or
+  truncated listing refuses), every check and status on the head green with both merge-train
+  gates, and the authenticated account neither the author nor a commit author — and prints
+  each refusal otherwise. New `[unattended_approval]` keys `switch_variable` (default
+  `VIBEY_UNATTENDED_APPROVAL`) and `switch_value` (default `on`) declare the live switch.
+
+- **Breaking:** the merge train admits no stranger (vibey ADR-0053, sub-doctrine 12.j). A
+  pull request whose author is not the owner or in `[merge_train] trusted_authors`, or that
+  carries `vibey-gh:external-repair`, is never merged unattended: it is held, labelled, and
+  reported "needs a human merge: author <login> is not in [merge_train] trusted_authors",
+  regardless of `[pr_automation] enabled`, the state of its gates (held before they report)
+  or an approving review. The owner's one-time notice is built from that reason, so a
+  trusted author's `external-repair` hold is not misreported as an untrusted author. Before, the
+  list bound only with PR automation off, so with it on a stranger's pull request merged on
+  a model's review verdict. Dependabot's pull requests now wait for a person; add a login to
+  `trusted_authors`, in a reviewed diff, to change that.
+- **Breaking:** `merge-train` no longer retries a refused merge with `gh pr merge --admin`.
+  A refusal is reported "needs a human merge: <GitHub's reason>" and the pass continues.
+  `--admin-fallback` turns the retry on for one run; it is a flag a person passes, and no
+  configuration key can make it the default (sub-doctrine 12.d). No rendered workflow
+  passes it.
+- **Breaking:** `promote --wait` gets the same rule. A refused promotion merge is reported
+  "#N needs a human merge: <GitHub's reason>" instead of being retried with `--admin`;
+  `promote --wait --admin-fallback` restores the retry for one run, and `--admin-fallback`
+  without `--wait` is refused (exit 2) rather than silently ignored. `promote.merge` now
+  returns `(merged, bypassed, error)`.
+- Split `pr-automation.yml` into `pr-evaluate.yml` (PR evaluate) and `pr-review.yml`
+  (PR review) with two required check runs instead of one, so a red gate names its task:
+  `PR evaluate / gate` certifies every configured scan settled on the exact head (red scan
+  gate titles carry the failing checks), and `PR review / gate` certifies the structured
+  exact-head review returned a verdict. `pr-evaluate.yml` answers to `pull_request_target`
+  and `workflow_run`, publishes the scan gate (suppressed for `conflict`, resolved in
+  pr-review), and dispatches `pr-review.yml` for `ready`/`review`/`repair`/`conflict`;
+  `pr-review.yml` answers only to `workflow_dispatch`, carries review/repair/mirror-fork/
+  resolve-conflict/escalate verbatim, publishes the review gate, and dispatches the merge
+  train. `[workflow_names] pr_automation` becomes `pr_evaluate`/`pr_review`;
+  `merge-train`'s gates become both new names; `automation-bootstrap` and the default
+  ignored/ruleset check lists gain both. The legacy `PR automation / gate` name is kept in
+  the ignored lists so old check runs on existing heads are never counted as scans.
 - Test that the rendered `commit-msg` and `pre-push` hooks reach their `<hook>.local`
   sibling when git runs them from a linked worktree, where `.git` is a file rather than
   a directory. The test drives a real `git commit` and `git push` against a bare remote,

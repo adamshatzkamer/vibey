@@ -21,8 +21,8 @@ Be clear about this before you install anything:
 - **Every engine ships in the image; none is configured by default.**
   Since [ADR-0037](../architecture/decisions/0037-one-distribution-one-version.md)
   the one `vibey` wheel carries all five runners, so the image puts
-  `claudeloop`, `codexloop`, `cursorloop`, `agyloop` and `qwenloop` on
-  `PATH` beside `vibey` (CI's `image` job asserts every console script
+  `claudeloop`, `codexloop`, `cursorloop`, `agyloop`, `gptossloop` and
+  `qwenloop` on `PATH` beside `vibey` (CI's `image` job asserts every console script
   resolves). The chart still defaults to `worker.provider: scripted` with
   no `worker.engines` and no keys, and that is the install CI deploys. Its
   worker logs `no recorded conformance for agyloop, claudeloop, codexloop,
@@ -54,7 +54,7 @@ Be clear about this before you install anything:
   `engine-auth` as `FAIL` for any of them without a key (see
   [Preflight from inside a pod](#preflight-from-inside-a-pod)).
 - **The operator is implemented, but off by default.** `vibey operator`
-  (`pip install 'vibey[operator]'`) runs kopf handlers that create
+  (`pip install 'vibey-engine[operator]'`) runs kopf handlers that create
   projects and apply `spec.answers` through the same application services
   `vibey new` / `vibey answer` use, then reconcile `VibeyProject` status
   every 15s. The chart does not install it unless you set
@@ -126,10 +126,39 @@ worker applies migrations itself at startup.
 The built-in Postgres is **development only** — `postgres.password`
 defaults to `vibey` in plain values. For anything real, set
 `postgres.enabled: false` and point `dsn.existingSecret` at a Secret
-whose `dsn` key (or the key named by `dsn.existingSecretKey`) holds the
-managed instance's DSN. The chart injects it as `VIBEY_PG_URL` into the
-worker and, when enabled, the operator. Use a fully qualified host or an
-IP address: KEDA reads the same DSN from another namespace.
+with two keys
+([ADR-0055](../architecture/decisions/0055-the-ledger-is-append-only-by-the-database.md)):
+
+- `dsn` (or the key named by `dsn.existingSecretKey`) is the application role's DSN. The
+  chart injects it as `VIBEY_PG_URL` into the worker and, when enabled, the operator.
+- The owner's DSN, under the key `dsn.existingSecretMigrateKey` names. It is mounted
+  only into the `migrate` init container, which runs `vibey migrate`: it applies
+  migrations, creates the application role if it is missing, grants it exactly the
+  declared privileges, and fails the pod if that role could still rewrite the ledger.
+
+`dsn.existingSecretMigrateKey` is empty by default, which makes a single-DSN install, so
+an existing Secret keeps working after an upgrade until you name an owner key. The worker then
+migrates as the one role, and `vibey doctor --cluster` fails `ledger-guard` until the roles
+are split ([database roles](../reference/configuration.md#database-roles)). Use a fully
+qualified host or an IP address: KEDA reads the application's DSN from another namespace.
+
+The built-in Postgres (`postgres.enabled: true`) does this for you: `postgres.user` is the
+owner and `postgres.appRole` (default `vibey_app`) the application role. Each surface
+database (`postgres.additionalDatabases`) is owned by a login role of the same name whose
+password is `postgres.additionalDatabasePasswords.<name>`; the postgres container creates
+it and hands it its database on every start, so an existing install is converted on
+upgrade and no surface pod holds the owner's credentials.
+
+Every connection to the built-in Postgres authenticates with scram-sha-256, local and
+remote alike (sub-doctrine 10.j,
+[ADR-0061](../architecture/decisions/0061-every-postgresql-connection-authenticates-with-scram-sha-256.md)).
+The chart ships the server's `pg_hba.conf` as the `<release>-postgres-hba` ConfigMap and
+points `hba_file` at it on every start, so an install created before this rule follows it
+after an upgrade. It also sets `password_encryption=scram-sha-256`. The method is not a
+value you can change. A managed instance must meet the same rule: require scram-sha-256
+for every role vibey and the surfaces connect as, with no `trust`, `md5` or clear-text
+`password` rule that could match them. See `SECURITY.md` §7 for the lines;
+`vibey doctor --cluster`'s `local-auth` does not pass until they are set.
 
 The `wait-for-postgres` init container is rendered only for the built-in
 Postgres. Against a managed instance the worker connects directly at
@@ -220,7 +249,7 @@ check fails:
 | `dsn-host` | the DSN host is fully qualified, an IP address, or `localhost`, so KEDA's operator in another namespace can resolve it |
 | `non-root` | the process uid is not 0 |
 | `workspace-writable` | the working directory (`/work` in the chart) accepts a write |
-| `engine-auth` | every engine named by `--engines`, plus claudeloop under `--provider claudeloop`, is on `PATH` and has one of its API-key variables set (qwenloop takes none). With neither flag nothing is required: it passes and reports which engines in the worker's default pool have a key, so a default install says plainly that no engine-driven job can run |
+| `engine-auth` | every engine named by `--engines`, plus claudeloop under `--provider claudeloop`, is on `PATH` and has one of its API-key variables set (gptossloop and qwenloop take none). With neither flag nothing is required: it passes and reports which engines in the worker's default pool have a key, so a default install says plainly that no engine-driven job can run |
 | `database` | the DSN connects |
 | `migrations` | every file in `/app/migrations` is recorded in `schema_migration`; runs only when `database` connected |
 
@@ -351,13 +380,26 @@ interview gates.
 
 The CR also accepts `maxCycleTurns` and
 `skillsContext: {mode, budget, timeout_seconds}` (`mode` is `off`,
-`shadow`, or `inject`; `budget` is 1,000–32,000, default 6,000).
-`spec.engines` is restricted by the CRD schema to the four paid engines,
-so `qwenloop` cannot be named in a CR today. The worker accepts
-`--provider qwenloop` (chart value `worker.provider`) for the sovereign
-DESIGN provider. That provider talks to a local Ollama over HTTP rather
-than running the `qwenloop` binary (which the image does ship), so it
-needs a model server the pod can reach; the chart does not provide one.
+`shadow`, or `inject`; `budget` is 1,000–32,000, default 6,000). `gates`
+(`{timeout_seconds, kill_grace_seconds, isolate_python_env, env_allow}`) and
+`engineEnvironment` (`{allow, engines: {<engine id>: [...]}}`) declare what a gate
+command and an engine session may see of the worker's environment, the same objects
+as `vibey.toml`'s [`[gates]`](../reference/configuration.md#gates) and
+[`[engine_environment]`](../reference/configuration.md#engine_environment); a
+forbidden entry (`VIBEY_*`, `PG*`, a DSN) is refused before the project is created.
+`spec.engines` is restricted by the CRD schema to the known engine ids
+(`claudeloop`, `codexloop`, `cursorloop`, `agyloop`, `gptossloop`,
+`qwenloop`, `claudeloop-local`). The worker accepts
+`--provider gptossloop` (chart value `worker.provider`; `qwenloop` is still
+read as gptossloop, ADR-0064) for the sovereign DESIGN provider. That
+provider talks to a local Ollama over HTTP rather than running the
+`gptossloop` binary (which the image does ship), so it needs a model server
+the pod can reach: `ollama.enabled` runs one in the release and points the
+worker at it (`VIBEY_OLLAMA_URL`/`VIBEY_OLLAMA_MODEL`, and
+`GPTOSSLOOP_BASE_URL`/`GPTOSSLOOP_MODEL` for the gptossloop engine).
+`ollama.qwenloopFeature: true` also switches qwenloop on, hands it
+`QWENLOOP_BASE_URL`/`QWENLOOP_MODEL` (`ollama.qwenModel`, default
+`qwen3:14b`) and pulls that model too; it is off by default.
 
 The operator creates the project on first reconcile, then re-reconciles
 every 15s. It applies any new `spec.answers` through the same gate-answer
@@ -439,7 +481,7 @@ inside the pod, with the worker's `--engines` and `--provider` (see
 | `worker.waitForProjectSeconds` | `15` | park instead of restart-looping |
 | `worker.parallelism` | `2` | concurrent job loops per pod |
 | `worker.project` | `""` | **set this**; empty binds to the newest project |
-| `worker.provider` | `scripted` | DESIGN/decompose provider; `claudeloop` needs its API key, `qwenloop` a reachable Ollama |
+| `worker.provider` | `scripted` | DESIGN/decompose provider; `claudeloop` needs its API key, `gptossloop` a reachable Ollama (`qwenloop` is read as gptossloop) |
 | `worker.engines` | `""` | comma-separated engine allow-list (`--engines`); empty means all; pass the same list to `doctor --cluster --engines` |
 | `worker.replicas` | `1` | ignored once KEDA owns the Deployment |
 | `worker.worktrees.size` / `storageClass` | `5Gi` / `""` | the `/work` PVC where BUILD worktrees live |

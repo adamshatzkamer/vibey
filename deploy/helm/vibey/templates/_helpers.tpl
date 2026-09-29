@@ -44,6 +44,48 @@ dsn
 {{- end -}}
 
 {{/*
+The owner's DSN (ADR-0055): the role that runs migrations and owns the tables.
+Empty means a single-DSN install -- an existing Secret whose owner key is not
+named (`dsn.existingSecretMigrateKey`, empty by default) -- where the worker
+migrates as the one role and `vibey doctor` reports the ledger guard as not in
+force.
+*/}}
+{{- define "vibey.migrateSecretKey" -}}
+{{- if .Values.dsn.existingSecret -}}
+{{- .Values.dsn.existingSecretMigrateKey -}}
+{{- else -}}
+migrate-dsn
+{{- end -}}
+{{- end -}}
+
+{{/*
+`vibey migrate`, as an init container: the only place the owner's DSN is mounted.
+It applies migrations, creates the application role if it is missing, and grants it
+exactly the declared privileges, then fails the pod if the application's DSN could
+still rewrite the ledger. The workload that follows gets the application's DSN only.
+*/}}
+{{- define "vibey.migrateInitContainer" -}}
+{{- if include "vibey.migrateSecretKey" . }}
+- name: migrate
+  image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+  imagePullPolicy: {{ .Values.image.pullPolicy }}
+  args: ["migrate"]
+  env:
+    - name: VIBEY_PG_MIGRATE_URL
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "vibey.dsnSecretName" . }}
+          key: {{ include "vibey.migrateSecretKey" . }}
+    - name: VIBEY_PG_URL
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "vibey.dsnSecretName" . }}
+          key: {{ include "vibey.dsnSecretKey" . }}
+  securityContext: {{- toYaml .Values.securityContext | nindent 4 }}
+{{- end }}
+{{- end -}}
+
+{{/*
 worker.project is a UUID, and two readers need it: the worker's --project
 argument and the KEDA scaler's SQL. The SQL is why it is checked here --
 a value interpolated into a query has to be proven to be the shape it
@@ -64,8 +106,9 @@ SQL is the bare 32 hex digits, which PostgreSQL's uuid input reads as-is.
 The in-cluster Ollama endpoint, fully qualified for the same reason the DSN
 is: a bare Service name resolves only inside this namespace, and nothing
 guarantees every reader lives here. Root form, no path -- vibey's own
-client wants the server root; qwenloop's OpenAI-compatible backend appends
-/v1 where it is wired, in worker.yaml.
+client wants the server root; the local runner's OpenAI-compatible backend
+(gptossloop, and qwenloop when on) appends /v1 where it is wired, in
+worker.yaml.
 */}}
 {{- define "vibey.ollamaURL" -}}
 {{- printf "http://%s-ollama.%s.svc.%s:%v" (include "vibey.fullname" .) .Release.Namespace .Values.clusterDomain .Values.ollama.service.port -}}
@@ -118,16 +161,68 @@ spec:
             echo "waiting for ollama at $OLLAMA_HOST"
             sleep 5
           done
+          {{- if .Values.ollama.qwenloopFeature }}
+          ollama pull "$OLLAMA_PULL_MODEL"
+          # qwenloop's Qwen model, beside the default (ADR-0064).
+          exec ollama pull "$OLLAMA_PULL_QWEN_MODEL"
+          {{- else }}
           exec ollama pull "$OLLAMA_PULL_MODEL"
+          {{- end }}
       env:
         - name: OLLAMA_HOST
           value: {{ include "vibey.ollamaURL" . | quote }}
         - name: OLLAMA_PULL_MODEL
           value: {{ required "ollama.model is required when ollama.pull.enabled" .Values.ollama.model | quote }}
+        {{- if .Values.ollama.qwenloopFeature }}
+        - name: OLLAMA_PULL_QWEN_MODEL
+          value: {{ required "ollama.qwenModel is required when ollama.qwenloopFeature" .Values.ollama.qwenModel | quote }}
+        {{- end }}
         # The client never needs a home of its own; point it somewhere a
         # non-root uid can write rather than at an unwritable "/".
         - name: HOME
           value: /tmp
       securityContext: {{- toYaml .Values.ollama.securityContext | nindent 8 }}
       resources: {{- toYaml .Values.ollama.pull.resources | nindent 8 }}
+{{- end -}}
+
+{{/*
+Format a container image from a dictionary with repository, tag, and optional digest.
+*/}}
+{{- define "vibey.image" -}}
+{{- $img := . -}}
+{{- if $img.digest -}}
+{{- printf "%s:%s@%s" $img.repository (toString $img.tag) $img.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $img.repository (toString $img.tag) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Format a fully qualified in-cluster Service URL for an operational surface component.
+Usage: include "vibey.surfaceURL" (dict "root" $ "name" "component-name" "port" 1234 "scheme" "http")
+*/}}
+{{- define "vibey.surfaceURL" -}}
+{{- $scheme := default "http" .scheme -}}
+{{- printf "%s://%s-%s.%s.svc.%s:%v" $scheme (include "vibey.fullname" .root) .name .root.Release.Namespace .root.Values.clusterDomain .port -}}
+{{- end -}}
+
+
+{{/*
+The environment variable a surface database's password reaches the postgres
+container under: VIBEY_DB_PASSWORD_<NAME>, upper-cased, non-alphanumerics as _.
+*/}}
+{{- define "vibey.surfaceDbPasswordEnv" -}}
+{{- printf "VIBEY_DB_PASSWORD_%s" (regexReplaceAll "[^A-Z0-9]" (upper .) "_") -}}
+{{- end -}}
+
+{{/*
+A surface database's own password (postgres.additionalDatabasePasswords), which
+must be set: a surface without one would have no role but the owner to use.
+*/}}
+{{- define "vibey.surfaceDbPassword" -}}
+{{- $password := index .root.Values.postgres.additionalDatabasePasswords .name -}}
+{{- if not $password -}}
+{{- fail (printf "postgres.additionalDatabasePasswords.%s must be set: each surface database has a role of its own (ADR-0055)" .name) -}}
+{{- end -}}
+{{- $password -}}
 {{- end -}}

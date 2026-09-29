@@ -12,9 +12,9 @@
 > PostgreSQL 14+. CI exercises majors 14–18; the chart default is PostgreSQL 17.
 > All timestamps `timestamptz`. All ids `uuid` except `event.seq`
 > (gapless bigint per project) and human-facing item ids (short prefixed strings).
-> Migrations are forward-only and applied automatically by `build_app()`
-> (`src/vibey/bootstrap.py`) every time a CLI command or worker opens the
-> database through it; there is no `vibey migrate` command (§7).
+> Migrations are forward-only. They run as the schema's owner: `vibey migrate` (the only
+> reader of `VIBEY_PG_MIGRATE_URL`), or `build_app()` (`src/vibey/bootstrap.py`) when the
+> application's own role may migrate (a single-DSN install); see §7 and ADR-0055.
 
 The live schema also has a Pydantic-backed SQLAlchemy projection in
 `src/vibey/infrastructure/db/orm_models.py`. It uses SQLModel so every one of
@@ -286,13 +286,37 @@ CREATE INDEX event_kind          ON event (project_id, kind, seq);
 CREATE INDEX event_correlation   ON event (correlation_id, seq);
 CREATE INDEX event_payload_gin   ON event USING gin (payload jsonb_path_ops);
 
--- Append-only: no UPDATE, no DELETE. Enforced, not merely intended.
-CREATE RULE event_no_update AS ON UPDATE TO event DO INSTEAD NOTHING;
-CREATE RULE event_no_delete AS ON DELETE TO event DO INSTEAD NOTHING;
+-- Append-only: no UPDATE, no DELETE, no TRUNCATE -- by the database (0016, ADR-0055).
+CREATE TRIGGER event_append_only BEFORE UPDATE OR DELETE ON event
+    FOR EACH ROW EXECUTE FUNCTION ledger_refuse_rewrite();
+CREATE TRIGGER event_no_truncate BEFORE TRUNCATE ON event
+    FOR EACH STATEMENT EXECUTE FUNCTION ledger_refuse_rewrite();
 ```
 
-The `RULE`s make `UPDATE` and `DELETE` silent no-ops rather than errors: a stray
-write affects zero rows.
+A rewrite is refused out loud: `the ledger is append-only: UPDATE on event is refused`,
+SQLSTATE `42501`, for every role, the owner included.
+
+- **Partitions.** The row trigger is cloned onto every partition, present and future.
+  `ledger_guard_partitions()` attaches the `TRUNCATE` guard, which PostgreSQL does not
+  clone, on every migration run.
+- **The earlier rules.** Migrations 0002 and 0013 used `DO INSTEAD NOTHING` rules, which
+  made a stray write a silent no-op. They did not fire for a statement addressed to a
+  partition or for `TRUNCATE`, and the owner (whom the worker connected as) could disable
+  them. 0016 drops them.
+- **The application role.** It holds `SELECT` and `INSERT` on `event` and nothing more
+  (`APP_ROLE_GRANTS`), so it cannot disable a trigger either. See
+  [the configuration reference](../reference/configuration.md#database-roles).
+
+What they do not stop, checked against the migrated schema on 2026-09-24 as the role
+vibey connects with (the table's owner): an `UPDATE` or `DELETE` addressed to a
+partition (`event_partitioned_0013_default`) rather than to `event` changes rows,
+because a rule on a partitioned parent does not fire for its partitions; `TRUNCATE
+event` empties the ledger, because rules never fire on `TRUNCATE`; and the owner can
+`ALTER TABLE event DISABLE RULE` or drop the rules outright. So append-only is enforced
+against the application's own queries, not against a holder of the application's DSN.
+That DSN is kept out of every engine session and gate command (see
+[SECURITY.md](../../SECURITY.md), §5); a database-level guard that binds the owner too
+is a recorded follow-up.
 
 **`kind` is open text, read forward-compatibly (vibey#275).** The column has no
 constraint and no enum type, so a newer vibey writes a kind an older one has never
@@ -496,14 +520,20 @@ CREATE TABLE job (
     last_error        jsonb,
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
+    bump_seq          bigint,                 -- 0014: place among bumped jobs; NULL = normal order
+    bump_named        boolean NOT NULL DEFAULT false,  -- 0015: in the named set
     CONSTRAINT job_idem_uniq UNIQUE (project_id, idempotency_key),
+    CONSTRAINT job_bump_seq_positive CHECK (bump_seq IS NULL OR bump_seq > 0),
+    CONSTRAINT job_bump_named_in_lane CHECK (NOT bump_named OR bump_seq IS NOT NULL),
     CONSTRAINT job_lease_consistent CHECK (
         (state = 'leased') = (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
     )
 );
 
 -- The claim index. Partial: only 'ready' rows are ever scanned.
-CREATE INDEX job_claim ON job (project_id, priority DESC, run_after ASC, id ASC)
+-- (0003 created it on priority/run_after/id; 0014 rebuilt it with bump_seq first.)
+CREATE INDEX job_claim
+    ON job (project_id, bump_seq ASC NULLS LAST, priority DESC, run_after ASC, id ASC)
     WHERE state = 'ready';
 
 -- The reaper index.
@@ -518,6 +548,9 @@ CREATE TABLE job_dependency (
 
 CREATE INDEX job_dep_reverse ON job_dependency (depends_on_job_id);
 ```
+
+**`priority`** is set by no request: `EnqueueRequest` has no priority field, so every
+enqueued job is 0 and a bump (§3.4, ADR-0054) is the only way to reorder work.
 
 **`idempotency_key`** is `sha256(f"{project_id}:{cycle}:{kind}:{subject}").hexdigest()`
 (`domain/job.py::idempotency_key`). Enqueue uses
@@ -552,12 +585,13 @@ WHERE id = (
     WHERE j.state = 'ready'
       AND j.run_after <= now()
       AND j.project_id = $3
+      AND j.phase::text = ANY($4::text[])   -- only phases this vibey knows (vibey#287)
       AND NOT EXISTS (
           SELECT 1 FROM job_dependency d
           JOIN job p ON p.id = d.depends_on_job_id
           WHERE d.job_id = j.id AND p.state <> 'succeeded'
       )
-    ORDER BY j.priority DESC, j.run_after ASC, j.id ASC
+    ORDER BY j.bump_seq ASC NULLS LAST, j.priority DESC, j.run_after ASC, j.id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
@@ -608,14 +642,28 @@ UPDATE job SET assigned_engine = $3, updated_at = now()
 WHERE id = $1 AND lease_owner = $2 AND state = 'leased';
 
 -- GATE ANSWER re-readies the parked job
--- (PostgresHumanGateRepository.answer, same transaction as the answer UPDATE)
-UPDATE job SET state = 'ready', updated_at = now()
+-- (PostgresHumanGateRepository.answer, same transaction as the answer UPDATE). `run_after`
+-- moves up to now, so "claimable since" reads the re-ready, not the first due time.
+UPDATE job SET state = 'ready', run_after = greatest(run_after, now()), updated_at = now()
 WHERE id = $1 AND state = 'awaiting_human';
 
 -- REAP (each idle worker-loop iteration, before the 5 s LISTEN wait; no separate supervisor)
-UPDATE job SET
-    state='ready', lease_owner=NULL, lease_expires_at=NULL, updated_at=now()
-WHERE state='leased' AND lease_expires_at < now();
+-- One transaction per lease (PostgresQueueReapStore.reap_leases, ADR-0056): re-read it
+-- under its row lock, judge it with domain/queue_reap.py's QueueReapPolicy, move it, and
+-- append its QueueReaped event on the same connection. A lease that cannot be moved rolls
+-- back alone (LeaseReapIncomplete names it after the rest are reaped).
+SELECT id, project_id, cycle, phase, kind, attempts, max_attempts, lease_expires_at
+FROM job
+WHERE id = $1 AND state = 'leased' AND lease_expires_at < now()
+FOR UPDATE SKIP LOCKED;
+-- attempts remain: requeue (the claim already counted the attempt)
+UPDATE job SET state = 'ready', lease_owner = NULL, lease_expires_at = NULL,
+               run_after = greatest(run_after, now()), updated_at = now()
+WHERE id = $1;
+-- attempts spent: park, refunding one, with a delivery_exhausted human_gate row
+UPDATE job SET state = 'awaiting_human', lease_owner = NULL, lease_expires_at = NULL,
+               attempts = greatest(attempts - 1, 0), updated_at = now()
+WHERE id = $1;
 ```
 
 All of these live in `PostgresJobRepository`
@@ -634,6 +682,56 @@ idempotent (non-negotiable #6): a reaped job *will* be executed again. `vibey
 worker`'s drive loop (`cli/main.py`) calls `reap()` only after a `run_once` that
 found no claimable job, so a worker busy on long jobs does not reap; another idle
 worker, or the next idle iteration, does.
+
+The reap is **bounded** (ADR-0056, closing ADR-0044 §8's gap). A job that kills its
+worker on every attempt never reaches `WorkerLoop`'s failure path, so before this it
+was re-readied forever; now an expired lease whose `attempts` has reached `max_attempts`
+parks with a `delivery_exhausted` gate, refunding one attempt so each answer buys one
+more delivery. `SKIP LOCKED` lets two reapers split the expired rows, so a replayed reap
+never moves a row twice. A row in a phase this vibey does not know is left for a newer
+vibey, as the claim leaves it.
+
+#### Queue priority: bump and un-bump (ADR-0054)
+
+A **bump** puts a job next in line: after whatever is running, ahead of every
+un-bumped waiting job, behind every job bumped before it. `bump_seq` is NULL for a
+job in normal order; a bump draws it from the sequence `job_bump_seq`
+(`migrations/0014_job_bump.sql`), so bumped jobs are claimed first-in-first-out by
+the order they were bumped, and the order among un-bumped jobs is exactly what it
+was. A sequence and not a timestamp: one bump moves a job and its dependencies in
+one transaction, where `now()` is one instant for all of them (sub-doctrine 10.g).
+`bump_named` (0015, replacing 0014's `bump_origin`) marks the named set: the jobs bumped (or enqueued prioritised) by name and
+not since un-bumped. The lane is derived from it -- the named jobs plus all their
+unfinished transitive dependencies -- so an un-bump clears the target and every pulled job
+the remaining named jobs no longer need, and every bump or un-bump sweeps (and records) any
+pulled job a cancelled or failed named job left behind, so no orphan outlives the next admitted
+bump or un-bump (a refused request changes nothing).
+
+`PostgresJobPriorityStore` (`src/vibey/infrastructure/db/job_priority_repository.py`)
+is reached only through `QueuePriorityService`, which checks the grant first. Each
+change is one transaction: `pg_advisory_xact_lock` on the project, a recursive CTE
+for the closure the change can reach (a bump's dependencies, stopping at finished
+rows), `FOR NO KEY UPDATE` on the rows it may write in id order (never blocking an
+enqueue's foreign-key `KEY SHARE`), state read only once locked, the pure planner
+in `domain/queue_priority.py`, and the event appended on the same connection:
+
+```sql
+-- BUMP (for each job the planner moves, dependencies before what needs them)
+UPDATE job SET bump_seq = nextval('job_bump_seq'), bump_named = (id = $target),
+               updated_at = now()
+WHERE id = $1 RETURNING bump_seq;
+
+-- UN-BUMP (the target, and every pulled job the remaining named jobs no longer need)
+UPDATE job SET bump_seq = NULL, bump_named = false, updated_at = now()
+WHERE id = ANY($1::uuid[]);
+```
+
+A bump never touches `state`, `lease_owner`, `lease_expires_at` or `run_after`,
+and the claim's dependency check is unchanged, so a bump orders work and never
+admits it. A leased job can be bumped and keeps its place if its attempt returns it
+to `ready`. The columns are queue state; the history is the ledger — every request,
+moved something, moved nothing or refused, as `JobPriorityBumped`,
+`JobPriorityUnbumped` or `JobPriorityRefused` (§3.2).
 
 ### 3.5 `work_item`
 
@@ -817,7 +915,20 @@ CREATE TABLE human_gate (
 
 CREATE INDEX human_gate_open ON human_gate (project_id, raised_at)
     WHERE answered_at IS NULL;
+
+-- 0018_human_gate_answer_once.sql
+ALTER TABLE human_gate ADD COLUMN answer_request_id text;
+ALTER TABLE human_gate ADD CONSTRAINT human_gate_request_id_with_answer
+    CHECK (answer_request_id IS NULL OR answered_at IS NOT NULL);
 ```
+
+**A gate is answered once.** The answer is a compare-and-set on
+`answered_at IS NULL` (`PostgresHumanGateRepository.answer_once`), in one transaction
+that also appends a `GateAnswered` event and returns the gate's job to `ready`. Of two
+answers racing for one gate exactly one lands. `answer_request_id` names the request
+that landed: the same request replayed with the same answer is a no-op, and any other
+answer is refused (`GateAlreadyAnswered`) and writes nothing. A gate answered before
+0018 has no request id, so every later answer to it is refused.
 
 `kind` is unconstrained text. Values raised by handlers today include `question`,
 `choice`, `approval`, `attempts_exhausted`, `budget_exhausted`,
@@ -899,6 +1010,23 @@ Handlers that must tolerate replay suppress that miss and continue with idempote
 work (for example `DeployDesignBridgeHandler`). There is no supervisor process; any
 number of workers may attempt a transition and exactly one wins.
 
+**A project's caps** (`vibey budget set` / `clear`, `PostgresProjectBudgetStore`) are
+changed under a row lock, with their ledger events on the same connection:
+
+```sql
+SELECT * FROM project WHERE id = $1 FOR NO KEY UPDATE;
+UPDATE project
+SET config = (config - $2::text[]) || $3::jsonb, updated_at = now()   -- cleared keys, set keys
+WHERE id = $1
+RETURNING *;
+SELECT append_event(...);                    -- one BudgetCapChanged per changed cap
+```
+
+Two changes to one project serialise on the row, so each reads the caps the other
+left and records them as its `old`. `NO KEY UPDATE` never blocks the `KEY SHARE` an
+event or job insert takes through its foreign key, so a worker keeps writing its
+ledger meanwhile. A change that changes nothing runs no `UPDATE` and appends nothing.
+
 **The integration branch** is guarded by a session-level advisory lock scoped to
 `(project_id, cycle)` (`PostgresAdvisoryLock`, ADR-0029):
 
@@ -952,10 +1080,18 @@ CREATE TABLE IF NOT EXISTS schema_migration (
 `checksum` is the sha256 hex of the file's text. Each pending migration runs in its
 own transaction together with its `schema_migration` insert.
 
-There is no `vibey migrate` command. `build_app()` in `src/vibey/bootstrap.py` runs
-`PostgresMigrator.from_environ(os.environ).apply(conn, discover_migrations(migrations_dir()))`
-every time it opens the pool, so every CLI command that opens the database, and every
-worker start, brings the schema up to date.
+Migrations run as the schema's owner (ADR-0055), in one of three ways:
+
+- **`vibey migrate`** applies them on `VIBEY_PG_MIGRATE_URL`, then reconciles the
+  application role's grants.
+- **`build_app()`** in `src/vibey/bootstrap.py` (`SchemaPreparer`), every time it opens
+  the pool. It never reads the owner's DSN:
+  - on the application's own connection when that role may migrate (a single-DSN
+    install);
+  - otherwise it only verifies (`PostgresMigrator.pending`, no DDL, no lock) and refuses
+    to start while anything is pending.
+
+So every worker start either brings the schema up to date or says why it cannot.
 `migrations_dir()` resolves to `<checkout>/migrations` from a source tree and to
 `/app/migrations` in the container image. Every start also re-verifies checksums:
 `apply` raises `MigrationChecksumError` if an already-applied migration's file has

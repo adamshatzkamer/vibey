@@ -1,11 +1,17 @@
 # Made with ❤️ by [Vibey](https://the-vibey-project.github.io/vibey/), Developed by [Adam Matthew Steinberger](https://vibewithadam.matthewsteinberger.com/) ([@adammatthewsteinberger](https://github.com/adammatthewsteinberger/)).
 import json
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from qwenloop.application.interfaces import AutonomousRunnerInterface
 from qwenloop.application.runner import (
+    _CONTINUE_PROMPT,
+    _EMPTY_REPLY_PROMPT,
+    _INVALID_COMPLETION_PROMPT,
+    _TOOL_CALL_RETRY_PROMPT,
     AutonomousRunner,
     _has_cdd_evidence,
     _render_native_verdict,
@@ -13,10 +19,37 @@ from qwenloop.application.runner import (
     _trim_transcript,
     _truncate_tool_result,
 )
-from qwenloop.domain.model import Backend, ChatChunk, ChatMessage, RunStatus, ServerInfo
+from qwenloop.domain.config import QwenConfig
+from qwenloop.domain.interfaces import FollowUpInterface
+from qwenloop.domain.model import (
+    CODING_TOOL_NAMES,
+    Backend,
+    ChatChunk,
+    ChatMessage,
+    FollowUp,
+    RunStatus,
+    ServerInfo,
+    ToolCallParseError,
+)
 from qwenloop.infrastructure.profiles import PORTABLE
 from qwenloop.infrastructure.run_store import FileRunStore
 from qwenloop.infrastructure.tools import SandboxTools
+
+
+class FakeClock:
+    """An in-memory clock: wall time from a fixed instant, monotonic time that advances a
+    fixed step on every read, so a turn's timings are exact and assertable."""
+
+    def __init__(self, step: float = 0.25) -> None:
+        self.step = step
+        self.elapsed = 0.0
+
+    def now(self) -> datetime:
+        return datetime(2026, 9, 22, 12, 0, tzinfo=UTC) + timedelta(seconds=self.elapsed)
+
+    def monotonic(self) -> float:
+        self.elapsed += self.step
+        return self.elapsed
 
 
 class FakeServer:
@@ -157,7 +190,9 @@ async def test_runner_inserts_continue_prompt_after_assistant_only_turn(tmp_path
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="nudge", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=3
     )
     assert result.status is RunStatus.COMPLETED
@@ -182,6 +217,7 @@ async def test_runner_notifies_lifecycle_events(tmp_path: Path) -> None:
         FileRunStore(tmp_path),
         SandboxTools(tmp_path),
         notifier=notifier,
+        clock=FakeClock(),
     ).run(
         run_id="notifications",
         plan="do it",
@@ -208,6 +244,7 @@ async def test_runner_ignores_notification_failures(tmp_path: Path) -> None:
         FileRunStore(tmp_path),
         SandboxTools(tmp_path),
         notifier=notifier,
+        clock=FakeClock(),
     ).run(
         run_id="notification-failure",
         plan="do it",
@@ -229,7 +266,9 @@ async def test_runner_preserves_assistant_tool_call_context(tmp_path: Path) -> N
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="tool-context",
         plan="do it",
         cwd=tmp_path,
@@ -249,6 +288,18 @@ def test_system_prompt_marks_verdict_as_text_not_a_tool(tmp_path: Path) -> None:
     prompt = _system_prompt(tmp_path)
     assert "There is no qwenloop-verdict tool" in prompt
     assert "plain text in your final assistant response" in prompt
+
+
+def test_every_prompt_names_every_callable_tool(tmp_path: Path) -> None:
+    # A prompt that lists fewer tools than the schema tells the model the rest do not exist.
+    listed = ", ".join(CODING_TOOL_NAMES)
+    for prompt in (
+        _system_prompt(tmp_path),
+        _CONTINUE_PROMPT,
+        _INVALID_COMPLETION_PROMPT,
+        _TOOL_CALL_RETRY_PROMPT,
+    ):
+        assert listed in prompt
 
 
 def test_cdd_evidence_requires_all_delivery_fields_inside_one_verdict() -> None:
@@ -288,7 +339,9 @@ async def test_runner_normalizes_native_verdict_tool_call(tmp_path: Path) -> Non
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="native-verdict",
         plan="do it",
         cwd=tmp_path,
@@ -318,7 +371,9 @@ async def test_storm_cannot_complete_after_read_only_inspection(tmp_path: Path) 
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="storm-read-only",
         plan="# qwenstorm plan\nwork it",
         cwd=tmp_path,
@@ -338,7 +393,9 @@ async def test_storm_can_complete_after_repo_action(tmp_path: Path) -> None:
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="storm-progress",
         plan="# qwenstorm plan\nwork it",
         cwd=tmp_path,
@@ -370,7 +427,9 @@ async def test_storm_reopens_a_marker_without_cdd_evidence(tmp_path: Path) -> No
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="cdd-evidence",
         plan="# qwenstorm plan\n## Convergence-Driven Development (CDD)",
         cwd=tmp_path,
@@ -391,7 +450,9 @@ async def test_runner_accepts_completion_evidence_split_across_turns(tmp_path: P
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="split-completion",
         plan="do it",
         cwd=tmp_path,
@@ -417,7 +478,9 @@ async def test_runner_emits_one_turn_completed_per_model_call(tmp_path: Path) ->
         ]
     )
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="turns", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=3
     )
     assert result.status is RunStatus.COMPLETED
@@ -433,6 +496,11 @@ async def test_runner_emits_one_turn_completed_per_model_call(tmp_path: Path) ->
             "input_tokens": 7,
             "output_tokens": 2,
             "tool_called": False,
+            # FakeClock: 250 ms per monotonic read -- start, answer, end
+            "started_at": "2026-09-22T12:00:00.000Z",
+            "ended_at": "2026-09-22T12:00:00.750Z",
+            "duration_ms": 500,
+            "model_ms": 250,
         },
         {
             "type": "turn.completed",
@@ -440,6 +508,10 @@ async def test_runner_emits_one_turn_completed_per_model_call(tmp_path: Path) ->
             "input_tokens": 3,
             "output_tokens": 4,
             "tool_called": True,
+            "started_at": "2026-09-22T12:00:00.750Z",
+            "ended_at": "2026-09-22T12:00:01.500Z",
+            "duration_ms": 500,
+            "model_ms": 250,
         },
     ]
     # each boundary closes its own turn, so the run's verdict follows the last one
@@ -456,7 +528,9 @@ async def test_runner_rejects_completion_verdict_with_no_tool_call(tmp_path: Pat
         )
     ]
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="premature",
         plan="do it",
         cwd=tmp_path,
@@ -472,7 +546,9 @@ async def test_runner_rejects_completion_verdict_with_no_tool_call(tmp_path: Pat
 async def test_runner_bounds_repeated_marker_only_claims(tmp_path: Path) -> None:
     server = ScriptedServer([[ChatChunk(text="QWENLOOP_TASK_FULLY_COMPLETE")] for _ in range(3)])
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="marker-loop",
         plan="do it",
         cwd=tmp_path,
@@ -488,7 +564,7 @@ async def test_runner_bounds_repeated_marker_only_claims(tmp_path: Path) -> None
 async def test_runner_writes_contract_artifacts(tmp_path: Path) -> None:
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
     result = await AutonomousRunner(
-        FakeServer(), FileRunStore(tmp_path), SandboxTools(tmp_path)
+        FakeServer(), FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
     ).run(run_id="abc", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=2)
     assert result.status is RunStatus.COMPLETED
     assert (tmp_path / "done.txt").read_text() == "ok"
@@ -505,9 +581,9 @@ async def test_runner_honors_wind_down(tmp_path: Path) -> None:
     inbox = tmp_path / ".qwenloop" / "runs" / "abc" / "control" / "inbox"
     (inbox / "1.json").write_text('{"type":"wind_down"}')
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(FakeServer(), store, SandboxTools(tmp_path)).run(
-        run_id="abc", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=2
-    )
+    result = await AutonomousRunner(
+        FakeServer(), store, SandboxTools(tmp_path), clock=FakeClock()
+    ).run(run_id="abc", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=2)
     assert result.status is RunStatus.WINDING_DOWN
 
 
@@ -549,7 +625,9 @@ async def test_runner_fails_on_empty_response(tmp_path: Path) -> None:
     server = FakeServer()
     server.chunks = [ChatChunk()]
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="empty", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=1
     )
     assert result.status is RunStatus.FAILED
@@ -560,7 +638,9 @@ async def test_runner_turn_limit_after_text(tmp_path: Path) -> None:
     server = FakeServer()
     server.chunks = [ChatChunk(text="still working")]
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="limit", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=1
     )
     assert result.status is RunStatus.FAILED
@@ -571,7 +651,9 @@ async def test_runner_normalizes_invalid_tool_arguments(tmp_path: Path) -> None:
     server = FakeServer()
     server.chunks = [ChatChunk(tool_call={"name": "unknown", "arguments": "bad"})]
     info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
-    result = await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path)).run(
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
         run_id="invalid",
         plan="do it",
         cwd=tmp_path,
@@ -622,6 +704,104 @@ async def test_sandbox_command_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert process.killed
 
 
+def test_run_store_takes_follow_ups_once_in_the_order_they_were_sent(tmp_path: Path) -> None:
+    store = FileRunStore(tmp_path)
+    assert store.take_prompts("missing") == []
+    store.create("x", {})
+    inbox = tmp_path / ".qwenloop" / "runs" / "x" / "control" / "inbox"
+    (inbox / "00000000000000000002-b.json").write_text('{"type":"prompt","text":"second"}')
+    (inbox / "00000000000000000001-a.json").write_text('{"type":"prompt","text":"first"}')
+    (inbox / "00000000000000000003-c.json").write_text('{"type":"stop"}')
+    (inbox / "00000000000000000004-d.json").write_text("not json")
+    (inbox / "00000000000000000005-e.json").write_text("[]")
+    (inbox / "00000000000000000006-f.json").write_text('{"type":"prompt","text":7}')
+    taken = store.take_prompts("x")
+    assert taken == [
+        FollowUp(id="00000000000000000001-a", text="first"),
+        FollowUp(id="00000000000000000002-b", text="second"),
+    ]
+    assert all(isinstance(follow_up, FollowUpInterface) for follow_up in taken)
+    ack = tmp_path / ".qwenloop" / "runs" / "x" / "control" / "ack"
+    assert sorted(path.name for path in ack.glob("*.json")) == [
+        "00000000000000000001-a.json",
+        "00000000000000000002-b.json",
+    ]
+    assert len(list(inbox.glob("*.json"))) == 4
+    assert store.take_prompts("x") == []
+    assert [item["type"] for item in store.read_control("x")] == ["stop", "prompt"]
+
+
+class FollowUpServer(ScriptedServer):
+    """Sends a follow-up while its first turn streams, as a person would mid-run."""
+
+    def __init__(self, turns: list[list[ChatChunk]], inbox: Path) -> None:
+        super().__init__(turns)
+        self._inbox = inbox
+
+    async def chat_stream(
+        self, info: ServerInfo, messages: Sequence[ChatMessage]
+    ) -> AsyncIterator[ChatChunk]:
+        if not self.seen:
+            self._inbox.mkdir(parents=True, exist_ok=True)
+            (self._inbox / "00000000000000000001-a.json").write_text(
+                '{"type":"prompt","text":"keep the heading short"}'
+            )
+        async for chunk in super().chat_stream(info, messages):
+            yield chunk
+
+
+@pytest.mark.asyncio
+async def test_runner_gives_the_model_a_follow_up_at_its_next_turn_once(tmp_path: Path) -> None:
+    inbox = tmp_path / ".qwenloop" / "runs" / "follow" / "control" / "inbox"
+    server = FollowUpServer(
+        [
+            [
+                ChatChunk(
+                    tool_call={"name": "write_file", "arguments": {"path": "x", "content": "y"}}
+                )
+            ],
+            [
+                ChatChunk(
+                    tool_call={"name": "write_file", "arguments": {"path": "z", "content": "w"}}
+                )
+            ],
+            [
+                ChatChunk(
+                    text="```qwenloop-verdict\npass\n```\nQWENLOOP_TASK_FULLY_COMPLETE",
+                    output_tokens=4,
+                )
+            ],
+        ],
+        inbox,
+    )
+    info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="follow", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=3
+    )
+    assert result.status is RunStatus.COMPLETED
+    follow_up = ChatMessage("user", "keep the heading short")
+    assert follow_up not in server.seen[0]
+    assert server.seen[1][-1] == follow_up
+    assert server.seen[2].count(follow_up) == 1
+    events = [
+        json.loads(line)
+        for line in (tmp_path / ".qwenloop" / "runs" / "follow" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    received = [event for event in events if event["type"] == "prompt.received"]
+    assert received == [
+        {
+            "type": "prompt.received",
+            "turn": 2,
+            "id": "00000000000000000001-a",
+            "text": "keep the heading short",
+        }
+    ]
+
+
 def test_run_store_handles_empty_and_invalid_control(tmp_path: Path) -> None:
     store = FileRunStore(tmp_path)
     assert store.read_control("missing") == []
@@ -630,3 +810,690 @@ def test_run_store_handles_empty_and_invalid_control(tmp_path: Path) -> None:
     (inbox / "bad.json").write_text("bad")
     (inbox / "list.json").write_text("[]")
     assert store.read_control("x") == []
+
+
+@pytest.mark.asyncio
+async def test_edit_file_replaces_exactly_one_occurrence(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("x = 1\ny = 2\n")
+    tools = SandboxTools(tmp_path)
+    result = await tools.execute(
+        "edit_file", {"path": "a.py", "old_string": "y = 2", "new_string": "y = 3"}
+    )
+    assert result == {"replaced": 1, "path": "a.py"}
+    assert (tmp_path / "a.py").read_text() == "x = 1\ny = 3\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_file_refuses_what_it_cannot_do_exactly(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("same\nsame\n")
+    (tmp_path / "blob.bin").write_bytes(b"\xff\xfe")
+    tools = SandboxTools(tmp_path)
+
+    def call(path: str, old: str) -> dict[str, object]:
+        return {"path": path, "old_string": old, "new_string": "z"}
+
+    missing = await tools.execute("edit_file", call("a.py", "absent"))
+    assert "not found" in str(missing["error"])
+    many = await tools.execute("edit_file", call("a.py", "same"))
+    assert "matches 2 times" in str(many["error"])
+    empty = await tools.execute("edit_file", call("a.py", ""))
+    assert "must not be empty" in str(empty["error"])
+    no_file = await tools.execute("edit_file", call("new.py", "x"))
+    assert "use write_file" in str(no_file["error"])
+    binary = await tools.execute("edit_file", call("blob.bin", "x"))
+    assert "cannot edit" in str(binary["error"])
+    assert (tmp_path / "a.py").read_text() == "same\nsame\n"
+    with pytest.raises(ValueError, match="escapes"):
+        await tools.execute("edit_file", call("../outside.py", "x"))
+
+
+@pytest.mark.asyncio
+async def test_edit_file_reports_a_failed_write(tmp_path: Path) -> None:
+    target = tmp_path / "ro.py"
+    target.write_text("keep\n")
+    target.chmod(0o444)
+    try:
+        result = await SandboxTools(tmp_path).execute(
+            "edit_file", {"path": "ro.py", "old_string": "keep", "new_string": "gone"}
+        )
+    finally:
+        target.chmod(0o644)
+    assert "error" in result
+    assert target.read_text() == "keep\n"
+
+
+@pytest.mark.asyncio
+async def test_write_file_refuses_to_gut_an_existing_file(tmp_path: Path) -> None:
+    big = tmp_path / "big.py"
+    big.write_text("".join(f"line {n}\n" for n in range(100)))
+    tools = SandboxTools(tmp_path)
+
+    refused = await tools.execute("write_file", {"path": "big.py", "content": "only\n"})
+    assert "would remove 99 of 100 lines" in str(refused["error"])
+    assert big.read_text().count("\n") == 100
+
+    allowed = await tools.execute(
+        "write_file", {"path": "big.py", "content": "only\n", "allow_shrink": True}
+    )
+    assert allowed == {"written": 5}
+    assert big.read_text() == "only\n"
+
+
+@pytest.mark.asyncio
+async def test_write_file_guard_leaves_ordinary_writes_alone(tmp_path: Path) -> None:
+    (tmp_path / "small.py").write_text("a\nb\n")
+    (tmp_path / "blob.bin").write_bytes(b"\xff\xfe")
+    long_text = "".join(f"line {n}\n" for n in range(60))
+    (tmp_path / "long.py").write_text(long_text)
+    tools = SandboxTools(tmp_path)
+
+    new = await tools.execute("write_file", {"path": "new.py", "content": "x\n"})
+    small = await tools.execute("write_file", {"path": "small.py", "content": "x\n"})
+    binary = await tools.execute("write_file", {"path": "blob.bin", "content": "x\n"})
+    grown = await tools.execute("write_file", {"path": "long.py", "content": long_text + "more\n"})
+    assert all("written" in result for result in (new, small, binary, grown))
+
+
+@pytest.mark.asyncio
+async def test_turn_completed_carries_its_timing_and_the_servers_own(tmp_path: Path) -> None:
+    timings = {
+        "prompt_n": 812.0,
+        "cache_n": 4096.0,
+        "prompt_ms": 950.5,
+        "predicted_n": 64.0,
+        "predicted_ms": 1200.0,
+        "predicted_per_second": 53.3,
+    }
+    server = ScriptedServer(
+        [
+            [
+                ChatChunk(tool_call={"name": "read_file", "arguments": {"path": "x"}}),
+                ChatChunk(text="", input_tokens=5, output_tokens=2, timings=timings),
+            ],
+            [ChatChunk(text="```qwenloop-verdict\npass\n```\nQWENLOOP_TASK_FULLY_COMPLETE")],
+        ]
+    )
+    info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
+    clock = FakeClock(step=0.25)
+    await AutonomousRunner(server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=clock).run(
+        run_id="timed", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=3
+    )
+    events = [
+        json.loads(line)
+        for line in (tmp_path / ".qwenloop" / "runs" / "timed" / "events.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    first, second = [event for event in events if event["type"] == "turn.completed"]
+    # three monotonic reads per turn (start, answer, end), each 250 ms apart
+    assert first["duration_ms"] == 500
+    assert first["model_ms"] == 250
+    assert first["started_at"] == "2026-09-22T12:00:00.000Z"
+    assert first["ended_at"] == "2026-09-22T12:00:00.750Z"
+    assert first["server_timings"] == timings
+    # a response without timings records none rather than inventing them
+    assert "server_timings" not in second
+
+
+@pytest.mark.asyncio
+async def test_a_turn_with_no_answer_at_all_is_still_timed(tmp_path: Path) -> None:
+    server = ScriptedServer(
+        [[], [ChatChunk(text="```qwenloop-verdict\npass\n```\nQWENLOOP_TASK_FULLY_COMPLETE")]]
+    )
+    info = ServerInfo(Backend.LLAMA_CPP, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock(step=0.5)
+    ).run(
+        run_id="silent", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=2
+    )
+    events = (tmp_path / ".qwenloop" / "runs" / "silent" / "events.jsonl").read_text().splitlines()
+    first = next(json.loads(line) for line in events if '"turn.completed"' in line)
+    assert first["duration_ms"] == 500
+    assert first["model_ms"] == 500
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info", "expected"),
+    [
+        (
+            ServerInfo(
+                Backend.LLAMA_CPP,
+                PORTABLE.name,
+                "http://127.0.0.1:9/v1",
+                True,
+                True,
+                7,
+                argv=("llama-server", "--api-key", "<redacted>"),
+                log_path="/cache/server.log",
+            ),
+            {"argv": ["llama-server", "--api-key", "<redacted>"], "log_path": "/cache/server.log"},
+        ),
+        (
+            ServerInfo(
+                Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1:11434/v1", False, True
+            ),
+            {"endpoint": "http://127.0.0.1:11434/v1"},
+        ),
+    ],
+)
+async def test_meta_records_the_server_settings_the_run_used(
+    tmp_path: Path, info: ServerInfo, expected: dict[str, object]
+) -> None:
+    server = ScriptedServer(
+        [[ChatChunk(text="```qwenloop-verdict\npass\n```\nQWENLOOP_TASK_FULLY_COMPLETE")]]
+    )
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="meta", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=1
+    )
+    meta = json.loads((tmp_path / ".qwenloop" / "runs" / "meta" / "meta.json").read_text())
+    assert meta["server_settings"] == expected
+
+
+class UnparseableThenScriptedServer(ScriptedServer):
+    """Refuses the first `failures` calls as an unparseable tool call, then plays its turns."""
+
+    def __init__(self, failures: int, turns: list[list[ChatChunk]]) -> None:
+        super().__init__(turns)
+        self.failures = failures
+        # what each refused call was sent; `seen` keeps only the calls that answered,
+        # because ScriptedServer picks its turn by counting them
+        self.refused: list[list[ChatMessage]] = []
+
+    async def chat_stream(
+        self, info: ServerInfo, messages: Sequence[ChatMessage]
+    ) -> AsyncIterator[ChatChunk]:
+        if self.failures:
+            self.failures -= 1
+            self.refused.append(list(messages))
+            raise ToolCallParseError("HTTP 500: error parsing tool call: raw='prose'")
+        async for chunk in super().chat_stream(info, messages):
+            yield chunk
+
+
+_DONE = "```qwenloop-verdict\npass\n```\nQWENLOOP_TASK_FULLY_COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_tool_call_is_retried_with_a_correction(tmp_path: Path) -> None:
+    server = UnparseableThenScriptedServer(
+        2,
+        [
+            [ChatChunk(tool_call={"name": "read_file", "arguments": {"path": "x"}})],
+            [ChatChunk(text=_DONE)],
+        ],
+    )
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="retry", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=3
+    )
+    assert result.status is RunStatus.COMPLETED
+    events = [
+        json.loads(line)
+        for line in (tmp_path / ".qwenloop" / "runs" / "retry" / "events.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    retried = [event for event in events if event["type"] == "turn.retried"]
+    assert [(event["turn"], event["retry"]) for event in retried] == [(1, 1), (1, 2)]
+    assert retried[0]["reason"] == "tool_call_parse_error"
+    assert "error parsing tool call" in retried[0]["detail"]
+    # each retry asks for a valid tool call before calling the model again
+    assert server.refused[0][-1].content == "do it"
+    assert server.refused[1][-1].content.startswith("Your last reply was not a valid tool call")
+    assert [message.content[:9] for message in server.seen[0][-2:]] == ["Your last"] * 2
+    # the retries belong to turn 1: it still closes once, with its tool call
+    turns = [event for event in events if event["type"] == "turn.completed"]
+    assert [(event["turn"], event["tool_called"]) for event in turns] == [(1, True), (2, False)]
+
+
+@pytest.mark.asyncio
+async def test_a_fourth_unparseable_tool_call_fails_the_run_as_before(tmp_path: Path) -> None:
+    server = UnparseableThenScriptedServer(4, [[ChatChunk(text=_DONE)]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    runner = AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    )
+    with pytest.raises(RuntimeError, match="error parsing tool call"):
+        await runner.run(
+            run_id="bound",
+            plan="do it",
+            cwd=tmp_path,
+            profile=PORTABLE,
+            server_info=info,
+            max_turns=3,
+        )
+    events = (tmp_path / ".qwenloop" / "runs" / "bound" / "events.jsonl").read_text().splitlines()
+    assert sum('"turn.retried"' in line for line in events) == 3
+
+
+@pytest.mark.asyncio
+async def test_with_no_empty_reply_retries_an_empty_reply_fails_the_run_as_before(
+    tmp_path: Path,
+) -> None:
+    server = ScriptedServer([[], [ChatChunk(text=_DONE)]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="empty",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=3,
+        max_empty_reply_retries=0,
+    )
+    # an empty reply is not a parse failure: with no retries declared it fails the run
+    assert result.status is RunStatus.FAILED
+    assert len(server.seen) == 1
+    events = _events(tmp_path, "empty")
+    assert not [event for event in events if event["type"] == "turn.retried"]
+    assert events[-1] == {
+        "type": "failed",
+        "reason": "empty_response",
+        "turn": 1,
+        "max_turns": 3,
+        "empty_replies": 1,
+        "max_empty_reply_retries": 0,
+    }
+
+
+def _events(root: Path, run_id: str) -> list[dict[str, object]]:
+    path = root / ".qwenloop" / "runs" / run_id / "events.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _empty(**kwargs: object) -> list[ChatChunk]:
+    """One turn with no tool call and no text: what gpt-oss sent in 27 of 60 failed runs."""
+    return [ChatChunk(**kwargs)]  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_reply_is_recorded_and_retried_with_a_nudge(tmp_path: Path) -> None:
+    server = ScriptedServer(
+        [
+            _empty(
+                input_tokens=900,
+                output_tokens=11,
+                finish_reason="stop",
+                reasoning="The user wants me to act.",
+            ),
+            [ChatChunk(tool_call={"name": "read_file", "arguments": {"path": "x"}})],
+            [ChatChunk(text=_DONE)],
+        ]
+    )
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="nudge",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=5,
+        max_empty_reply_retries=2,
+    )
+    assert result.status is RunStatus.COMPLETED
+    events = _events(tmp_path, "nudge")
+    empty = [event for event in events if event["type"] == "turn.empty"]
+    # what the empty turn actually contained: how it ended, what it cost, whether the
+    # model reasoned, and how its reasoning began (a capped excerpt, recorded as data)
+    assert empty == [
+        {
+            "type": "turn.empty",
+            "turn": 1,
+            "finish_reason": "stop",
+            "input_tokens": 900,
+            "output_tokens": 11,
+            "reasoning_present": True,
+            "reasoning_chars": len("The user wants me to act."),
+            "reasoning_excerpt": "The user wants me to act.",
+            "reasoning_excerpt_truncated": False,
+            "empty_replies": 1,
+            "max_empty_reply_retries": 2,
+            "retrying": True,
+        }
+    ]
+    # the retry is a new model call, so it spends a turn of the budget
+    turns = [event["turn"] for event in events if event["type"] == "turn.completed"]
+    assert turns == [1, 2, 3]
+    # the retry sees a neutral nudge naming both ways out, and nothing else new
+    nudge = server.seen[1][-1]
+    assert (nudge.role, nudge.content) == ("user", _EMPTY_REPLY_PROMPT)
+    assert server.seen[1][:-1] == server.seen[0]
+    assert "call one of the tools" in _EMPTY_REPLY_PROMPT
+    assert "answer in plain text" in _EMPTY_REPLY_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_an_empty_reply_without_finish_reason_or_reasoning_says_so(tmp_path: Path) -> None:
+    server = ScriptedServer([_empty(), [ChatChunk(text=_DONE)]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="bare", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=2
+    )
+    empty = next(event for event in _events(tmp_path, "bare") if event["type"] == "turn.empty")
+    assert (
+        empty["finish_reason"],
+        empty["reasoning_present"],
+        empty["reasoning_chars"],
+        empty["reasoning_excerpt"],
+        empty["reasoning_excerpt_truncated"],
+    ) == (None, False, 0, None, False)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_empty_reply_retries_fail_the_run_for_that_reason(tmp_path: Path) -> None:
+    server = ScriptedServer([_empty(finish_reason="stop") for _ in range(10)])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="silent",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=10,
+        max_empty_reply_retries=2,
+    )
+    assert result.status is RunStatus.FAILED
+    # the first empty reply plus two retries, then the run stops: bounded, not max_turns
+    assert len(server.seen) == 3
+    events = _events(tmp_path, "silent")
+    retrying = [event["retrying"] for event in events if event["type"] == "turn.empty"]
+    assert retrying == [True, True, False]
+    assert events[-1] == {
+        "type": "failed",
+        "reason": "empty_response",
+        "turn": 3,
+        "max_turns": 10,
+        "empty_replies": 3,
+        "max_empty_reply_retries": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_retries_spend_the_turn_budget_and_cannot_outlast_it(
+    tmp_path: Path,
+) -> None:
+    server = ScriptedServer([_empty() for _ in range(10)])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="cap",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=2,
+        max_empty_reply_retries=50,
+    )
+    assert result.status is RunStatus.FAILED
+    assert len(server.seen) == 2
+    # the cap stopped it, and the event says so rather than blaming the empty reply
+    assert _events(tmp_path, "cap")[-1] == {
+        "type": "failed",
+        "reason": "turn_limit",
+        "turn": 2,
+        "max_turns": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_empty_reply_retries_bound_consecutive_empty_turns_only(tmp_path: Path) -> None:
+    tool = [ChatChunk(tool_call={"name": "read_file", "arguments": {"path": "x"}})]
+    server = ScriptedServer([_empty(), tool, _empty(), tool, [ChatChunk(text=_DONE)]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    result = await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="reset",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=5,
+        max_empty_reply_retries=1,
+    )
+    # a turn that did something clears the count: two separated empty replies both retry
+    assert result.status is RunStatus.COMPLETED
+    empty = [event for event in _events(tmp_path, "reset") if event["type"] == "turn.empty"]
+    assert [(event["turn"], event["empty_replies"]) for event in empty] == [(1, 1), (3, 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_limit_failure_names_the_cap(tmp_path: Path) -> None:
+    server = ScriptedServer([[ChatChunk(text="still working")]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="limit", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=1
+    )
+    assert _events(tmp_path, "limit")[-1] == {
+        "type": "failed",
+        "reason": "turn_limit",
+        "turn": 1,
+        "max_turns": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_repeated_invalid_completion_claims_fail_for_that_reason(tmp_path: Path) -> None:
+    server = ScriptedServer([[ChatChunk(text="QWENLOOP_TASK_FULLY_COMPLETE")] for _ in range(3)])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="claims", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=9
+    )
+    assert _events(tmp_path, "claims")[-1] == {
+        "type": "failed",
+        "reason": "invalid_completion_claims",
+        "turn": 3,
+        "max_turns": 9,
+    }
+
+
+@pytest.mark.asyncio
+async def test_meta_records_the_turn_cap_and_the_empty_reply_bound(tmp_path: Path) -> None:
+    server = ScriptedServer(
+        [
+            [ChatChunk(tool_call={"name": "read_file", "arguments": {"path": "x"}})],
+            [ChatChunk(text=_DONE)],
+        ]
+    )
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="caps",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=60,
+        max_empty_reply_retries=4,
+    )
+    meta = json.loads((tmp_path / ".qwenloop" / "runs" / "caps" / "meta.json").read_text())
+    assert (meta["max_turns"], meta["max_empty_reply_retries"]) == (60, 4)
+
+
+@pytest.mark.asyncio
+async def test_the_runner_defaults_to_the_declared_empty_reply_bound(tmp_path: Path) -> None:
+    server = ScriptedServer([[ChatChunk(text=_DONE)]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="dflt", plan="do it", cwd=tmp_path, profile=PORTABLE, server_info=info, max_turns=1
+    )
+    meta = json.loads((tmp_path / ".qwenloop" / "runs" / "dflt" / "meta.json").read_text())
+    assert meta["max_empty_reply_retries"] == QwenConfig().max_empty_reply_retries
+    assert meta["max_recorded_argument_chars"] == QwenConfig().max_recorded_argument_chars
+    assert (
+        meta["empty_reply_reasoning_excerpt_chars"]
+        == QwenConfig().empty_reply_reasoning_excerpt_chars
+    )
+
+
+def test_the_runner_conforms_to_its_declared_contract(tmp_path: Path) -> None:
+    runner = AutonomousRunner(
+        ScriptedServer([]), FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    )
+    assert isinstance(runner, AutonomousRunnerInterface)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cap", "excerpt", "truncated"),
+    [(10, "We need t", True), (400, "We need to call read_file.", False), (0, None, False)],
+)
+async def test_an_empty_turn_records_a_capped_excerpt_of_its_reasoning(
+    tmp_path: Path, cap: int, excerpt: str | None, truncated: bool
+) -> None:
+    reasoning = "We need to call read_file."
+    expected = reasoning[:cap] if excerpt is not None else None
+    server = ScriptedServer([_empty(reasoning=reasoning), [ChatChunk(text=_DONE)]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="excerpt",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=2,
+        empty_reply_reasoning_excerpt_chars=cap,
+    )
+    empty = next(e for e in _events(tmp_path, "excerpt") if e["type"] == "turn.empty")
+    # the excerpt is taken from the start and says when it was cut; the length is always kept
+    assert (empty["reasoning_excerpt"], empty["reasoning_excerpt_truncated"]) == (
+        expected,
+        truncated,
+    )
+    assert empty["reasoning_chars"] == len(reasoning)
+    # model output recorded as data only: it never goes back to the model
+    assert all(reasoning not in message.content for message in server.seen[1])
+
+
+@pytest.mark.asyncio
+async def test_every_tool_call_records_its_name_and_capped_arguments(tmp_path: Path) -> None:
+    body = "x" * 500
+    server = ScriptedServer(
+        [
+            [
+                ChatChunk(
+                    tool_call={
+                        "id": "call-7",
+                        "name": "write_file",
+                        "arguments": {"path": "a.txt", "content": body},
+                    }
+                ),
+                ChatChunk(tool_call={"name": "shell", "arguments": {"argv": ["echo", "hi"]}}),
+                ChatChunk(tool_call={"name": "shell", "arguments": {"argv": ["echo", body]}}),
+            ],
+            [ChatChunk(text=_DONE)],
+        ]
+    )
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="calls",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=3,
+        max_recorded_argument_chars=20,
+    )
+    events = _events(tmp_path, "calls")
+    calls = [event for event in events if event["type"] == "tool.call"]
+    assert calls == [
+        {
+            "type": "tool.call",
+            "turn": 1,
+            "id": "call-7",
+            "name": "write_file",
+            # argument names are always kept; file content never beyond the cap
+            "arguments": {"path": "a.txt", "content": "x" * 20 + "...[truncated 480 characters]"},
+        },
+        {
+            "type": "tool.call",
+            "turn": 1,
+            "id": "qwenloop-turn-1-call-1",
+            "name": "shell",
+            "arguments": {"argv": ["echo", "hi"]},
+        },
+        {
+            "type": "tool.call",
+            "turn": 1,
+            "id": "qwenloop-turn-1-call-2",
+            "name": "shell",
+            # a value that is not a string is capped on its JSON form
+            "arguments": {"argv": '["echo", "xxxxxxxxxx...[truncated 492 characters]'},
+        },
+    ]
+    # the call is recorded before its result, so a crashing tool still leaves the evidence
+    kinds = [event["type"] for event in events if event["type"] in {"tool.call", "tool_result"}]
+    assert kinds[:2] == ["tool.call", "tool_result"]
+    assert body not in json.dumps(calls)
+
+
+@pytest.mark.asyncio
+async def test_a_zero_argument_cap_records_argument_names_only(tmp_path: Path) -> None:
+    server = ScriptedServer(
+        [
+            [ChatChunk(tool_call={"name": "read_file", "arguments": {"path": "secret.txt"}})],
+            [ChatChunk(text=_DONE)],
+        ]
+    )
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="names",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=2,
+        max_recorded_argument_chars=0,
+    )
+    call = next(e for e in _events(tmp_path, "names") if e["type"] == "tool.call")
+    assert call["arguments"] == {"path": "...[truncated 10 characters]"}
+
+
+@pytest.mark.asyncio
+async def test_meta_records_the_recording_caps(tmp_path: Path) -> None:
+    server = ScriptedServer([[ChatChunk(text=_DONE)]])
+    info = ServerInfo(Backend.OPENAI_COMPAT, PORTABLE.name, "http://127.0.0.1", False, True)
+    await AutonomousRunner(
+        server, FileRunStore(tmp_path), SandboxTools(tmp_path), clock=FakeClock()
+    ).run(
+        run_id="recaps",
+        plan="do it",
+        cwd=tmp_path,
+        profile=PORTABLE,
+        server_info=info,
+        max_turns=1,
+        max_recorded_argument_chars=64,
+        empty_reply_reasoning_excerpt_chars=32,
+    )
+    meta = json.loads((tmp_path / ".qwenloop" / "runs" / "recaps" / "meta.json").read_text())
+    assert (meta["max_recorded_argument_chars"], meta["empty_reply_reasoning_excerpt_chars"]) == (
+        64,
+        32,
+    )

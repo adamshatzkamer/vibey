@@ -39,6 +39,7 @@ from vibey_gh.install import WORKFLOWS, render_workflow
 from vibey_gh.interfaces import ReviewComposerPort
 from vibey_gh.review_composition import (
     FULL,
+    NO_PAID,
     PAID_HALVES,
     PAID_LANE,
     REVIEW_COMPOSER,
@@ -88,7 +89,23 @@ def _local(**changes: Any) -> dict:
 
 def _sovereign(**changes: Any) -> dict:
     """The sovereign lane's verdict as `local-review` publishes it: placeholders included."""
-    return _local(**changes) | REVIEW_CONTRACT.placeholders()
+    return (
+        _local(**changes)
+        | REVIEW_CONTRACT.placeholders()
+        | {REVIEW_CONTRACT.scope_field: [DIFF_GROUNDABLE]}
+    )
+
+
+def _whole(**changes: Any) -> dict:
+    """What the local model returns when it answers the WHOLE review (no paid lane, 8.b)."""
+    return _paid_full(summary="Adds a flag; the documentation keeps up.") | changes
+
+
+def _sovereign_whole(**changes: Any) -> dict:
+    """A whole-review verdict as `local-review --scope full` publishes it."""
+    return _whole(**changes) | {
+        REVIEW_CONTRACT.scope_field: [DIFF_GROUNDABLE, REQUIRES_WIDER_CONTEXT]
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -99,7 +116,7 @@ def _sovereign(**changes: Any) -> dict:
 def test_the_composer_satisfies_its_declared_seam():
     assert isinstance(REVIEW_COMPOSER, ReviewComposerPort)
     assert REVIEW_COMPOSER == ReviewComposer()
-    assert PAID_HALVES == (FULL, REQUIRES_WIDER_CONTEXT)
+    assert PAID_HALVES == (FULL, REQUIRES_WIDER_CONTEXT, NO_PAID)
 
 
 @pytest.mark.parametrize("case", GOLDEN["paid_verdicts"], ids=lambda case: case["name"])
@@ -285,8 +302,19 @@ def test_the_wider_half_alone_needs_the_sovereign_verdict():
 
 @pytest.mark.parametrize("half", [DIFF_GROUNDABLE, "both", ""])
 def test_a_paid_half_that_is_not_one_is_refused(half):
-    with pytest.raises(ValueError, match="paid half must be one of full, requires-wider-context"):
+    with pytest.raises(
+        ValueError, match="paid half must be one of full, requires-wider-context, none"
+    ):
         REVIEW_COMPOSER.compose(_paid_full(), half=half, head_sha="abc")
+
+
+@pytest.mark.parametrize("half", [FULL, REQUIRES_WIDER_CONTEXT])
+def test_a_paid_half_with_no_paid_answer_says_so(half):
+    """The workflow hands `combine` an empty answer when the paid call failed. That is
+    "the paid lane returned nothing", and it is said in those words rather than as a
+    complaint about the type of nothing."""
+    with pytest.raises(ValueError, match="the paid lane returned no answer to compose"):
+        REVIEW_COMPOSER.compose(None, half=half, sovereign=_sovereign(), head_sha="abc")
 
 
 def test_answers_that_are_not_objects_are_refused():
@@ -529,6 +557,13 @@ class _Run:
     recorded: list[dict]
     local_calls: list[list[str]]
     gate: dict[str, Any] | None
+    gh_calls: list[list[str]]
+    errors: list[str]
+
+    @property
+    def lanes(self) -> dict[str, str]:
+        """The two answers the declared path has always decided, and nothing added since."""
+        return {name: self.lane[name] for name in ("sovereign_lane", "sovereign_carries")}
 
 
 REASONS = {
@@ -565,8 +600,21 @@ if argv[:1] == ["local-review"]:
         def __exit__(self, *exc):
             return None
 
-    body = json.dumps({{"message": {{"content": verdict}}}}).encode()
-    local_review.urllib.request.urlopen = lambda request, timeout=None: _Response(body)
+    import re
+
+    def _open(request, timeout=None):
+        # A model that read the whole prompt: it echoes both of the request's check codes.
+        sent = json.loads(request.data)
+        text = "".join(message["content"] for message in sent["messages"])
+        codes = re.findall(r"(?:The first is|the second check code is) ([0-9a-f]+)", text)
+        answer = json.loads(verdict)
+        if isinstance(answer, dict):
+            answer = {{local_review.CANARY_FIELD: " ".join(codes), **answer}}
+        body = {{"message": {{"content": json.dumps(answer)}}, "done_reason": "stop",
+                "prompt_eval_count": 10}}
+        return _Response(json.dumps(body).encode())
+
+    local_review.urllib.request.urlopen = _open
 from vibey_gh.cli import main
 raise SystemExit(main(argv))
 """
@@ -579,10 +627,38 @@ with open(os.environ["SIM_GH_LOG"], "a", encoding="utf-8") as handle:
 
 
 class _Workflow:
-    """The rendered pr-automation.yml, driven one scenario at a time."""
+    """The rendered pr-review.yml, driven one scenario at a time ("pr-evaluate.yml" is the
+    scan gate and is not part of this workflow's decision surface).
 
-    def __init__(self, tmp_path: Path) -> None:
-        self.text = render_workflow(WORKFLOWS / "pr-automation.yml", GhConfig(root=tmp_path))
+    `paid_review` is the 8.b declaration the workflow is rendered with. Every scenario that
+    predates it -- the two-lane review, its golden gate -- runs declared, which is the
+    configuration it always described; the undeclared path has scenarios of its own."""
+
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        paid_review: bool = True,
+        paid_repair: bool | None = None,
+        paid_conflict_resolution: bool | None = None,
+        enabled: bool = True,
+    ) -> None:
+        from vibey_gh.config import PrAutomationConfig, PrAutomationFallbackConfig
+
+        # Unless a scenario says otherwise, every paid use is declared together or not at
+        # all: declared is the world the golden gate was captured in.
+        cfg = GhConfig(
+            root=tmp_path,
+            pr_automation=PrAutomationConfig(
+                paid_review=paid_review,
+                paid_repair=paid_review if paid_repair is None else paid_repair,
+                paid_conflict_resolution=(
+                    paid_review if paid_conflict_resolution is None else paid_conflict_resolution
+                ),
+                fallback=PrAutomationFallbackConfig(enabled=enabled),
+            ),
+        )
+        self.text = render_workflow(WORKFLOWS / "pr-review.yml", cfg)
         self.jobs = yaml.safe_load(self.text)["jobs"]
         self.tmp = tmp_path
         bin_dir = tmp_path / "bin"
@@ -613,6 +689,7 @@ class _Workflow:
                 "PATH": self.path,
                 "HOME": str(self.tmp),
                 "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(self.tmp / "step-summary.md"),
                 "RUNNER_TEMP": str(self.tmp),
                 "GITHUB_SERVER_URL": "https://github.com",
                 "GITHUB_RUN_ID": "99",
@@ -641,9 +718,14 @@ class _Workflow:
         state: str = "review",
         local: dict | None = None,
         paid: dict | None = None,
+        refused: str | None = None,
+        probe: str = "",
     ) -> _Run:
+        """`refused` is the text of a paid call the API refused (`is_error` in the execution
+        record) and `probe` the readiness probe's own reason."""
         for log in ("vibey-gh.jsonl", "gh.jsonl"):
             (self.tmp / log).unlink(missing_ok=True)
+        errors: list[str] = []
         github = {
             "repository": "owner/repo",
             "event_name": "workflow_run",
@@ -667,7 +749,7 @@ class _Workflow:
                     "reason": REASONS[state],
                 }
             },
-            "sovereign": {"outputs": {"ready": _text(heartbeat)}},
+            "sovereign": {"outputs": {"ready": _text(heartbeat), "reason": probe}},
             "meta": {
                 "outputs": {
                     "head_ref": "topic",
@@ -694,11 +776,27 @@ class _Workflow:
         needs["review-sovereign"] = {"result": "skipped", "outputs": {}}
         context = {**base, "needs": needs}
         if _condition(self.jobs["review-sovereign"], context, needs):
+            job_steps: dict[str, Any] = {
+                "install": {"outcome": "success"},
+                "diff": {"outcome": "success"},
+                "context": {"outcome": "skipped"},
+            }
+            context_step = self._step("review-sovereign", id="context")
+            if _truthy(_Expression(context_step["if"], context).value()):
+                completed, _ = self._bash(context_step, context, {})
+                assert completed.returncode == 0, completed.stderr
+                job_steps["context"] = {"outcome": "success"}
             result_step = self._step("review-sovereign", id="result")
             completed, outputs = self._bash(
                 result_step, context, {"SIM_LOCAL_VERDICT": json.dumps(local) if local else ""}
             )
-            job_steps = {"result": {"outputs": outputs}}
+            job_steps["result"] = {"outputs": outputs}
+            if completed.returncode != 0:
+                why = self._step("review-sovereign", id="why")
+                done, said = self._bash(why, {**context, "steps": job_steps}, {})
+                assert done.returncode == 0, done.stderr
+                job_steps["why"] = {"outputs": said}
+                errors += [line for line in done.stdout.splitlines() if line.startswith("::")]
             needs["review-sovereign"] = {
                 "result": "success" if completed.returncode == 0 else "failure",
                 "outputs": {
@@ -723,7 +821,36 @@ class _Workflow:
             schema = json.loads(args[args.index("--json-schema") + 1])
             prompt = _interpolate(claude["with"]["prompt"], step_context)
             result = "failure"
-            if credits:
+            if refused is not None:
+                # The action failed and left the execution record it always leaves: one
+                # `result` entry, `is_error` set, nothing spent.
+                record = self.tmp / "claude-execution-output.json"
+                record.write_text(
+                    json.dumps(
+                        [
+                            {"type": "system", "subtype": "init"},
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "is_error": True,
+                                "duration_ms": 369,
+                                "num_turns": 1,
+                                "total_cost_usd": 0,
+                                "modelUsage": {},
+                                "result": refused,
+                            },
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                job_steps["claude"] = {"outputs": {"execution_file": str(record)}}
+                done, said = self._bash(
+                    self._step("review", id="why"), {**context, "steps": job_steps}, {}
+                )
+                assert done.returncode == 1, "a refusal is this step's error"
+                job_steps["why"] = {"outputs": said}
+                errors += [line for line in done.stdout.splitlines() if line.startswith("::")]
+            elif credits:
                 assert paid is not None
                 missing = set(schema["required"]) - set(paid)
                 assert not missing, f"the stubbed answer does not fit its schema: {missing}"
@@ -739,6 +866,22 @@ class _Workflow:
                 "outputs": {
                     name: _interpolate(value, {**base, "steps": job_steps})
                     for name, value in self.jobs["review"]["outputs"].items()
+                },
+            }
+
+        # record-sovereign: the sovereign whole review recorded, when no paid review is
+        # declared; its combine and persistence are the workflow's own.
+        needs["record-sovereign"] = {"result": "skipped", "outputs": {}}
+        context = {**base, "needs": needs}
+        if _condition(self.jobs["record-sovereign"], context, needs):
+            completed, outputs = self._bash(
+                self._step("record-sovereign", id="result"), context, {}
+            )
+            needs["record-sovereign"] = {
+                "result": "success" if completed.returncode == 0 else "failure",
+                "outputs": {
+                    name: _interpolate(value, {**base, "steps": {"result": {"outputs": outputs}}})
+                    for name, value in self.jobs["record-sovereign"]["outputs"].items()
                 },
             }
 
@@ -768,6 +911,12 @@ class _Workflow:
                 "stdout": completed.stdout,
             }
 
+        gh_log = self.tmp / "gh.jsonl"
+        gh_calls = (
+            [json.loads(line) for line in gh_log.read_text().splitlines()]
+            if gh_log.exists()
+            else []
+        )
         log = self.tmp / "vibey-gh.jsonl"
         calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
         recorded = [
@@ -783,6 +932,8 @@ class _Workflow:
             recorded=recorded,
             local_calls=[call for call in calls if call[:1] == ["local-review"]],
             gate=gate,
+            gh_calls=gh_calls,
+            errors=errors,
         )
 
 
@@ -801,14 +952,23 @@ def _golden(state, review_passed, review_result, local_passed="", local_findings
     )
 
 
-# The one sanctioned difference from the golden: the job the local verdict comes from was
-# renamed when it started going first. Anything else that differs is a behaviour change.
-_RENAMED = {"'Local review fallback'": "'Sovereign diff review'"}
+# The three sanctioned differences from the golden: the job the local verdict comes from was
+# renamed when it started going first; the gate's own check was renamed from
+# `PR automation / gate` to `PR review / gate` when the workflow split; and the local model the
+# golden was captured with became configuration that moved on, to this era's default model
+# (sub-doctrine 8.d, #389) -- the model is named, never behaved on. Anything else that differs
+# is a behaviour change.
+_RENAMED = {
+    "'Local review fallback'": "'Sovereign diff review'",
+    "PR automation:": "PR review:",
+    "(qwen2.5-coder:14b)": "(gpt-oss:20b)",
+}
 
 
 def _assert_gate_is_golden(gate: dict, golden: dict) -> None:
     expected = dict(golden)
     for old, new in _RENAMED.items():
+        expected["title"] = expected["title"].replace(old, new)
         expected["summary"] = expected["summary"].replace(old, new)
         expected["stdout"] = expected["stdout"].replace(old, new)
     for key in ("exit", "conclusion", "title", "summary", "merge_train", "stdout"):
@@ -854,7 +1014,7 @@ def test_fresh_heartbeat_and_credits_the_sovereign_lane_carries_the_diff_half(wo
     and the gate names the lane behind each half."""
     run = workflow.run(heartbeat=True, credits=True, local=_local(), paid=_paid_wider())
 
-    assert run.lane == {"sovereign_lane": "true", "sovereign_carries": "true"}
+    assert run.lanes == {"sovereign_lane": "true", "sovereign_carries": "true"}
     assert run.jobs["review-sovereign"]["result"] == "success"
     assert run.local_calls and run.local_calls[0][run.local_calls[0].index("--role") + 1] == (
         "sovereign"
@@ -883,12 +1043,10 @@ def test_fresh_heartbeat_and_credits_the_sovereign_lane_carries_the_diff_half(wo
     assert run.jobs["repair"]["result"] == "skipped"
     assert run.gate["conclusion"] == "success"
     assert run.gate["merge_train"] is True
-    assert run.gate["title"] == (
-        "PR automation: gate (diff: sovereign lane, documentation: paid lane)"
-    )
+    assert run.gate["title"] == ("PR review: gate (diff: sovereign lane, documentation: paid lane)")
     for fact in (
         "diff-groundable half (pass, summary, findings) was carried by the SOVEREIGN lane",
-        "local model (qwen2.5-coder:14b)",
+        "local model (gpt-oss:20b)",
         (
             "requires-wider-context half (the documentation-contract judgments) was carried by "
             "the PAID lane (claude-sonnet-5)"
@@ -904,7 +1062,7 @@ def test_fresh_heartbeat_and_credits_the_sovereign_lane_carries_the_diff_half(wo
         pytest.param(
             _local(**{"pass": False}, findings=[FINDING]),
             _paid_wider(),
-            "PR automation: sovereign lane found a blocking defect in the diff",
+            "PR review: sovereign lane found a blocking defect in the diff",
             "skipped",
             "reported a BLOCKING finding",
             id="a local finding",
@@ -912,7 +1070,7 @@ def test_fresh_heartbeat_and_credits_the_sovereign_lane_carries_the_diff_half(wo
         pytest.param(
             _local(**{"pass": False}),
             _paid_wider(),
-            "PR automation: sovereign lane could not complete the diff review",
+            "PR review: sovereign lane could not complete the diff review",
             "skipped",
             "declined WITHOUT reporting any finding",
             id="a local decline",
@@ -920,7 +1078,7 @@ def test_fresh_heartbeat_and_credits_the_sovereign_lane_carries_the_diff_half(wo
         pytest.param(
             _local(),
             _paid_wider(wider_findings=[FINDING]),
-            "PR automation: review findings (documentation half, paid lane)",
+            "PR review: review findings (documentation half, paid lane)",
             "success",
             "returned actionable findings; bounded repair addresses them",
             id="a paid documentation finding",
@@ -928,7 +1086,7 @@ def test_fresh_heartbeat_and_credits_the_sovereign_lane_carries_the_diff_half(wo
         pytest.param(
             _local(**{"pass": False}, findings=[FINDING]),
             _paid_wider(links_valid=False),
-            "PR automation: review findings (both halves)",
+            "PR review: review findings (both halves)",
             "success",
             "reported a BLOCKING finding",
             id="both halves",
@@ -969,7 +1127,7 @@ def test_no_heartbeat_is_exactly_todays_behaviour(workflow, state, paid, review_
     word, what it published before the lanes split."""
     run = workflow.run(heartbeat=False, credits=True, state=state, paid=paid)
 
-    assert run.lane == {"sovereign_lane": "false", "sovereign_carries": "false"}
+    assert run.lanes == {"sovereign_lane": "false", "sovereign_carries": "false"}
     assert run.jobs["review-sovereign"]["result"] == "skipped"
     assert run.local_calls == []
     assert run.schema == REVIEW_CONTRACT.json_schema()
@@ -1024,8 +1182,8 @@ def test_no_credits_is_exactly_the_local_fallback(
     nothing is repaired, exactly as before."""
     run = workflow.run(heartbeat=True, credits=False, trusted=trusted, local=local)
 
-    assert run.lane["sovereign_lane"] == "true"
-    assert run.lane["sovereign_carries"] == _text(trusted)
+    assert run.lanes["sovereign_lane"] == "true"
+    assert run.lanes["sovereign_carries"] == _text(trusted)
     role = run.local_calls[0][run.local_calls[0].index("--role") + 1]
     assert role == ("sovereign" if trusted else "fallback")
     assert run.jobs["review"]["result"] == "failure"
@@ -1062,7 +1220,7 @@ def test_an_outside_authors_diff_is_still_reviewed_in_full_by_the_paid_lane(
         heartbeat=True, credits=True, trusted=False, local=_local(**{"pass": False}), paid=paid
     )
 
-    assert run.lane == {"sovereign_lane": "true", "sovereign_carries": "false"}
+    assert run.lanes == {"sovereign_lane": "true", "sovereign_carries": "false"}
     assert run.jobs["review-sovereign"]["result"] == "success"
     assert run.schema == REVIEW_CONTRACT.json_schema()
     assert "sovereign lane" not in run.prompt
@@ -1075,7 +1233,7 @@ def test_a_fork_never_reaches_the_self_hosted_runner(workflow):
         heartbeat=True, credits=True, trusted=True, same_repo=False, paid=_paid_full()
     )
 
-    assert run.lane == {"sovereign_lane": "false", "sovereign_carries": "false"}
+    assert run.lanes == {"sovereign_lane": "false", "sovereign_carries": "false"}
     assert run.jobs["review-sovereign"]["result"] == "skipped"
     assert run.local_calls == []
     assert run.schema == REVIEW_CONTRACT.json_schema()
@@ -1090,7 +1248,771 @@ def test_a_repository_that_opts_out_never_offers_the_lane(tmp_path):
         root=tmp_path,
         pr_automation=PrAutomationConfig(fallback=PrAutomationFallbackConfig(enabled=False)),
     )
-    jobs = yaml.safe_load(render_workflow(WORKFLOWS / "pr-automation.yml", cfg))["jobs"]
+    jobs = yaml.safe_load(render_workflow(WORKFLOWS / "pr-review.yml", cfg))["jobs"]
 
     assert jobs["review-sovereign"]["if"].startswith("false &&")
-    assert jobs["evaluate"]["steps"][-1]["env"]["ENABLED"] is False
+    lane = next(step for step in jobs["evaluate"]["steps"] if step.get("id") == "lane")
+    assert lane["env"]["ENABLED"] is False
+
+
+# --------------------------------------------------------------------------------------
+# No paid review declared (sub-doctrine 8.b): the sovereign lane answers the whole review
+# --------------------------------------------------------------------------------------
+
+
+def test_with_no_paid_lane_the_sovereign_verdict_is_the_whole_review():
+    envelope = REVIEW_COMPOSER.compose(
+        None, half=NO_PAID, sovereign=_sovereign_whole(), head_sha="abc"
+    )
+    verdict = envelope["verdict"]
+
+    assert envelope["half"] == NO_PAID
+    assert verdict["pass"] is True
+    assert verdict["head_sha"] == "abc"
+    assert envelope["carried"] == {name: SOVEREIGN_LANE for name in REVIEW_CONTRACT.fields}
+    assert verdict["carried"] == envelope["carried"]
+    # The schema's own key order, then what the composer adds. The scope was checked, not
+    # persisted: it is a fact about how the reviewer was run, not part of its answer.
+    assert list(verdict) == [
+        "pass",
+        *JUDGMENTS,
+        "summary",
+        "findings",
+        "head_sha",
+        "carried",
+        "repairable",
+    ]
+    assert envelope["structured"] == verdict
+    assert envelope["halves"] == {FULL: {"lane": SOVEREIGN_LANE, "passed": True, "findings": 0}}
+    assert envelope["findings"] == 0
+    # Repair is a paid agent; with no paid lane declared nothing may reach for it.
+    assert envelope["repairable"] is False and verdict["repairable"] is False
+
+
+@pytest.mark.parametrize(
+    ("answer", "findings"),
+    [
+        pytest.param(_sovereign_whole(**{"pass": False}), 0, id="the reviewer declined"),
+        pytest.param(_sovereign_whole(findings=[FINDING]), 1, id="a finding"),
+        pytest.param(_sovereign_whole(links_valid=False), 0, id="a judgment fails"),
+        pytest.param(_sovereign_whole(links_valid="true"), 0, id="a judgment spelt as a string"),
+    ],
+)
+def test_a_whole_sovereign_review_passes_only_on_every_count(answer, findings):
+    """Its own `pass` (a local decline is a decline), every judgment exactly true, and no
+    findings: the strictest reading of both halves, because nothing else looks."""
+    envelope = REVIEW_COMPOSER.compose(None, half=NO_PAID, sovereign=answer, head_sha="abc")
+
+    assert envelope["verdict"]["pass"] is False
+    assert envelope["halves"][FULL]["passed"] is False
+    assert envelope["findings"] == findings
+    assert envelope["repairable"] is False
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [None, [DIFF_GROUNDABLE], [REQUIRES_WIDER_CONTEXT], "full", [DIFF_GROUNDABLE, "both"]],
+    ids=["unstated", "diff only", "wider only", "not a list", "an unknown half"],
+)
+def test_a_verdict_that_did_not_answer_both_halves_never_stands_for_the_whole_review(scope):
+    """A diff-only verdict writes `true` into every judgment it never made. Read as a whole
+    review it would pass sixteen of them on no evidence at all -- the exact lie the
+    placeholders are documented not to tell."""
+    answer = _sovereign(**{"pass": True})
+    if scope is None:
+        del answer[REVIEW_CONTRACT.scope_field]
+    else:
+        answer[REVIEW_CONTRACT.scope_field] = scope
+
+    with pytest.raises(ValueError, match="did not answer both halves"):
+        REVIEW_COMPOSER.compose(None, half=NO_PAID, sovereign=answer, head_sha="abc")
+
+
+def test_with_no_paid_lane_there_is_no_paid_answer_to_compose():
+    with pytest.raises(ValueError, match="no paid review is declared"):
+        REVIEW_COMPOSER.compose(_paid_full(), half=NO_PAID, sovereign=_sovereign_whole())
+    with pytest.raises(ValueError, match="the sovereign lane's whole-review verdict is needed"):
+        REVIEW_COMPOSER.compose({}, half=NO_PAID, head_sha="abc")
+    with pytest.raises(TypeError, match="sovereign verdict must be a JSON object, not list"):
+        REVIEW_COMPOSER.compose(None, half=NO_PAID, sovereign=[])  # type: ignore[arg-type]
+
+
+def test_combine_composes_a_sovereign_only_review_from_the_command_line(capsys):
+    """`vibey-gh pr-automation combine --half none` is how the workflow records it: no
+    `--paid` at all, because nothing paid was asked."""
+    from vibey_gh.cli import main
+
+    code = main(
+        [
+            "pr-automation",
+            "combine",
+            "--half",
+            NO_PAID,
+            "--sovereign",
+            json.dumps(_sovereign_whole()),
+            "--head-sha",
+            "abc",
+        ]
+    )
+
+    assert code == 0
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["verdict"]["pass"] is True
+    assert envelope["carried"]["links_valid"] == SOVEREIGN_LANE
+
+    assert main(["pr-automation", "combine", "--half", FULL, "--head-sha", "abc"]) == 1
+    assert "the paid lane returned no answer to compose" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------------------
+# The declaration itself
+# --------------------------------------------------------------------------------------
+
+
+PAID_DECLARATIONS = ("paid_review", "paid_repair", "paid_conflict_resolution")
+
+
+@pytest.mark.parametrize("key", PAID_DECLARATIONS)
+def test_every_paid_call_in_pr_automation_is_declared_only(tmp_path, key):
+    """8.b, applied to every job that reaches the paid model -- review, repair, conflict
+    resolution -- one key per use, each false unless a human writes it true."""
+    from vibey_gh.config import PrAutomationConfig, load_config
+
+    assert getattr(PrAutomationConfig(), key) is False
+    assert getattr(load_config(tmp_path).pr_automation, key) is False
+    (tmp_path / ".vibey-gh.toml").write_text(f"[pr_automation]\n{key} = true\n", "utf-8")
+    assert getattr(load_config(tmp_path).pr_automation, key) is True
+    (tmp_path / ".vibey-gh.toml").write_text(f'[pr_automation]\n{key} = "true"\n', "utf-8")
+    with pytest.raises(ValueError, match=f"pr_automation.{key} must be true or false"):
+        load_config(tmp_path)
+
+
+@pytest.mark.parametrize("root", ["tenant", "workspace"])
+def test_this_repository_declares_no_paid_pr_automation(root):
+    """The operator's instruction: the sovereign lanes INSTEAD OF ANTHROPIC_API_KEY."""
+    from vibey_gh.config import load_config
+
+    tenant = Path(__file__).resolve().parent.parent
+    where = (
+        tenant
+        if root == "tenant"
+        else next(
+            (parent for parent in tenant.parents if (parent / ".vibey-gh.toml").is_file()), None
+        )
+    )
+    if where is None:  # pragma: no cover - a standalone sdist has no workspace
+        pytest.skip("no workspace configuration outside the tenant")
+    text = (where / ".vibey-gh.toml").read_text(encoding="utf-8")
+    for key in PAID_DECLARATIONS:
+        assert f"{key} = false" in text
+        assert getattr(load_config(where).pr_automation, key) is False
+
+
+def test_a_paid_review_is_declared_only():
+    """8.b: reaching for a paid counterparty is the move that must be declared aloud, in
+    the repository. Undeclared -- an absent key, a fresh configuration -- means sovereign
+    only, so the default is `false` in the dataclass and the loader alike."""
+    from vibey_gh.config import PrAutomationConfig, load_config
+
+    assert PrAutomationConfig().paid_review is False
+    assert (
+        load_config(Path(__file__).resolve().parent / "golden").pr_automation.paid_review is False
+    )
+
+
+def test_the_declaration_is_read_from_pr_automation(tmp_path):
+    from vibey_gh.config import load_config
+
+    (tmp_path / ".vibey-gh.toml").write_text("[pr_automation]\npaid_review = true\n", "utf-8")
+
+    assert load_config(tmp_path).pr_automation.paid_review is True
+
+
+@pytest.mark.parametrize("value", ['"true"', "1", '"yes"', "[]"])
+def test_a_declaration_that_is_not_a_boolean_is_refused_at_load(tmp_path, value):
+    """A declaration is a human writing `true` into the repository. A quoted string or a
+    number is not that, and reading one as truthy would reach for a paid counterparty on
+    a typo -- so it is refused, loudly, before anything renders."""
+    from vibey_gh.config import load_config
+
+    (tmp_path / ".vibey-gh.toml").write_text(f"[pr_automation]\npaid_review = {value}\n", "utf-8")
+
+    with pytest.raises(ValueError, match="pr_automation.paid_review must be true or false"):
+        load_config(tmp_path)
+
+
+def test_this_tenants_own_configuration_declares_no_paid_review():
+    """The operator's instruction, dogfooded: the tenant that ships the declaration says in
+    writing that its reviews run on the sovereign lane."""
+    from vibey_gh.config import load_config
+
+    tenant = Path(__file__).resolve().parent.parent
+    text = (tenant / ".vibey-gh.toml").read_text(encoding="utf-8")
+
+    assert "paid_review = false" in text
+    assert load_config(tenant).pr_automation.paid_review is False
+
+
+def test_the_whole_review_reads_the_documents_the_repository_declares(tmp_path):
+    """Which documents the sovereign lane judges the documentation contract against is a
+    key, not a list compiled into the workflow (12.h)."""
+    from vibey_gh.config import PrAutomationFallbackConfig, load_config
+
+    assert PrAutomationFallbackConfig().context_paths == ("README.md", "docs/index.md")
+    (tmp_path / ".vibey-gh.toml").write_text(
+        '[pr_automation.fallback]\ncontext_paths = ["README.md", "docs/guide.md"]\n', "utf-8"
+    )
+
+    assert load_config(tmp_path).pr_automation.fallback.context_paths == (
+        "README.md",
+        "docs/guide.md",
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",
+        "../README.md",
+        "docs/../../x",
+        "a b.md",
+        "docs/*.md",
+        "",
+        "README.md?x",
+        "~/x",
+    ],
+)
+def test_a_context_path_is_a_plain_repository_path(path):
+    """Each entry is fetched from the exact head through the contents API and word-split in
+    a shell loop, so it may be neither absolute, nor climbing, nor spaced, nor a glob."""
+    from vibey_gh.config import PrAutomationFallbackConfig
+
+    with pytest.raises(ValueError, match="context_paths"):
+        PrAutomationFallbackConfig(context_paths=(path,))
+
+
+def test_context_paths_are_unique():
+    from vibey_gh.config import PrAutomationFallbackConfig
+
+    with pytest.raises(ValueError, match="context_paths entries must be unique"):
+        PrAutomationFallbackConfig(context_paths=("README.md", "README.md"))
+
+
+# --------------------------------------------------------------------------------------
+# The rendered workflow with NO paid review declared (8.b), evaluated
+# --------------------------------------------------------------------------------------
+
+_DECLARED = "(no paid review is declared, 8.b)"
+
+
+@pytest.fixture
+def undeclared(tmp_path: Path) -> _Workflow:
+    return _Workflow(tmp_path, paid_review=False)
+
+
+def _never_paid(run: _Run) -> None:
+    """Nothing on the undeclared path asks the paid model or repairs on a local verdict."""
+    assert run.jobs["review"]["result"] == "skipped"
+    assert run.schema is None and run.prompt is None
+    assert run.jobs["repair"]["result"] == "skipped"
+    assert run.jobs["mirror-fork"]["result"] == "skipped"
+
+
+@needs_bash_and_jq
+def test_undeclared_a_trusted_head_gets_the_whole_review_from_the_sovereign_lane(undeclared):
+    """The operator's instruction: the sovereign lane instead of ANTHROPIC_API_KEY. It is
+    asked the whole review, judged against the declared documents fetched read-only at the
+    exact head, and its verdict alone is recorded and gates the merge."""
+    run = undeclared.run(heartbeat=True, credits=True, local=_whole())
+
+    assert run.lane["sovereign_whole"] == "true" and run.lane["human_reason"] == ""
+    assert run.lanes == {"sovereign_lane": "true", "sovereign_carries": "false"}
+    (call,) = run.local_calls
+    assert call[call.index("--role") + 1] == "sovereign"
+    assert call[call.index("--scope") + 1] == "full"
+    assert call[call.index("--context-dir") + 1].endswith("/context")
+    fetched = [c for c in run.gh_calls if c[:1] == ["api"] and "contents/" in " ".join(c)]
+    assert [c[-1] for c in fetched] == [
+        "repos/owner/repo/contents/README.md?ref=abc123",
+        "repos/owner/repo/contents/docs/index.md?ref=abc123",
+    ]
+    _never_paid(run)
+
+    (verdict,) = run.recorded
+    assert verdict["pass"] is True
+    assert set(verdict["carried"].values()) == {SOVEREIGN_LANE}
+    assert verdict["summary"].startswith("[SOVEREIGN LANE — gpt-oss:20b — whole review]")
+    assert run.jobs["record-sovereign"]["result"] == "success"
+    assert run.gate["conclusion"] == "success"
+    assert run.gate["merge_train"] is True
+    assert run.gate["title"] == "PR review: gate (sovereign lane, whole review)"
+    assert "no paid model was asked" in run.gate["summary"]
+    assert "not a repository-wide audit" in run.gate["summary"]
+
+
+@needs_bash_and_jq
+@pytest.mark.parametrize(
+    ("local", "title", "said"),
+    [
+        pytest.param(
+            _whole(**{"pass": False}, findings=[FINDING]),
+            "PR review: sovereign lane found blocking findings",
+            "reported 1 finding(s)",
+            id="a finding",
+        ),
+        pytest.param(
+            _whole(links_valid=False),
+            "PR review: sovereign lane did not pass the review",
+            "returned pass=false with no finding",
+            id="a judgment fails with no finding",
+        ),
+    ],
+)
+def test_undeclared_a_failing_whole_review_is_reported_and_never_repaired(
+    undeclared, local, title, said
+):
+    run = undeclared.run(heartbeat=True, credits=True, local=local)
+
+    _never_paid(run)
+    (verdict,) = run.recorded
+    assert verdict["pass"] is False and verdict["repairable"] is False
+    assert run.gate["conclusion"] == "failure"
+    assert run.gate["merge_train"] is False
+    assert run.gate["title"] == title
+    assert said in run.gate["summary"]
+    assert _DECLARED in run.gate["summary"]
+
+
+@needs_bash_and_jq
+@pytest.mark.parametrize(
+    ("scenario", "reason", "title"),
+    [
+        pytest.param(
+            {"trusted": False},
+            "the author is not a trusted author of this repository, and the sovereign lane"
+            " reviews trusted authors only",
+            "PR review: needs a human review",
+            id="an outside author",
+        ),
+        pytest.param(
+            {"same_repo": False},
+            "the head is in a fork (someone/fork), which never reaches the self-hosted"
+            " sovereign runner",
+            "PR review: needs a human review",
+            id="a fork",
+        ),
+        pytest.param(
+            {
+                "heartbeat": False,
+                "probe": "the sovereign heartbeat is 90m old, past the 15m window",
+            },
+            "the sovereign lane is not ready: the sovereign heartbeat is 90m old, past the 15m"
+            " window",
+            # The one reason that clears itself: the recovery sweep re-probes a gate titled
+            # "review incomplete" once the runner beats again.
+            "PR review: review incomplete (needs a human review)",
+            id="an unready sovereign lane",
+        ),
+    ],
+)
+def test_undeclared_nothing_the_sovereign_lane_cannot_review_gets_an_automated_pass(
+    undeclared, scenario, reason, title
+):
+    """An outside author, a fork, or an unready lane: no automated pass, and no paid model
+    asked in its place. The gate says a human is needed, and why, in so many words."""
+    run = undeclared.run(**({"heartbeat": True, "credits": True} | scenario))
+
+    assert run.lane["sovereign_whole"] == "false"
+    assert run.jobs["review-sovereign"]["result"] == "skipped"
+    assert run.local_calls == [] and run.recorded == []
+    _never_paid(run)
+    assert run.gate["conclusion"] == "failure"
+    assert run.gate["merge_train"] is False
+    assert run.gate["title"] == title
+    assert f"needs a human review: {reason} {_DECLARED}." in run.gate["summary"]
+
+
+@needs_bash_and_jq
+def test_undeclared_a_lane_switched_off_says_so(tmp_path):
+    run = _Workflow(tmp_path, paid_review=False, enabled=False).run(heartbeat=True, credits=True)
+
+    assert run.jobs["review-sovereign"]["result"] == "skipped"
+    _never_paid(run)
+    assert run.gate["title"] == "PR review: needs a human review"
+    assert (
+        "needs a human review: the sovereign lane is switched off"
+        " ([pr_automation.fallback] enabled = false) (no paid review is declared, 8.b)."
+    ) in run.gate["summary"]
+
+
+@needs_bash_and_jq
+def test_undeclared_a_sovereign_lane_that_gives_no_verdict_names_the_reason(undeclared):
+    """ "No verdict" is never all the gate can say: the reviewer's own reason travels from
+    the step that failed, through the job, into the published check."""
+    run = undeclared.run(heartbeat=True, credits=True, local=None)
+
+    assert run.jobs["review-sovereign"]["result"] == "failure"
+    assert run.jobs["review-sovereign"]["outputs"]["reason"] == "local model unreachable"
+    assert "::error::the sovereign lane produced no verdict: local model unreachable" in run.errors
+    assert run.jobs["record-sovereign"]["result"] == "skipped"
+    _never_paid(run)
+    assert run.gate["conclusion"] == "failure"
+    assert run.gate["title"] == "PR review: review incomplete (needs a human review)"
+    assert (
+        "needs a human review: the sovereign lane produced no verdict: local model unreachable"
+        f" {_DECLARED}."
+    ) in run.gate["summary"]
+
+
+@needs_bash_and_jq
+def test_undeclared_a_blocked_head_is_as_it_was(undeclared):
+    run = undeclared.run(heartbeat=True, credits=True, state="blocked")
+
+    assert run.jobs["review"]["result"] == "skipped"
+    _assert_gate_is_golden(run.gate, _golden("blocked", "", "skipped"))
+
+
+_NO_PAID_REPAIR = "needs a human: automated repair needs a paid model, and none is declared (8.b)"
+
+
+@needs_bash_and_jq
+def test_undeclared_failing_scans_are_handed_to_a_human_not_a_paid_model(undeclared):
+    """Failing scans used to start a paid repair. Undeclared, the repair job is never
+    scheduled, and the gate says what that leaves: a person."""
+    run = undeclared.run(heartbeat=True, credits=True, state="repair")
+
+    assert run.jobs["repair"]["result"] == "skipped"
+    assert run.jobs["mirror-fork"]["result"] == "skipped"
+    assert run.gate["conclusion"] == "failure"
+    assert run.gate["title"] == "PR review: needs a human (failing scans)"
+    assert f"completed checks are failing. {_NO_PAID_REPAIR}." in run.gate["summary"]
+
+
+@needs_bash_and_jq
+def test_a_paid_review_without_paid_repair_never_promises_a_repair(tmp_path):
+    """Review declared, repair not: the paid review's findings stand, and the gate no
+    longer says a bounded repair will address them -- nothing will."""
+    workflow = _Workflow(tmp_path, paid_review=True, paid_repair=False)
+    run = workflow.run(heartbeat=False, credits=True, paid=_paid_full(findings=[FINDING]))
+
+    assert run.jobs["review"]["result"] == "success"
+    assert run.jobs["repair"]["result"] == "skipped"
+    assert run.gate["title"] == "PR review: review findings"
+    assert "Bounded repair" not in run.gate["summary"]
+    assert _NO_PAID_REPAIR in run.gate["summary"]
+
+
+@needs_bash_and_jq
+@pytest.mark.parametrize("declared", [True, False])
+def test_a_conflict_says_a_human_is_needed_when_no_paid_resolution_is_declared(tmp_path, declared):
+    """The gate publishes nothing for a conflict (a resolution will move the head), so the
+    evaluation says it, where the run's summary shows it."""
+    workflow = _Workflow(tmp_path, paid_review=True, paid_conflict_resolution=declared)
+    step = workflow._step("evaluate", id="unpaid")
+    context = {"steps": {"evaluate": {"outputs": {"state": "conflict"}}}}
+
+    completed, _ = workflow._bash(step, context, {})
+
+    said = (
+        "needs a human: automated conflict resolution needs a paid model, and none is"
+        " declared (8.b)"
+    )
+    assert completed.returncode == 0
+    assert (said in completed.stdout) is not declared
+    summary = tmp_path / "step-summary.md"
+    assert (summary.exists() and said in summary.read_text("utf-8")) is not declared
+
+
+def _paid_jobs(jobs: dict) -> dict:
+    """Every job that can hand anything to the paid model or read its secret."""
+    return {
+        name: job
+        for name, job in jobs.items()
+        if "claude-code-action" in json.dumps(job) or "ANTHROPIC" in json.dumps(job)
+    }
+
+
+def test_with_nothing_paid_declared_no_job_can_run_with_the_api_key(tmp_path):
+    """What the operator's next step rests on -- deleting the ANTHROPIC_API_KEY secret:
+    with every paid declaration false, every job that references the paid model or its
+    secret carries a literal `false` at the head of its condition, so GitHub can never
+    schedule it, whatever the event, the state or the author."""
+    from vibey_gh.config import PrAutomationConfig
+
+    cfg = GhConfig(root=tmp_path, pr_automation=PrAutomationConfig())
+    jobs = yaml.safe_load(render_workflow(WORKFLOWS / "pr-review.yml", cfg))["jobs"]
+
+    paid = _paid_jobs(jobs)
+    assert set(paid) == {"review", "repair", "resolve-conflict"}
+    for name, job in paid.items():
+        assert job["if"].startswith("false &&"), name
+        assert _truthy(_Expression(job["if"], {}).value()) is False, name
+    # And the ones that stay schedulable never touch it.
+    for name, job in jobs.items():
+        if name not in paid:
+            assert "secrets.ANTHROPIC" not in json.dumps(job), name
+
+
+@pytest.mark.parametrize("key", PAID_DECLARATIONS)
+def test_each_declaration_opens_exactly_its_own_job(tmp_path, key):
+    from vibey_gh.config import PrAutomationConfig
+
+    owner = {
+        "paid_review": "review",
+        "paid_repair": "repair",
+        "paid_conflict_resolution": "resolve-conflict",
+    }
+    cfg = GhConfig(root=tmp_path, pr_automation=PrAutomationConfig(**{key: True}))
+    jobs = yaml.safe_load(render_workflow(WORKFLOWS / "pr-review.yml", cfg))["jobs"]
+
+    for name, job in _paid_jobs(jobs).items():
+        assert job["if"].startswith("true &&" if name == owner[key] else "false &&"), name
+
+
+@pytest.mark.parametrize(
+    ("repair", "conflict", "state", "runs"),
+    [
+        (False, False, "repair", False),
+        (True, False, "repair", True),
+        (False, False, "conflict", False),
+        (False, True, "conflict", True),
+        (True, False, "conflict", False),
+    ],
+)
+def test_a_fork_is_mirrored_only_for_a_declared_paid_job(tmp_path, repair, conflict, state, runs):
+    """Mirroring a fork exists so a paid repair or resolution can work on it. With neither
+    declared it would replace a contributor's pull request for nothing."""
+    workflow = _Workflow(
+        tmp_path, paid_review=False, paid_repair=repair, paid_conflict_resolution=conflict
+    )
+    needs = {
+        "evaluate": {"result": "success", "outputs": {"fork": "true", "state": state}},
+        "review": {"result": "skipped", "outputs": {}},
+    }
+    context = {"inputs": {}, "needs": needs}
+
+    assert _condition(workflow.jobs["mirror-fork"], context, needs) is runs
+
+
+def test_undeclared_the_rendered_workflow_never_schedules_the_paid_review(tmp_path):
+    """The declaration renders as a literal at the head of the paid job's condition, so an
+    undeclared repository's workflow skips it before GitHub schedules anything -- the
+    API secret is never read on that path."""
+    from vibey_gh.config import PrAutomationConfig
+
+    def jobs(paid: bool) -> dict:
+        cfg = GhConfig(root=tmp_path, pr_automation=PrAutomationConfig(paid_review=paid))
+        return yaml.safe_load(render_workflow(WORKFLOWS / "pr-review.yml", cfg))["jobs"]
+
+    undeclared, declared = jobs(False), jobs(True)
+    assert undeclared["review"]["if"].startswith("false &&")
+    assert declared["review"]["if"].startswith("true &&")
+    assert undeclared["record-sovereign"]["if"].startswith("false == false &&")
+    assert declared["record-sovereign"]["if"].startswith("true == false &&")
+    # The default configuration is the undeclared one.
+    default = yaml.safe_load(render_workflow(WORKFLOWS / "pr-review.yml", GhConfig(root=tmp_path)))[
+        "jobs"
+    ]
+    assert default["review"]["if"].startswith("false &&")
+
+
+# --------------------------------------------------------------------------------------
+# Honest failures: a refused paid call is named as one (12.i)
+# --------------------------------------------------------------------------------------
+
+
+@needs_bash_and_jq
+@pytest.mark.parametrize(
+    ("text", "said"),
+    [
+        pytest.param("Credit balance is too low", "Credit balance is too low", id="credit"),
+        pytest.param("", "no reason given", id="no reason"),
+        pytest.param(
+            "Denied\n[click](https://evil.example) <b>@someone</b> `x`",
+            "Denied click(https://evil.example) bsomeone/b x",
+            id="markup is not published",
+        ),
+    ],
+)
+def test_a_refused_paid_review_is_named_as_a_refusal(workflow, text, said):
+    """The action ends a refused call with "Result subtype: success", which is false. The
+    execution record says `is_error`, so the refusal is this step's error, in plain words,
+    and the gate reports it instead of a bare "review job: failure"."""
+    run = workflow.run(heartbeat=False, credits=False, refused=text)
+
+    refusal = f"the paid review was refused by the API: {said}"
+    assert run.jobs["review"]["outputs"]["refusal"] == refusal
+    assert f"::error::{refusal}" in run.errors
+    assert run.gate["conclusion"] == "failure"
+    assert run.gate["title"] == "PR review: review incomplete"
+    assert f"returned no verdict ({refusal}) and no local fallback" in run.gate["summary"]
+
+
+@needs_bash_and_jq
+def test_a_refusal_beside_a_passing_fallback_still_names_the_refusal(workflow):
+    run = workflow.run(
+        heartbeat=True, credits=False, local=_local(), refused="Credit balance is too low"
+    )
+
+    assert run.gate["title"] == "PR review: gate (local fallback)"
+    assert (
+        "returned no verdict (the paid review was refused by the API: Credit balance is too"
+        " low), so a LOCAL FALLBACK model"
+    ) in run.gate["summary"]
+
+
+def _refused_record(tmp_path: Path, text: str) -> Path:
+    record = tmp_path / "claude-execution-output.json"
+    record.write_text(
+        "\n".join(  # JSONL: one of the three shapes the record has been seen to take
+            json.dumps(entry)
+            for entry in (
+                {"type": "system", "subtype": "init"},
+                {"type": "result", "subtype": "success", "is_error": True, "result": text},
+            )
+        ),
+        encoding="utf-8",
+    )
+    return record
+
+
+@needs_bash_and_jq
+@pytest.mark.parametrize(
+    ("job", "what"),
+    [("review", "review"), ("repair", "repair"), ("resolve-conflict", "conflict resolution")],
+)
+def test_every_paid_call_names_its_own_refusal(workflow, tmp_path, job, what):
+    """Wherever the workflow reads a paid result -- review, repair, conflict resolution --
+    an `is_error` record is that step's error, in the same plain words."""
+    record = _refused_record(tmp_path, "Credit balance is too low")
+    context = {"steps": {"claude": {"outputs": {"execution_file": str(record)}}}}
+
+    completed, outputs = workflow._bash(workflow._step(job, id="why"), context, {})
+
+    refusal = f"the paid {what} was refused by the API: Credit balance is too low"
+    assert completed.returncode == 1
+    assert outputs == {"refusal": refusal}
+    assert f"::error::{refusal}" in completed.stdout.splitlines()
+
+
+@needs_bash_and_jq
+def test_a_call_that_was_not_refused_raises_no_refusal(workflow, tmp_path):
+    """A model that ran and answered badly is not the API refusing it: the step keeps
+    reporting the facts, and names no refusal."""
+    record = tmp_path / "claude-execution-output.json"
+    record.write_text(json.dumps({"type": "result", "is_error": False, "result": "ok"}), "utf-8")
+    context = {"steps": {"claude": {"outputs": {"execution_file": str(record)}}}}
+
+    completed, outputs = workflow._bash(workflow._step("repair", id="why"), context, {})
+
+    assert completed.returncode == 0
+    assert outputs == {}
+    assert "is_error=false" in completed.stdout
+
+
+@needs_bash_and_jq
+def test_a_refused_repair_is_named_in_the_gate(workflow, tmp_path):
+    gate = workflow.jobs["gate"]
+    refusal = "the paid repair was refused by the API: Credit balance is too low"
+    needs = {
+        "evaluate": {"outputs": {"pr": "12", "head_sha": "abc123", "state": "repair"}},
+        "repair": {"result": "failure", "outputs": {"refusal": refusal}},
+    }
+    context = {
+        "github": {"repository": "owner/repo", "event": {"repository": {}}},
+        "needs": needs
+        | {"evaluate": {"outputs": needs["evaluate"]["outputs"] | {"reason": REASONS["repair"]}}},
+    }
+
+    completed, _ = workflow._bash(gate["steps"][0], context, {})
+
+    calls = [json.loads(line) for line in (tmp_path / "gh.jsonl").read_text().splitlines()]
+    (check,) = [call for call in calls if call[:2] == ["api", "repos/owner/repo/check-runs"]]
+    assert f"output[summary]=completed checks are failing. {refusal}. Run " in " ".join(check)
+    assert completed.returncode == 1
+
+
+# --------------------------------------------------------------------------------------
+# The sovereign model's window, declared from the host's own measurement (#1090)
+# --------------------------------------------------------------------------------------
+
+
+def test_the_sovereign_models_window_is_declared_not_compiled_in(tmp_path):
+    from vibey_gh import fit
+    from vibey_gh.config import PrAutomationFallbackConfig, load_config
+
+    default = PrAutomationFallbackConfig()
+    assert default.context_window == fit.DEFAULT_CONTEXT_CEILING_TOKENS == 65536
+    assert default.reasoning_reserve_tokens == fit.DEFAULT_CONTEXT_RESERVE_TOKENS == 8192
+    assert default.chars_per_token == fit.DEFAULT_CHARS_PER_TOKEN == 3
+    # The configuration's bound on it is the sizer's own.
+    PrAutomationFallbackConfig(chars_per_token=fit.MAX_CHARS_PER_TOKEN)
+    with pytest.raises(ValueError, match="chars_per_token"):
+        PrAutomationFallbackConfig(chars_per_token=fit.MAX_CHARS_PER_TOKEN + 1)
+    assert default.think == ""  # the model's own default: fidelity is not traded blind
+    (tmp_path / ".vibey-gh.toml").write_text(
+        "[pr_automation.fallback]\ncontext_window = 131072\nreasoning_reserve_tokens = 4096\n"
+        'chars_per_token = 4\nthink = "low"\n',
+        "utf-8",
+    )
+    loaded = load_config(tmp_path).pr_automation.fallback
+    assert (loaded.context_window, loaded.reasoning_reserve_tokens) == (131072, 4096)
+    assert (loaded.chars_per_token, loaded.think) == (4, "low")
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"context_window": 2048}, "context_window"),
+        ({"reasoning_reserve_tokens": 512}, "reasoning_reserve_tokens"),
+        ({"reasoning_reserve_tokens": 65536}, "reasoning_reserve_tokens"),
+        ({"chars_per_token": 0}, "chars_per_token"),
+        ({"chars_per_token": 9}, "chars_per_token"),
+        ({"chars_per_token": 2.5}, "chars_per_token"),
+        ({"chars_per_token": float("nan")}, "chars_per_token"),
+        ({"think": "max"}, "think"),
+        ({"max_document_chars": 999}, "max_document_chars"),
+        ({"max_document_chars": 5000.0}, "max_document_chars"),
+    ],
+)
+def test_a_window_that_could_not_hold_a_review_is_refused(changes, message):
+    from vibey_gh.config import PrAutomationFallbackConfig
+
+    with pytest.raises(ValueError, match=message):
+        PrAutomationFallbackConfig(**changes)
+
+
+@pytest.mark.parametrize("name", ["pr-review.yml", "issue-automation.yml"])
+def test_every_local_model_call_is_handed_the_declared_window(tmp_path, name):
+    """The runner's working directory holds no .vibey-gh.toml, so a window left to the
+    command's defaults would be the package's, not the host's own measurement."""
+    from vibey_gh.config import PrAutomationConfig, PrAutomationFallbackConfig
+
+    fallback = PrAutomationFallbackConfig(
+        context_window=131072, reasoning_reserve_tokens=6000, chars_per_token=4, think="low"
+    )
+    cfg = GhConfig(root=tmp_path, pr_automation=PrAutomationConfig(fallback=fallback))
+    text = render_workflow(WORKFLOWS / name, cfg)
+
+    assert "--context-window 131072" in text
+    assert "--reasoning-reserve 6000" in text
+    assert "--chars-per-token 4" in text
+    assert "--think 'low'" in text
+
+
+def test_the_documents_have_a_limit_of_their_own_not_the_diffs(tmp_path):
+    """`max_document_chars` bounds the whole review's documents; `max_diff_chars` bounds the
+    diff. Tied together, this repository's own two pages reached the diff's 60,000 and a
+    small README edit turned every gate red. Declared, loaded, and handed to the review."""
+    from vibey_gh.config import PrAutomationConfig, PrAutomationFallbackConfig, load_config
+
+    assert PrAutomationFallbackConfig().max_document_chars == 120000
+    (tmp_path / ".vibey-gh.toml").write_text(
+        "[pr_automation.fallback]\nmax_document_chars = 250000\n", "utf-8"
+    )
+    assert load_config(tmp_path).pr_automation.fallback.max_document_chars == 250000
+
+    fallback = PrAutomationFallbackConfig(max_diff_chars=50000, max_document_chars=250000)
+    cfg = GhConfig(root=tmp_path, pr_automation=PrAutomationConfig(fallback=fallback))
+    text = render_workflow(WORKFLOWS / "pr-review.yml", cfg)
+    assert "--max-chars 50000 \\\n                --max-document-chars 250000" in text

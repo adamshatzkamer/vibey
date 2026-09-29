@@ -19,8 +19,9 @@ document when reviewing or operating GitHub Actions. Deeper references cover
 topic branch push
   -> Branch intake opens or reuses a draft PR
   -> CI, CodeQL, Provenance, and Docs settle for the exact head
-  -> PR automation reviews, repairs, or resolves conflicts within a bounded budget
-  -> PR automation publishes an exact-head gate
+  -> PR evaluation publishes the exact-head scan gate and dispatches PR review
+  -> PR review certifies the exact-head verdict, repairing or resolving conflicts within
+     a bounded budget
   -> Merge train squash-merges into develop
   -> Release publishes the preview package and documentation channel
   -> Promote opens develop -> main, or refreshes the open PR's title and body
@@ -46,7 +47,8 @@ events. A skipped stale run is expected. A current-head failure is never bypasse
 | `provenance.yml` | Provenance | Verifies source fingerprints, Conventional Commit subjects, and the required `Made-With` trailer without rewriting permanent history. |
 | `conventional-commits.yml` | Conventional Commits | Audits commit subjects and may safely normalize a linear same-repository topic branch with an exact-head lease. |
 | `documentation.yml` | Docs | Enforces the FOSS, human, agent, plugin-marketplace, Mermaid, SEO, crawler, and LLM documentation contract. |
-| `pr-automation.yml` | PR automation | Aggregates current-head scans, runs semantic review (with an opt-in self-hosted local-model fallback when the primary review returns no verdict), performs bounded repair or conflict resolution, persists lineage state, and publishes the merge gate. |
+| `pr-evaluate.yml` | PR evaluate | Responds to scan-workflow completions, reloads the current head, and publishes the `PR evaluate / gate` scan gate whose red title names the failing checks — then dispatches `pr-review.yml` for `ready` / `review` / `repair` / `conflict` states. |
+| `pr-review.yml` | PR review | Runs the structured exact-head review (with the opt-in sovereign lane), performs bounded repair or conflict resolution with fork mirroring and escalation, persists lineage state, and publishes the `PR review / gate` gate that dispatches the merge train. |
 | `automation-bootstrap.yml` | Automation bootstrap | Provides an explicitly authorized one-time path for merging a workflow repair when the older base workflow cannot repair itself; it waits on the integration ruleset's `required_checks` (less `ignored_checks` and the routed-around gate) and confines the change to automation-core paths under `[install] self_source`. |
 | `merge-train.yml` | Merge train | Squash-merges eligible PRs to `develop` and rebase-merges eligible promotion PRs to `main`. |
 | `promote-to-main.yml` | Promote | Opens the asynchronous `develop -> main` promotion PR after integration succeeds, or refreshes the open one's title and body. |
@@ -63,12 +65,16 @@ prevent downstream automation from firing.
 
 ## Exact-head PR automation
 
-`pr-automation.yml` resolves the PR associated with a completed scan, reloads it, and
+`pr-evaluate.yml` resolves the PR associated with a completed scan, reloads it, and
 compares the event SHA with the current head. It waits while non-ignored checks are queued
 or running. Successful, neutral, and intentional skipped results are non-failing;
 failures, timeouts, startup failures, and action-required results enter repair; cancelled
 or stale infrastructure runs are operationally blocked rather than presented as source
-defects.
+defects. It publishes the `PR evaluate / gate` scan gate on the exact head, and when scans
+have settled dispatches `pr-review.yml`, which runs the structured exact-head review and
+publishes the `PR review / gate` gate that sends the merge train its instruction. A
+conflicted head publishes no scan check: the resolution attempt runs in `pr-review.yml`,
+and conflict resolution is not a scan verdict.
 
 Repair, conflict, and review-finding budgets share one bound per contributor lineage, and
 it applies to trusted and outside authors alike — every author's exact head is reviewed, so
@@ -84,6 +90,14 @@ maintainability, architecture-boundary, and test-quality review. Forks are inspe
 never mutated with privileged credentials; required edits use a linked repository-owned
 replacement PR that preserves the contributor and exact head.
 
+Whether the review reaches a paid model at all is a declaration, `[pr_automation]
+paid_review`, and it is `false` by default (sub-doctrine 8.b: a paid counterparty is
+declared-only). Undeclared, the `review` job never runs: the sovereign lane below answers the
+**whole** review — the diff and the documentation-contract judgments — for a trusted author
+whose head is in this repository, and every other pull request (an outside author, a fork,
+or one arriving while the runner is down) fails the gate with `needs a human review: <why>
+(no paid review is declared, 8.b)`. What follows describes the declared path.
+
 With `[pr_automation.fallback].enabled = true` (the default) and a self-hosted runner
 labelled `vibey-local-gh` whose heartbeat is fresh, the review's diff half runs on that
 runner FIRST (sub-doctrine 8.a): a `review-sovereign` job sends the diff to a local
@@ -93,7 +107,7 @@ runner entirely. For a trusted author the local verdict carries `pass`, `summary
 `findings`, the paid review above answers only the documentation-contract judgments, and
 the gate names the lane behind each half; a local finding never starts an automated
 repair. For any other author the local verdict is held in reserve and read only when the
-paid review returns no verdict at all, under the honestly weaker title `PR automation:
+paid review returns no verdict at all, under the honestly weaker title `PR review:
 gate (local fallback)`. `vibey-gh local-triage` is the equivalent fallback for issue
 automation and always forces `needs_human=true`. See [Configuration](../docs/configuration.md) and
 [Threat model](../docs/threat-model.md).
@@ -152,8 +166,12 @@ private-repository diagnostic.
 
 ## Credentials and settings
 
-- `ANTHROPIC_API_KEY` must be a repository secret for AI review, repair, conflict
-  resolution, autonomous issue solutions, documentation upkeep, and release repair.
+- `ANTHROPIC_API_KEY` must be a repository secret for autonomous issue solutions,
+  documentation upkeep, and release repair — and for PR review, repair and conflict
+  resolution only where `[pr_automation] paid_review`, `paid_repair` or
+  `paid_conflict_resolution` declares that paid use (8.b; each is `false` by default). A call the API refuses
+  is reported as `the paid <review|repair|conflict resolution> was refused by the API:
+  <reason>`, never as the action's closing "Result subtype: success".
 - `AUTOMERGE_TOKEN` is needed when the default `GITHUB_TOKEN` cannot merge through the
   ruleset, manage settings, create PRs, or reconcile the repository profile and rulesets.
 - PyPI and TestPyPI use trusted publishing through the `pypi` and `testpypi` environments;
@@ -202,13 +220,14 @@ to act on. See [Releases](../docs/releases.md).
 ## Failure recovery
 
 1. Open the failed check attached to the exact PR head, not an older cancelled run.
-2. Read the first failing trusted step and the `PR automation / gate` summary. The gate's
-   title names who decided the outcome: `PR automation: ready` reports the evaluation,
-   `PR automation: review findings` means the exact-head review returned actionable work,
-   `PR automation: review incomplete` means the review returned no verdict at all —
-   an infrastructure or operator failure such as an exhausted API credit balance, not a
+2. Read the first failing trusted step and the two gates' summaries. `PR evaluate / gate`
+   names the scans: a red title like `PR evaluate: repair — failing: <checks>` lists the
+   check runs that failed for the exact head. `PR review / gate` names the review:
+   `PR review: review findings` means the exact-head review returned actionable work,
+   `PR review: review incomplete` means the review returned no verdict at all — an
+   infrastructure or operator failure such as an exhausted API credit balance, not a
    defect in the pull request — and, only when a repository has opted into
-   `[pr_automation.fallback]`, `PR automation: gate (local fallback)` means the primary
+   `[pr_automation.fallback]`, `PR review: gate (local fallback)` means the primary
    review returned no verdict but a local model on a self-hosted runner reviewed the diff
    and found nothing blocking; treat that as a weaker signal than an ordinary pass, since
    the documentation-contract fields were not evaluated (see
@@ -251,7 +270,7 @@ concurrency, secret exposure, and branch deletion—not merely YAML syntax.
 
 ## Tooling install version
 
-Every rendered workflow installs `vibey-gh` itself with `pip install vibey` — the one
+Every rendered workflow installs `vibey-gh` itself with `pip install vibey-engine` — the one
 distribution that carries it (vibey ADR-0037) — floating on the latest published release by
 default. Set `[install].pin_version = true` in `.vibey-gh.toml` to pin that install to the
 exact version that rendered the file (`vibey==X.Y.Z`) instead, so a later release of this

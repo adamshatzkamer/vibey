@@ -6,18 +6,32 @@ sessions; ``VIBEY_TEST_TEMPLATE_DB`` renames it) and clones it into
 ``vibey_test_<worker_id>`` for this process.
 ``VIBEY_TEST_DATABASE_URL`` is repointed so every downstream fixture and test
 helper picks up the isolated per-worker database transparently.
+
+The application connects as a restricted role, as a split production install does
+(ADR-0055): ``VIBEY_PG_URL`` names ``vibey_test_app`` (``VIBEY_TEST_APP_ROLE``
+renames it; an empty value falls back to one role for everything), which holds only
+the declared grants. ``VIBEY_PG_MIGRATE_URL`` is never exported. So the whole suite
+runs every application path under the grants production runs it under, and a query
+that needs a privilege nobody declared fails here, as ``permission denied``.
+``VIBEY_TEST_DATABASE_URL`` stays the owner's, for fixtures that set up or inspect
+state the application itself never touches.
 """
 
 import asyncio
 import contextlib
+import faulthandler
 import getpass
 import os
+import signal
+import sys
 from pathlib import Path
 
 import asyncpg
 import pytest
 from hypothesis import HealthCheck, settings
 
+from tests.db_reaper import BackgroundReap, HoldMark, TestDatabaseHold, TestDatabaseReaper
+from tests.db_roles import TestDatabaseRoles
 from vibey.infrastructure.db.migrator import apply_migrations, discover_migrations
 
 # The no-loss lane: `pytest -m noloss --hypothesis-profile=noloss`, the CI job "No-loss
@@ -35,6 +49,18 @@ settings.register_profile(
     suppress_health_check=[HealthCheck.too_slow],
 )
 
+# Every other run: Hypothesis' default example count, but no per-example deadline and no
+# too_slow check, for the same reason as the no-loss lane -- a loaded machine is not a
+# property failure. Under parallel suites (load average 60+) a 22 ms example took 253 ms
+# and failed `test_every_dollar_the_budget_brake_sees_is_charged_somewhere` as "flaky"
+# (2026-09-24). A test that genuinely needs a time bound declares it with @settings.
+settings.register_profile(
+    "vibey",
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+settings.load_profile("vibey")
+
 _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 # The template is migrated from THIS checkout's migrations and then reused by
 # every later session on the same server. Two checkouts whose migrations
@@ -43,6 +69,14 @@ _MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 # with VIBEY_TEST_TEMPLATE_DB; the default is the name it has always had.
 _TEMPLATE_DB = os.environ.get("VIBEY_TEST_TEMPLATE_DB", "vibey_test_template")
 _BASE_DSN: str | None = None
+_ROLES = TestDatabaseRoles.from_environ(os.environ)
+# This process's hold on its database (tests/db_reaper.py): taken before the database
+# exists, released after it is dropped. A killed session's hold ends with its connection,
+# which is how the reaper tells a leaked database from one in use. The database's mark names
+# this process too, so a hold that ends while the process lives gives nothing away.
+_HOLD: TestDatabaseHold | None = None
+# The reap of other, dead sessions' databases, run beside this session by its controller.
+_REAP: BackgroundReap | None = None
 
 
 def _resolve_base_dsn() -> str:
@@ -102,9 +136,21 @@ async def _setup(base_dsn: str) -> str:
             try:
                 migrations = discover_migrations(_MIGRATIONS_DIR)
                 await apply_migrations(tmpl_conn, migrations)
+                # Roles are cluster-wide; grants live in the database, so the clone
+                # below inherits them from the template.
+                await _ROLES.ensure(conn)
+                await _ROLES.grant(tmpl_conn)
             finally:
                 await tmpl_conn.close()
 
+            # The hold comes first, so this database never exists unheld while its session
+            # is alive. The mark names this process and machine, so a hold that ends while the
+            # process lives still gives nothing away: the reaper keeps the database until the
+            # process is gone.
+            mark = HoldMark.this_process().text()  # before anything exists, so it cannot fail after
+            global _HOLD
+            _HOLD = TestDatabaseHold(base_dsn, wdb)
+            _HOLD.start()
             # Drop-if-exists handles crashed prior runs (AC-14).
             await conn.execute(
                 "SELECT pg_terminate_backend(pid) "
@@ -116,6 +162,7 @@ async def _setup(base_dsn: str) -> str:
             await conn.execute(
                 f'CREATE DATABASE "{wdb}" TEMPLATE "{_TEMPLATE_DB}"',
             )
+            await conn.execute(f"COMMENT ON DATABASE \"{wdb}\" IS '{mark}'")
         finally:
             await conn.execute(
                 "SELECT pg_advisory_unlock(hashtext($1))",
@@ -141,22 +188,97 @@ async def _teardown(base_dsn: str) -> None:
         await conn.execute(f'DROP DATABASE IF EXISTS "{wdb}"')
     finally:
         await conn.close()
+        if _HOLD is not None:
+            _HOLD.release()
+
+
+# Where SIGUSR1 sends this process's stacks. Kept open for the life of the process: the
+# handler writes to the descriptor, and a closed one would dump nothing.
+_STACKS_FILE: object = None
+
+
+# Module-level rather than a class (ADR-0016's written reason): pytest resolves hooks by
+# name at conftest scope, and this is called from one and by one meta test.
+def _arm_stack_dump() -> None:
+    """On SIGUSR1, dump every thread's stack, and keep running.
+
+    The storm's push-gate reaper sends it to a hung suite before it kills the suite, so the
+    kill leaves a record of what was stuck (tests/meta/test_a_hung_test_names_itself.py).
+    With `VIBEY_PYTEST_STACKS_DIR` set -- `push_gate.py run` sets it -- the dump goes to one
+    file per process there, because a worker's stderr is captured by pre-commit, which the
+    reaper is about to kill with it. Without it, to stderr.
+    """
+    global _STACKS_FILE
+    where = os.environ.get("VIBEY_PYTEST_STACKS_DIR")
+    if where:
+        Path(where).mkdir(parents=True, exist_ok=True)
+        _STACKS_FILE = open(  # noqa: SIM115 - must outlive this call; see _STACKS_FILE
+            Path(where) / f"pytest-{os.getpid()}.stacks", "a", encoding="utf-8"
+        )
+        faulthandler.register(signal.SIGUSR1, file=_STACKS_FILE, all_threads=True)
+    else:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 
 def pytest_configure(config: pytest.Config) -> None:
     global _BASE_DSN
+    # First, so a hang in the database setup below is as legible as one in a test.
+    _arm_stack_dump()
     _BASE_DSN = _resolve_base_dsn()
     os.environ["_VIBEY_TEST_BASE_DSN"] = _BASE_DSN
+    # Once per session (the controller, or a serial run; never each xdist worker), clear
+    # what killed sessions left on this server. In the background, so no run waits for it;
+    # VIBEY_TEST_REAP=0 turns it off and VIBEY_TEST_REAP_LIMIT caps one session's drops.
+    global _REAP
+    if "PYTEST_XDIST_WORKER" not in os.environ and os.environ.get("VIBEY_TEST_REAP", "1") != "0":
+        _REAP = BackgroundReap(
+            TestDatabaseReaper(_BASE_DSN), limit=int(os.environ.get("VIBEY_TEST_REAP_LIMIT", "200"))
+        )
+        _REAP.start()
     worker_dsn = asyncio.run(_setup(_BASE_DSN))
     os.environ["VIBEY_TEST_DATABASE_URL"] = worker_dsn
     # Some integration tests exercise the application entry point directly, whose
-    # production setting is VIBEY_PG_URL rather than the fixture-specific name.
-    # Point both names at the same isolated worker database so those tests cannot
-    # fall through to an unset configuration or a shared database.
-    os.environ["VIBEY_PG_URL"] = worker_dsn
+    # production settings are VIBEY_PG_URL (the application role) and
+    # VIBEY_PG_MIGRATE_URL (the owner). Point both at this worker's isolated database
+    # so those tests cannot fall through to an unset configuration or a shared one.
+    # The owner's DSN is never exported: only `vibey migrate` reads VIBEY_PG_MIGRATE_URL,
+    # and the tests that run it set it for that one call.
+    app_dsn = _ROLES.app_dsn(worker_dsn)
+    os.environ["VIBEY_TEST_APP_DATABASE_URL"] = app_dsn
+    os.environ["VIBEY_PG_URL"] = app_dsn
+    os.environ.pop("VIBEY_PG_MIGRATE_URL", None)
+
+
+class _WeekdayIndependentSabbath:
+    """A host Sabbath gate that never holds and whose location is resolved, so no test's
+    outcome depends on the weekday or the machine it runs on (8.i, ADR-0070). Tests of the
+    Sabbath itself opt out with `@pytest.mark.sabbath` and name their own instant."""
+
+    def hold(self) -> None:
+        return None
+
+    def describe(self) -> list[str]:
+        return ["sabbath: enabled (test stub)"]
+
+    def location_resolved(self) -> bool:
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _weekday_independent_sabbath(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if request.node.get_closest_marker("sabbath") is None:
+        from vibey.cli.sabbath import SABBATH
+
+        monkeypatch.setattr(SABBATH, "_factory", _WeekdayIndependentSabbath)
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     if _BASE_DSN is not None:
         with contextlib.suppress(Exception):
             asyncio.run(_teardown(_BASE_DSN))
+    if _REAP is not None:
+        report = _REAP.finish()
+        if report is not None and (report.dropped or report.errors):
+            print(report.line(), file=sys.stderr)

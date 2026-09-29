@@ -4,13 +4,17 @@ Guidance for Codex when working in this repository.
 
 ## What this repo is
 
-This is a **Codex plugin marketplace**: 135 plugins composed of 710 Agent Skills,
-shipped inside the `vibey` distribution under the MIT license — `vibey-skills` is a
+This is a **Codex plugin marketplace**: 136 plugins composed of 728 Agent Skills,
+shipped inside the `vibey-engine` package under the MIT license — `vibey-skills` is a
 workspace tenant, not a separate PyPI project (vibey ADR-0037). The application code is the
 packaging CLI plus the retrieval context engine (`src/vibey_skills/context_engine.py`,
 behind `vibey-skills index / search / packet / evaluate`) — but the deliverable is still
 the Markdown and JSON that define the plugins. "Correctness" means valid manifests and
 accurate, well-triggered skill content.
+
+## Context microslices
+
+Every skill and guidance surface follows the [context microslice contract](https://github.com/the-vibey-project/vibey/blob/develop/docs/context-microslices.md): one purpose per slice, stable identity, provenance, explicit links, and measured retrieval budgets. Retrieve only the smallest sufficient linked set; never paste the whole catalogue or silently truncate requirements. Existing skills migrate incrementally and remain authoritative until replacement slices link back.
 
 ## Source of truth
 
@@ -112,7 +116,7 @@ three different base URLs:
 | Surface | Base | Relative links |
 |---|---|---|
 | GitHub repo view | the repo root | work |
-| PyPI project page | `https://pypi.org/project/vibey/` (the root README is the long description; this one is not rendered there) | **break** |
+| PyPI project page | `https://pypi.org/project/vibey-engine/` (the root README is the long description; this one is not rendered there) | **break** |
 | Pages site | `https://the-vibey-project.github.io/vibey-skills/` | work only inside `docs/` |
 
 - **Root Markdown** (`README.md`, `CONTRIBUTING.md`, `AGENTS.md`, `SECURITY.md`,
@@ -185,7 +189,7 @@ of all of that — `tools/check_fingerprints.py`, `tools/next_version.py`,
 gone; the behaviour is unchanged.
 
 ```bash
-pip install -e ../gh      # from the tree; or `pip install vibey`, which carries it
+pip install -e ../gh      # from the tree; or `pip install vibey-engine`, which carries it
 vibey-gh install          # hooks + the merge-train workflow, and points core.hooksPath
 vibey-gh check            # are the fingerprints intact?
 vibey-gh version --since origin/main --explain
@@ -318,7 +322,7 @@ Install the tooling and its hooks once per clone, so the trailer is added for yo
 push without the fingerprints is refused:
 
 ```bash
-pip install -e ../gh      # from the tree; or `pip install vibey`, which carries it
+pip install -e ../gh      # from the tree; or `pip install vibey-engine`, which carries it
 vibey-gh install
 ```
 

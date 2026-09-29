@@ -20,7 +20,10 @@
 > ([ADR-0021](../architecture/decisions/0021-one-tree-history-preserved.md)); a fifth engine,
 > `qwenloop`, joined as an opt-in local standby
 > ([ADR-0015](../architecture/decisions/0015-qwenloop-standby.md)) and as the sovereign DESIGN
-> provider ([ADR-0027](../architecture/decisions/0027-sovereign-design-provider.md)).
+> provider ([ADR-0027](../architecture/decisions/0027-sovereign-design-provider.md)). Since
+> [ADR-0064](../architecture/decisions/0064-gptossloop-is-the-sovereign-engine.md) that local
+> runner ships as two engines: `gptossloop` on GPT-OSS 20B, the sovereign default and on
+> without a switch, and `qwenloop` on a Qwen model, opt-in.
 > Where this document and the code disagree, the code and `docs/reference/` win.
 > Audience: the engineer (human or agent) who will build this.
 > Companion documents: [domain model](domain-model.md), [data model](data-model.md),
@@ -33,9 +36,14 @@
 
 Five autonomous session runners live in this repository under
 `src/vibey_runners/` — `claudeloop`, `codexloop`, `cursorloop`, `agyloop` (the
-paid pool) and `qwenloop` (a local, zero-dollar standby, opt-in via
-`[features] qwenloop = true` or `VIBEY_FEATURE_QWENLOOP`; see
-[ADR-0015](../architecture/decisions/0015-qwenloop-standby.md)). When this document was written
+paid pool) and the local, zero-dollar runner in `src/vibey_runners/qwen`, which
+ships as two engines: `gptossloop` (GPT-OSS 20B, the sovereign default, on unless
+`[features] gptossloop = false` or `VIBEY_FEATURE_GPTOSSLOOP=0`) and `qwenloop`
+(the same runner on `qwen3:14b`, opt-in via `[features] qwenloop = true` or
+`VIBEY_FEATURE_QWENLOOP`); see
+[ADR-0015](../architecture/decisions/0015-qwenloop-standby.md),
+[ADR-0038](../architecture/decisions/0038-local-engines-are-preferred-first.md) and
+[ADR-0064](../architecture/decisions/0064-gptossloop-is-the-sovereign-engine.md). When this document was written
 the first four were separate repositories; they were absorbed with history in
 September 2026 ([ADR-0021](../architecture/decisions/0021-one-tree-history-preserved.md)). Each drives one vendor's coding agent
 through an unattended run: it distinguishes a waitable rate-limit window from
@@ -100,7 +108,9 @@ They are enforced by CI, not by convention.
    the lease will expire and another worker will pick it up. Every job type must
    be safe to run twice.
 7. **The ledger is append-only.** No updates, no deletes. Corrections are new
-   events that supersede prior ones.
+   events that supersede prior ones. The database enforces it: triggers refuse any
+   rewrite, even by the owner, and the application connects as a role that holds only
+   `SELECT` and `INSERT` on the ledger (ADR-0055).
 8. **Every commit follows Conventional Commits.** Enforced by a git hook.
 9. **No engine-specific types leak past `infrastructure/engines/`.** The domain
    knows `EngineId` and `Effort`; it never knows what `--preset` means.
@@ -119,7 +129,7 @@ graph TB
         XL["codexloop<br/>OpenAI"]
         UL["cursorloop<br/>Cursor / Composer"]
         AL["agyloop<br/>Google Antigravity"]
-        QL["qwenloop<br/>local Qwen (opt-in)"]
+        QL["gptossloop · qwenloop<br/>local GPT-OSS (default) · Qwen (opt-in)"]
     end
 
     subgraph Local["Local machine"]
@@ -215,7 +225,7 @@ graph TB
     Rot --> HE
     W1 --> Ad
     W1 --> Md
-    Ad -->|"subprocess"| Ext["claudeloop / codexloop /<br/>cursorloop / agyloop / qwenloop"]
+    Ad -->|"subprocess"| Ext["claudeloop / codexloop /<br/>cursorloop / agyloop /<br/>gptossloop / qwenloop"]
     Ad --> WT
     W1 --> Led
     Led --> E
@@ -235,7 +245,9 @@ processes**, plus an optional Kubernetes operator.
   jobs, bounded to `min(parallelism, engines × 2, cpu_count)`. `vibey work
   <project-id>` processes one ready DESIGN job in the foreground and exits.
 - Every process reads its DSN from `VIBEY_PG_URL` and refuses to start without it
-  (`DatabaseNotConfigured`); there is no default database. `vibey install --postgres`
+  (`DatabaseNotConfigured`); there is no default database. That DSN names the
+  application role; migrations and grants run as the owner, `VIBEY_PG_MIGRATE_URL`
+  (`vibey migrate`, ADR-0055). `vibey install --postgres`
   can install and start a local PostgreSQL 14+ server through Homebrew, apt, or dnf.
   Postgres may also be brought by the operator as a container or through the Helm
   chart's in-cluster `postgres:17-alpine`.
@@ -300,7 +312,7 @@ src/vibey/
 │                    rotation_handoff, wind_down, conformance, seed_prompt
 ├── infrastructure/  db/ (asyncpg repositories, migrator, advisory_lock, notifier),
 │                    engines/ (descriptors, loop_process_adapter, tailer, classify,
-│                    scripted*, claudeloop_*, qwenloop_design), git/, ledger/
+│                    scripted*, claudeloop_*, gptossloop_*), git/, ledger/
 │                    (full_ledger_writer, redact), provision/, build/, container/,
 │                    azure/, deploy/, notify/, operator/, interfaces/,
 │                    skills_context, context_writer, review_artifact_writer,
@@ -517,7 +529,7 @@ WHERE id = (
           JOIN job p ON p.id = d.depends_on_job_id
           WHERE d.job_id = j.id AND p.state <> 'succeeded'
       )
-    ORDER BY j.priority DESC, j.run_after ASC, j.id ASC
+    ORDER BY j.bump_seq ASC NULLS LAST, j.priority DESC, j.run_after ASC, j.id ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
@@ -708,7 +720,7 @@ The runners are not interchangeable at the CLI level. Divergence as recorded in
 `infrastructure/engines/descriptors.py` (checked against each binary's
 `run --help` by the conformance suite; updated 2026-09-15):
 
-| | claudeloop | codexloop | cursorloop | agyloop | qwenloop |
+| | claudeloop | codexloop | cursorloop | agyloop | gptossloop / qwenloop |
 |---|---|---|---|---|---|
 | Effort at invocation | `--preset` + `--effort` (5 levels) | **none** — `run` has no effort flag; every level projects to `STANDARD` | **none** — a `--model` ladder (`composer-fast` → `composer` → `grok-4.5` → `grok` → `grok-xhigh`) | `--preset` + `--effort` (5 levels) | `--max-turns` 8 / 16 / 40 / 64 / 96 |
 | Top-level `savepoints` | yes | yes | yes | **no** | placeholder stub |
@@ -736,7 +748,7 @@ Effort.MAX  →  claudeloop  --preset high --effort max
             →  codexloop   (no flag)                                 (saturates at STANDARD)
             →  cursorloop  --model grok-xhigh                        (ladder position)
             →  agyloop     --preset high --effort max
-            →  qwenloop    --max-turns 96                            (turn budget)
+            →  gptossloop  --max-turns 96                            (turn budget; qwenloop the same)
 ```
 
 A job declares `requires: {effort: HIGH, capabilities: {savepoints}}`. The
@@ -796,13 +808,15 @@ circuit not `open`, capability requirements met, and per-phase allow-list permit
 it.
 
 **Local tier, preferred first** ([ADR-0038](../architecture/decisions/0038-local-engines-are-preferred-first.md),
-amending [ADR-0015](../architecture/decisions/0015-qwenloop-standby.md)'s standby rule). `qwenloop`
-and `claudeloop-local` are local, zero-dollar engines, each off unless its
-`[features]` key or `VIBEY_FEATURE_*` switch enables it. When enabled they are
+amending [ADR-0015](../architecture/decisions/0015-qwenloop-standby.md)'s standby rule). `gptossloop`,
+`qwenloop` and `claudeloop-local` are local, zero-dollar engines, each behind its
+`[features]` key or `VIBEY_FEATURE_*` switch: `gptossloop` is on unless switched off,
+the other two are off unless switched on
+([ADR-0064](../architecture/decisions/0064-gptossloop-is-the-sovereign-engine.md)). When enabled they are
 preferred: `EngineSelector` runs SWRR within the LOCAL tier and a paid engine is
-selected only when no local engine is eligible. Separately, DESIGN can be run on a local
-model by choice — `--provider qwenloop` on `vibey work` and `vibey worker` — which
-talks to the local model directly rather than through rotation
+selected only when no local engine is eligible. Separately, DESIGN and DECOMPOSE run
+on a local model — `--provider gptossloop`, the default on `vibey work` and `vibey
+worker` — which talks to the local model directly rather than through rotation
 ([ADR-0027](../architecture/decisions/0027-sovereign-design-provider.md)).
 
 ```mermaid
@@ -860,7 +874,7 @@ names) and merges it into a router file per engine at the root of each
 | codexloop / Codex | `AGENTS.md` |
 | cursorloop / Cursor | `CURSOR.md` |
 | agyloop / Antigravity | `GEMINI.md` |
-| qwenloop | `QWEN.md` |
+| gptossloop / qwenloop | `QWEN.md` |
 
 Only the router files are written. The block sits between
 `<!-- vibey:begin -->` / `<!-- vibey:end -->` markers; hand-written content
@@ -1219,8 +1233,9 @@ Property tests worth calling out specifically:
 `domain/config.py` parses; the authoritative schema is
 `docs/reference/configuration.md`.* **The schema is implemented and tested but
 is not yet a runtime input:** `infrastructure/config_loader.py::load_config_from_path`
-has no caller. At runtime only `[features] qwenloop` is read from `vibey.toml` (by `vibey
-doctor`; the worker reads the same flag from the project's `config` record),
+has no caller. At runtime only the `[features]` local-engine switches (`gptossloop`,
+`qwenloop`, `claudeloop_local`) are read from `vibey.toml` (by `vibey doctor` and
+`vibey loops`; the worker reads the same keys from the project's `config` record),
 and per-project limits and the skills-context policy come from the project record
 written by `vibey new` or the Kubernetes operator. The planned `[visual]` and
 `[media.providers]` tables and the extra `[deploy]` keys (`opt_in_required`,
@@ -1246,7 +1261,8 @@ max_dollars_total     = 250.0
 max_turns_per_item    = 60
 
 [engines]
-enabled = ["claudeloop", "codexloop", "cursorloop", "agyloop"]   # the default;
+enabled = ["claudeloop", "codexloop", "cursorloop", "agyloop"]   # gptossloop
+                                 # (the sovereign default) is always added;
                                  # "qwenloop" requires [features] qwenloop = true
 
 [engines.weights]                # base rotation weights
@@ -1277,6 +1293,7 @@ iac     = "bicep"
 # secret references are completed and accepted interactively in Phase ④.
 
 [features]
+gptossloop = true                # the default; VIBEY_FEATURE_GPTOSSLOOP overrides
 qwenloop = false                 # VIBEY_FEATURE_QWENLOOP overrides
 
 [qwenloop]

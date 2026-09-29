@@ -171,6 +171,21 @@ class ProtectedRefInterface(Protocol):
 
 
 @runtime_checkable
+class NotSupportedInterface(Protocol):
+    @property
+    def kind(self) -> ForgeKindInterface: ...
+
+    @property
+    def verb(self) -> str: ...
+
+    @property
+    def reason(self) -> str: ...
+
+    @property
+    def problem(self) -> str: ...
+
+
+@runtime_checkable
 class GitHubForgeInterface(ForgeAdapterInterface, Protocol):
     """The GitHub implementation of the forge-neutral adapter."""
 
@@ -192,12 +207,29 @@ class ForgeAdapterReaderInterface(ForgeReaderInterface, Protocol):
 
 @runtime_checkable
 class ForgejoTransportInterface(ForgeTransportInterface, Protocol):
-    """The Forgejo transport implementation."""
+    """The Forgejo transport implementation.
+
+    `timeout` is declared here rather than on `ForgeTransportInterface` because only the two
+    HTTP transports have one: the `gh` transport shells out to a client that owns its own.
+    Left undeclared, the seam this change exists to add would be invisible to any caller
+    typed against this interface -- a public attribute that works and cannot be seen is not
+    a seam (ADR-0016: interfaces declare).
+    """
+
+    @property
+    def timeout(self) -> float:
+        """Seconds a single call may take before it is abandoned."""
+        ...
 
 
 @runtime_checkable
 class GitLabTransportInterface(ForgeTransportInterface, Protocol):
     """The GitLab transport implementation."""
+
+    @property
+    def timeout(self) -> float:
+        """Seconds a single call may take before it is abandoned."""
+        ...
 
 
 @runtime_checkable
@@ -325,6 +357,95 @@ class PrAutomationFallbackConfigInterface(_ConfigRecordInterface, Protocol):
     @property
     def heartbeat_max_age_minutes(self) -> int: ...
 
+    @property
+    def context_paths(self) -> tuple[str, ...]: ...
+
+    @property
+    def context_window(self) -> int: ...
+
+    @property
+    def reasoning_reserve_tokens(self) -> int: ...
+
+    @property
+    def chars_per_token(self) -> int: ...
+
+    @property
+    def think(self) -> str: ...
+
+
+@runtime_checkable
+class RunnersConfigInterface(_ConfigRecordInterface, Protocol):
+    """`[runners]`: how the machine serving the sovereign lane is stood up (12.c)."""
+
+    @property
+    def repository(self) -> str: ...
+
+    @property
+    def unit_prefix(self) -> str: ...
+
+    @property
+    def install_dir(self) -> str: ...
+
+    @property
+    def launch_agents_dir(self) -> str: ...
+
+    @property
+    def log_dir(self) -> str: ...
+
+    @property
+    def gh_config_dir(self) -> str: ...
+
+    @property
+    def image(self) -> str: ...
+
+    @property
+    def runner_version(self) -> str: ...
+
+    @property
+    def container_model_url(self) -> str: ...
+
+    @property
+    def require_ac(self) -> bool: ...
+
+    @property
+    def throttle_seconds(self) -> int: ...
+
+    @property
+    def max_failures(self) -> int: ...
+
+    @property
+    def path(self) -> str: ...
+
+    @property
+    def heartbeat_scheduler(self) -> str: ...
+
+    @property
+    def heartbeat_interval_minutes(self) -> int: ...
+
+    @property
+    def heartbeat_python(self) -> str: ...
+
+    @property
+    def heartbeat_log_dir(self) -> str: ...
+
+    @property
+    def heartbeat_clone_dir(self) -> str: ...
+
+    @property
+    def systemd_user_dir(self) -> str: ...
+
+    def resolved_gh_config_dir(self, home: Path) -> Path:
+        """`gh_config_dir` against `home`, with `..` and every symlink resolved."""
+        ...
+
+    def shares_operator_gh_dir(self, home: Path, environ: Mapping[str, str]) -> bool:
+        """Whether `gh_config_dir` resolves to gh's own default directory."""
+        ...
+
+    def registration(self, platform: PlatformConfigInterface) -> tuple[str, str, str]:
+        """`(owner/name, registration URL, problem)`; the problem is empty when resolvable."""
+        ...
+
 
 @runtime_checkable
 class PrAutomationConfigInterface(_ConfigRecordInterface, Protocol):
@@ -354,6 +475,15 @@ class PrAutomationConfigInterface(_ConfigRecordInterface, Protocol):
 
     @property
     def retain_schedule_backstop(self) -> bool: ...
+
+    @property
+    def paid_review(self) -> bool: ...
+
+    @property
+    def paid_repair(self) -> bool: ...
+
+    @property
+    def paid_conflict_resolution(self) -> bool: ...
 
     @property
     def fallback(self) -> PrAutomationFallbackConfigInterface: ...

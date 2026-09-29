@@ -28,7 +28,7 @@ from vibey_gh.review_contract import (
 )
 
 # The `--json-schema` the paid exact-head reviewer was held to while it was a hand-written
-# literal in `templates/workflows/pr-automation.yml` (as of 4e9adf18), verbatim. The template
+# literal in `templates/workflows/pr-review.yml` (as of 4e9adf18), verbatim. The template
 # now carries a placeholder that `install.render_workflow` fills from the contract, and
 # rendering must not change a byte of what the reviewer is asked. When the schema is MEANT
 # to change, change this in the same commit, so the difference is in front of a reviewer.
@@ -84,7 +84,7 @@ def _schema_arguments(text: str, marker: str = "links_valid") -> dict[str, str]:
         if marker in arguments["full"]:
             assert choice["condition"] == "steps.half.outputs.half == 'requires-wider-context'"
             return arguments
-    raise AssertionError("pr-automation.yml no longer declares the review schema")
+    raise AssertionError("pr-review.yml no longer declares the review schema")
 
 
 def _schema_argument(text: str, marker: str = "links_valid") -> str:
@@ -93,15 +93,15 @@ def _schema_argument(text: str, marker: str = "links_valid") -> str:
     return _schema_arguments(text, marker)["full"]
 
 
-def _rendered_pr_automation() -> str:
-    """`pr-automation.yml` as `vibey-gh install` writes it. The template alone holds only a
+def _rendered_pr_review() -> str:
+    """`pr-review.yml` as `vibey-gh install` writes it. The template alone holds only a
     placeholder where the schema goes; what the reviewer is held to exists only rendered."""
-    return render_workflow(WORKFLOWS / "pr-automation.yml", GhConfig(root=Path(".")))
+    return render_workflow(WORKFLOWS / "pr-review.yml", GhConfig(root=Path(".")))
 
 
 def _primary_review_schema() -> dict:
     """The `--json-schema` the paid exact-head reviewer is held to."""
-    return json.loads(_schema_argument(_rendered_pr_automation()))
+    return json.loads(_schema_argument(_rendered_pr_review()))
 
 
 def test_the_contract_covers_the_primary_review_schema_exactly():
@@ -148,7 +148,7 @@ def test_the_documentation_contract_is_the_half_a_diff_cannot_carry():
 def test_fields_is_the_two_halves_in_order_and_not_the_yaml_key_order():
     """`fields` orders the diff-groundable half first, then the documentation contract.
 
-    That is deliberately NOT the primary schema's own key order -- `pr-automation.yml`
+    That is deliberately NOT the primary schema's own key order -- `pr-review.yml`
     puts `summary` and `findings` LAST -- so a caller who zips `fields` against a schema's
     values positionally binds them to the wrong names. The docstring says so; this checks
     it, and checks it against the local fallback's own ordering rather than against
@@ -274,7 +274,7 @@ def test_the_rendered_schema_is_the_hand_written_one_it_replaced():
     """Moving the schema into the contract is groundwork, not a change to the review: the
     paid reviewer must be asked exactly what it was asked before, down to key order —
     a model answers in the order the schema lists the fields."""
-    rendered = _schema_argument(_rendered_pr_automation())
+    rendered = _schema_argument(_rendered_pr_review())
 
     assert json.loads(rendered) == json.loads(LEGACY_REVIEW_SCHEMA)
     assert rendered == LEGACY_REVIEW_SCHEMA
@@ -283,7 +283,7 @@ def test_the_rendered_schema_is_the_hand_written_one_it_replaced():
 
 def test_the_template_carries_placeholders_and_never_a_hand_written_schema():
     """A literal beside the placeholders is how a second copy creeps back in."""
-    raw = (WORKFLOWS / "pr-automation.yml").read_text(encoding="utf-8")
+    raw = (WORKFLOWS / "pr-review.yml").read_text(encoding="utf-8")
 
     assert (
         "--json-schema '${{ steps.half.outputs.half == 'requires-wider-context' && "
@@ -292,20 +292,20 @@ def test_the_template_carries_placeholders_and_never_a_hand_written_schema():
     assert raw.count("__VIBEY_GH_REVIEW_SCHEMA__") == 1
     assert raw.count("__VIBEY_GH_REVIEW_WIDER_SCHEMA__") == 1
     assert '"links_valid"' not in raw
-    rendered = _rendered_pr_automation()
+    rendered = _rendered_pr_review()
     assert "__VIBEY_GH_REVIEW_SCHEMA__" not in rendered
     assert "__VIBEY_GH_REVIEW_WIDER_SCHEMA__" not in rendered
 
 
 def _deployed_copies() -> list:
-    """Every rendered `pr-automation.yml` this checkout carries: the tenant's own and, inside
+    """Every rendered `pr-review.yml` this checkout carries: the tenant's own and, inside
     the monorepo, the workspace root's -- rendered with a different configuration, which is
     exactly why both are read rather than assumed to agree. A standalone sdist has only the
     first."""
     tenant = Path(__file__).resolve().parent.parent
-    copies = [pytest.param(tenant / ".github/workflows/pr-automation.yml", id="tenant")]
+    copies = [pytest.param(tenant / ".github/workflows/pr-review.yml", id="tenant")]
     for parent in tenant.parents:
-        candidate = parent / ".github/workflows/pr-automation.yml"
+        candidate = parent / ".github/workflows/pr-review.yml"
         if candidate.is_file():
             copies.append(pytest.param(candidate, id="workspace"))
             break
@@ -420,7 +420,7 @@ def test_an_apostrophe_in_a_schema_cannot_break_the_single_quoted_argument(monke
     )
     monkeypatch.setattr(install, "REVIEW_CONTRACT", contract)
 
-    arguments = _schema_arguments(_rendered_pr_automation(), marker="house_style")
+    arguments = _schema_arguments(_rendered_pr_review(), marker="house_style")
 
     # Both branches, because both are expression literals as well as shell arguments, and
     # an apostrophe would end either one early.
@@ -505,3 +505,58 @@ def test_an_untyped_report_field_raises_like_any_other():
     assert contract.json_schema()["required"] == ["pass", "house_style"]
     with pytest.raises(KeyError, match="wider_summary, wider_findings"):
         contract.json_schema([REQUIRES_WIDER_CONTEXT])
+
+
+# --------------------------------------------------------------------------------------
+# The whole review, answered by one sovereign reviewer (sub-doctrine 8.b)
+# --------------------------------------------------------------------------------------
+
+
+def test_every_documentation_judgment_carries_the_question_a_reviewer_is_asked():
+    """With no paid review declared, the sovereign lane answers the documentation contract
+    too, and a local model asked for sixteen bare field names guesses at what each means.
+    Each judgment's question lives beside its type, in the one table, so the prompt a
+    reviewer is handed cannot list a judgment the schema lacks or skip one it has."""
+    asked = REVIEW_CONTRACT.questions()
+
+    assert [name for name, _ in asked] == list(REVIEW_CONTRACT.requires_wider_context)
+    for name, question in asked:
+        assert question.strip() and question == REVIEW_CONTRACT.field_questions[name]
+    # A seam reader gets the same table.
+    port: ReviewContractPort = REVIEW_CONTRACT
+    assert port.questions() == asked
+
+
+def test_a_judgment_with_no_question_raises_rather_than_being_asked_blind():
+    """The same rule as a field with no type: a reviewer asked a question nobody wrote down
+    is asked a different question than the one the gate reads."""
+    contract = ReviewContract(
+        diff_groundable=("pass",),
+        requires_wider_context=("house_style", "tone"),
+        field_questions={"tone": "the prose is kind"},
+    )
+
+    with pytest.raises(KeyError, match="no question declared for review field.*house_style"):
+        contract.questions()
+
+
+def test_a_verdict_names_the_halves_it_actually_answered():
+    """A diff-only verdict writes `true` into every judgment it did NOT evaluate, to keep
+    its shape. Read as a whole review, those placeholders would pass sixteen judgments
+    nobody made -- so every local verdict says which halves it answered, under a key that
+    is neither a judgment nor a report field."""
+    assert REVIEW_CONTRACT.scope_field == "scope"
+    assert REVIEW_CONTRACT.scope_field not in REVIEW_CONTRACT.fields
+    assert REVIEW_CONTRACT.scope_field not in REVIEW_CONTRACT.wider_report_fields
+    port: ReviewContractPort = REVIEW_CONTRACT
+    assert port.scope_field == "scope"
+
+
+@pytest.mark.parametrize("name", ["pass", "house_style", "wider_summary"])
+def test_the_scope_field_cannot_be_a_field_a_lane_writes(name: str):
+    with pytest.raises(ValueError, match=f"scope field cannot be a review field: {name}"):
+        ReviewContract(
+            diff_groundable=("pass",),
+            requires_wider_context=("house_style",),
+            scope_field=name,
+        )

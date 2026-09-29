@@ -9,11 +9,28 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
+from vibey.domain.budget import BudgetLedger
 from vibey.domain.circuit import StoredCircuitState
 from vibey.domain.effort import Effort
-from vibey.domain.engine import EngineId, IsolationLevel, StoredEngineId
+from vibey.domain.engine import (
+    EngineDescriptor,
+    EngineId,
+    EngineTier,
+    IsolationLevel,
+    JobRequirement,
+    Loop,
+    StoredEngineId,
+)
+from vibey.domain.failover import FailoverStatus
+from vibey.domain.handoff import GateResult, HandoffBrief
+from vibey.domain.hub_scope import HubScope
+from vibey.domain.interfaces.budget_caps_interface import (
+    CapChangeInterface,
+    CapHistoryEntryInterface,
+)
 from vibey.domain.job import FailureClass, StoredJobState
 from vibey.domain.phase import Phase, StoredPhase
+from vibey.domain.queue_reap import PolicyOutcome, ReapVerdict
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +42,8 @@ class EnqueueRequest:
     idempotency_key: str
     payload: Mapping[str, object] = field(default_factory=dict)
     requirement: Mapping[str, object] = field(default_factory=dict)
-    priority: int = 0
+    # No `priority`: a bump, through the grant, is the only way to reorder the queue
+    # (ADR-0054). A priority on the request would be a second way with no grant.
     work_item_id: str | None = None
     max_attempts: int = 7
     run_after: datetime | None = None
@@ -79,6 +97,21 @@ class JobRecord:
     last_error: Mapping[str, object] | None
     created_at: datetime
     updated_at: datetime
+    bump_seq: int | None = None
+    """The job's place among bumped jobs (ADR-0054), or None in normal order. Last,
+    with a default, so a record built before the column existed still builds."""
+    bump_named: bool = False
+    """True when bumped (or enqueued prioritised) by name and not since un-bumped; false
+    for a job pulled into the lane as a named job's dependency (ADR-0054)."""
+
+
+@dataclass(frozen=True, slots=True)
+class QueueEntry:
+    """One job as `vibey queue list` shows it: the row, and the dependencies it
+    still waits on (not yet succeeded), which the claim will not jump."""
+
+    job: JobRecord
+    waiting_on: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +137,18 @@ class HumanGateRecord:
     timeout_at: datetime | None
     answered_at: datetime | None
     answered_by: str | None
+    answer_request_id: str | None = None
+    """The id of the request that answered the gate; `None` while open, and for a gate
+    answered before answers carried one. The same id replayed is a no-op."""
+
+
+@dataclass(frozen=True, slots=True)
+class GateAnswerOutcome:
+    """What answering a gate did: the gate as it now stands, and whether this request
+    had already answered it (`replayed`), in which case nothing was written."""
+
+    record: HumanGateRecord
+    replayed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,3 +288,265 @@ class RotationCursor:
     engine_id: StoredEngineId
     current: int
     order: int
+
+
+@dataclass(frozen=True, slots=True)
+class QueueReapReport:
+    """What one reaper pass measured and did (ADR-0056).
+
+    ``acted`` holds the reaps the pass performed and recorded, or -- in a dry run -- the
+    reaps it would have performed. ``surfaced`` holds the stuck conditions that move
+    nothing. ``unreadable`` names every source the pass could not read: nothing is
+    concluded from those, and a pass with any of them is not ``ok`` (10.f, 12.e).
+    """
+
+    project_id: UUID
+    dry_run: bool
+    acted: tuple[ReapVerdict, ...] = ()
+    surfaced: tuple[ReapVerdict, ...] = ()
+    policy: PolicyOutcome | None = None
+    cleared: tuple[ReapVerdict, ...] = ()
+    """Sightings recorded open earlier that this pass, reading their source whole, no
+    longer found -- each closed on the ledger (#1108 review finding 4)."""
+    notes: tuple[str, ...] = ()
+    unreadable: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Every source was read, and the broker policy -- where one was reconciled -- was
+        read back as written."""
+        return not self.unreadable and (self.policy is None or self.policy.verified)
+
+    def joined(self, other: "QueueReapReport") -> "QueueReapReport":
+        """This part of a pass followed by `other`: every finding of both, in order."""
+        return QueueReapReport(
+            project_id=self.project_id,
+            dry_run=self.dry_run,
+            acted=self.acted + other.acted,
+            surfaced=self.surfaced + other.surfaced,
+            policy=other.policy if other.policy is not None else self.policy,
+            cleared=self.cleared + other.cleared,
+            notes=self.notes + other.notes,
+            unreadable=self.unreadable + other.unreadable,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UltraStatus:
+    """A project's ULTRA run as its ledger records it (`vibey ultra status`, ADR-0063).
+
+    `rate_per_hour` is measured from recorded spend, `None` when nothing has been
+    measured (shown as "unknown", 8.g).
+    """
+
+    project_id: UUID
+    name: str
+    active: bool
+    no_cap_declared: bool
+    passes_completed: int
+    max_dollars: float | None
+    dollars_spent: float
+    rate_per_hour: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectBudget:
+    """A project's caps, its current cycle's spend against them, and every change to
+    the caps (`vibey budget`).
+
+    `budget` is the brake's own reading, never a second opinion: the caps through
+    `LedgerBudgetSource.caps_from_config`, the spend through `LedgerBudgetSource.current`
+    -- what the worker checks before every BUILD session. `history` is read back from
+    the ledger's `BudgetCapChanged` events, oldest first.
+    """
+
+    project_id: UUID
+    name: str
+    cycle: int
+    budget: BudgetLedger
+    history: tuple[CapHistoryEntryInterface, ...] = ()
+
+    @property
+    def exhausted(self) -> bool:
+        """A cap is reached: the next BUILD session parks a `budget_exhausted` gate."""
+        return self.budget.any_exhausted
+
+
+@dataclass(frozen=True, slots=True)
+class CapChangeOutcome:
+    """What a budget store's write did: the project row as its transaction left it, and
+    the changes it made -- none when the request left every cap as it was."""
+
+    project: ProjectRecord
+    changes: tuple[CapChangeInterface, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetChange:
+    """What `vibey budget set` or `clear` did, and what holds now.
+
+    `by` is the name the change was recorded under. `parked` holds the project's open
+    `budget_exhausted` gates: a changed cap applies to a job parked on one only once the
+    gate is answered, so the command says so rather than leaving a person waiting.
+    """
+
+    after: ProjectBudget
+    by: str
+    changes: tuple[CapChangeInterface, ...] = ()
+    parked: tuple[HumanGateRecord, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EngineContext:
+    """One engine as vibey's own resolvers see it right now: its descriptor, whether it
+    would run, the variable that switches it (a local engine has one), the model it runs
+    when vibey chooses that model itself (gptossloop's `VIBEY_OLLAMA_MODEL`), and the argv
+    template its `run` is built from (infrastructure/engines/argv.py)."""
+
+    descriptor: EngineDescriptor
+    enabled: bool
+    run: tuple[str, ...]
+    switch: str | None = None
+    model: str | None = None
+    # Whether the switch is on when nothing sets it: gptossloop's is (ADR-0064).
+    on_by_default: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EffortRun:
+    """One engine at one requested effort: the argv it passes, the effort it really
+    achieves, the model when anything in vibey names it, and why when nothing does."""
+
+    effort: Effort
+    argv: tuple[str, ...]
+    achieved: Effort
+    model: str | None
+    chosen_by: str | None
+    notes: str
+
+
+@dataclass(frozen=True, slots=True)
+class EffortChoice:
+    """One engine as a candidate for one effort, in a loop's by-effort view."""
+
+    engine_id: EngineId
+    model: str | None
+    achieved: Effort
+
+
+@dataclass(frozen=True, slots=True)
+class LoopEngine:
+    """One engine as `vibey loops` reports it: its descriptor, how it stands right now,
+    every effort it can be asked for, and the argv template of its `run`. A `repealed`
+    engine (canon 8.b) stays listed and is never offered for selection."""
+
+    descriptor: EngineDescriptor
+    enabled: bool
+    switch: str | None
+    default_model: str | None
+    efforts: tuple[EffortRun, ...]
+    run: tuple[str, ...]
+    repealed: bool = False
+    notes: tuple[str, ...] = ()
+    on_by_default: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LoopView:
+    """One of the two loops (8.c) and every engine its tier holds. `by_effort` offers only
+    the engines not repealed."""
+
+    loop: Loop
+    tier: EngineTier
+    default: bool
+    declared_only: bool
+    engines: tuple[LoopEngine, ...]
+    by_effort: Mapping[Effort, tuple[EffortChoice, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class EffortLadder:
+    """Where each phase starts and how BUILD climbs (domain/effort.py)."""
+
+    phase_base: Mapping[Phase, Effort]
+    build_attempts: tuple[Effort, ...]
+    exhausted_after: int
+    rotates_when_effort_rises: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LoopsReport:
+    """Everything `vibey loops` says: the efforts, the default loop and paid engine, the
+    ladder, and both loops."""
+
+    efforts: tuple[Effort, ...]
+    default_loop: Loop
+    paid_default_engine: EngineId
+    ladder: EffortLadder
+    loops: tuple[LoopView, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HubPrincipal:
+    """Who is asking the hub (ADR-0067): the name its actions are recorded under, and the
+    scopes it holds. The host's own local token is one principal; each paired device is
+    another. Holding no scope is the default and permits nothing."""
+
+    name: str
+    scopes: frozenset[HubScope] = frozenset()
+
+
+# The driver failover (ADR-0070): what its seams exchange.
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptDigest:
+    sha256: str
+    lines: int
+
+
+@dataclass(frozen=True, slots=True)
+class RepoSnapshot:
+    branch: str
+    head_sha: str
+    dirty_paths: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessResult:
+    exit_code: int
+    stdout: str
+
+
+@dataclass(frozen=True, slots=True)
+class DriverSignal:
+    """What Claude Code's `StopFailure` hook hands its command on stdin."""
+
+    session_id: str
+    transcript_path: str
+    cwd: str
+    error: str
+    detail: str = ""
+    last_message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DriverOutcome:
+    """What happened, in one word, and the evidence behind it."""
+
+    result: str
+    detail: str = ""
+    brief_path: str | None = None
+    status: FailoverStatus | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EngineFailoverDecision:
+    """What engine-level failover or handback decided (ADR-0070)."""
+
+    result: str
+    """`failed_over`, `already`, `not_capacity`, `parked` or `handed_back`."""
+    next_engine: EngineId | None = None
+    requirement: JobRequirement | None = None
+    gate: GateResult | None = None
+    brief: HandoffBrief | None = None

@@ -50,9 +50,6 @@ class EnqueueRequestInterface(Protocol):
     def requirement(self) -> Mapping[str, object]: ...
 
     @property
-    def priority(self) -> int: ...
-
-    @property
     def work_item_id(self) -> str | None: ...
 
     @property
@@ -336,6 +333,9 @@ class RunOutcomeInterface(Protocol):
 
     @property
     def capacity_rejected(self) -> bool: ...
+
+    @property
+    def capacity_state(self) -> str | None: ...
 
     @property
     def exit_code(self) -> int | None: ...

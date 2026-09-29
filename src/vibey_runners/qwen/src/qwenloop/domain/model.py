@@ -1,12 +1,27 @@
 # Made with ❤️ by [Vibey](https://the-vibey-project.github.io/vibey/), Developed by [Adam Matthew Steinberger](https://vibewithadam.matthewsteinberger.com/) ([@adammatthewsteinberger](https://github.com/adammatthewsteinberger/)).
 """Pure model, capacity, and run state."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
 EXIT_CODE_WIND_DOWN = 75
 DONE_MARKER = "QWENLOOP_TASK_FULLY_COMPLETE"
+#: Every tool a run can call, in the order the model is told them. The one list the tool
+#: schema, the dispatcher and the prompts are all checked against, so a tool cannot be
+#: advertised without being callable or callable without being advertised. `search`,
+#: `find` and `open_file` exist because gpt-oss:20b called them 431 times across 82 storm
+#: runs while the dispatcher answered "unknown tool" (18% of every tool call it made).
+CODING_TOOL_NAMES: tuple[str, ...] = (
+    "read_file",
+    "write_file",
+    "edit_file",
+    "shell",
+    "search",
+    "find",
+    "open_file",
+)
 
 
 class Backend(StrEnum):
@@ -59,6 +74,11 @@ class ServerInfo:
     # because an attached endpoint names its models its own way (Ollama: `qwen2.5-coder:14b`).
     # Empty means "send the profile name", which is what a managed server serves.
     model: str = ""
+    # What a managed server was started with, its API key already redacted, and where its
+    # own output goes -- so a run records the settings it measured (#382). Both stay empty
+    # for an attached endpoint, which qwenloop never starts.
+    argv: tuple[str, ...] = ()
+    log_path: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +102,18 @@ class ChatMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class FollowUp:
+    """A person's message for a running run, sent with `qwenloop prompt`.
+
+    `id` is the control file's name without `.json`: the time it was sent, then a random
+    part, so follow-ups sort in the order they were sent.
+    """
+
+    id: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class RepoItem:
     """One open issue or pull request, as reported by `gh`."""
 
@@ -96,6 +128,29 @@ class ChatChunk:
     tool_call: dict[str, Any] | None = None
     input_tokens: int = 0
     output_tokens: int = 0
+    # llama-server's own per-request timings (prompt_n, cache_n, prompt_ms, predicted_n,
+    # predicted_ms, predicted_per_second); None when the server sent none.
+    timings: Mapping[str, float] | None = None
+    # Why the model stopped (`stop`, `length`, `tool_calls`, ...); None when not reported.
+    finish_reason: str | None = None
+    # The reply's separate reasoning text (gpt-oss on Ollama sends one); None when the
+    # server sent none. Model output: the runner records a capped excerpt of it as data and
+    # never feeds it back to the model. Kept out of repr, which could otherwise be huge.
+    reasoning: str | None = field(default=None, repr=False)
+
+
+class ToolCallParseError(RuntimeError):
+    """The model server could not parse the model's reply as a tool call (#386).
+
+    Ollama answers HTTP 500 "error parsing tool call" when a model writes prose where a
+    tool call was due. That fails one turn, not the run: the runner asks for a valid tool
+    call and retries. It stays a RuntimeError, so a caller that does not retry sees
+    exactly the error it saw before.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
 
 
 @dataclass(slots=True)

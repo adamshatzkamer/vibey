@@ -1,8 +1,10 @@
 # Made with ❤️ by [Vibey](https://the-vibey-project.github.io/vibey/), Developed by [Adam Matthew Steinberger](https://vibewithadam.matthewsteinberger.com/) ([@adammatthewsteinberger](https://github.com/adammatthewsteinberger/)).
 """Pure qwenloop configuration parsing."""
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
+from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -11,8 +13,145 @@ from qwenloop.domain.model import Backend
 #: Where `--backend openai-compat` attaches when no `base_url` is configured: Ollama's
 #: own default listen address, with the `/v1` prefix its OpenAI-compatible API lives under.
 DEFAULT_ENDPOINT_BASE_URL = "http://127.0.0.1:11434/v1"
-#: The same Qwen 2.5 Coder 14B the pinned profiles run, under the name Ollama gives it.
-DEFAULT_ENDPOINT_MODEL = "qwen2.5-coder:14b"
+#: This era's default free model (sub-doctrine 8.d): GPT-OSS 20B, under the name Ollama
+#: gives it -- the model `gptossloop` asks an endpoint for. The pinned llama.cpp profiles
+#: are a separate choice and keep their own model.
+DEFAULT_ENDPOINT_MODEL = "gpt-oss:20b"
+#: The Qwen model `qwenloop` asks an endpoint for (ADR-0064): Qwen3 14B, under the name
+#: Ollama gives it. Qwen3 rather than Qwen2.5-Coder because this runner drives the model
+#: through native tool calls, and Qwen2.5-Coder 14B on Ollama writes its calls out as text.
+DEFAULT_QWEN_ENDPOINT_MODEL = "qwen3:14b"
+#: How many consecutive empty model replies (no tool call, no text) a run retries before it
+#: fails. One empty reply is a bad turn, not a dead run: 27 of 60 failed QwenStorm runs
+#: ended on the first one. Each retry is a new model call and spends a turn of `max_turns`,
+#: so the turn cap still bounds the run. 0 restores fail-on-first-empty.
+DEFAULT_MAX_EMPTY_REPLY_RETRIES = 2
+#: How many characters of each tool-call argument value `events.jsonl` keeps. Argument names
+#: are always recorded; a value longer than this (a write_file body, a long argv) is cut to
+#: it and marked, so a run's evidence never carries a whole file. 0 keeps names only.
+DEFAULT_MAX_RECORDED_ARGUMENT_CHARS = 200
+#: How many characters from the start of an empty reply's reasoning a `turn.empty` event
+#: keeps, beside the reasoning's full length. 0 records no excerpt at all.
+DEFAULT_EMPTY_REPLY_REASONING_EXCERPT_CHARS = 400
+
+
+class Effort(StrEnum):
+    """Bounded execution policies for autonomous runs.
+
+    EXTREME has ULTRA's budget, but is explicitly finite: the runner still stops when
+    the plan reaches its stabilization verdict or the turn budget is exhausted.
+    """
+
+    STANDARD = "standard"
+    ULTRA = "ultra"
+    EXTREME = "extreme"
+
+    @property
+    def default_max_turns(self) -> int:
+        return 40 if self is Effort.STANDARD else 120
+
+    @classmethod
+    def parse(cls, value: str) -> "Effort":
+        try:
+            return cls(value.strip().lower())
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in cls)
+            raise ValueError(f"unknown effort {value!r}; expected one of: {allowed}") from exc
+
+
+#: Directories no search or find descends into unless the operator says otherwise:
+#: version-control internals, virtual environments, dependency trees, tool caches, and
+#: qwenloop's own run records.
+DEFAULT_SKIP_DIRS: tuple[str, ...] = (
+    ".git",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".qwenloop",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolLimits:
+    """How much any one tool call may read or return. Declared here with defaults and
+    overridable from the config file's `[tools]` table (sub-doctrine 12.h). A limit the
+    model passes in a call may narrow these, never widen them."""
+
+    # read_file / open_file: characters of file content one call returns.
+    max_read_chars: int = 200_000
+    # search: matching lines one call returns.
+    max_search_matches: int = 100
+    # find: file paths one call returns.
+    max_find_results: int = 200
+    # search: characters kept of any one matching line.
+    max_line_chars: int = 240
+    # search: a file larger than this is skipped rather than read.
+    max_file_bytes: int = 2_000_000
+    # search: skipped files named in an answer; the answer always counts all of them.
+    max_skipped_examples: int = 5
+    # search with regex=true: wall-clock seconds the isolated matcher may run before it is
+    # killed. A model-supplied pattern can backtrack catastrophically; this bounds one call.
+    search_timeout_seconds: float = 10.0
+    # search / find: directory names never descended into.
+    skip_dirs: tuple[str, ...] = DEFAULT_SKIP_DIRS
+
+
+_TOOL_LIMIT_KEYS = frozenset(item.name for item in fields(ToolLimits))
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerIdentity:
+    """Which engine this process runs as (ADR-0064).
+
+    One runner package carries two engines that differ only in the model they ask for:
+    `gptossloop`, the sovereign default on GPT-OSS, and `qwenloop`, on a Qwen model. Each
+    reads its own settings -- its own config file and its own environment variables -- so
+    naming a model for one never changes the model the other runs.
+    """
+
+    #: The command and the engine id vibey knows it by.
+    name: str
+    #: The prefix of every environment variable it reads: `<PREFIX>_CONFIG`, and so on.
+    env_prefix: str
+    #: The model an OpenAI-compatible endpoint is asked for when nothing names one.
+    default_model: str
+
+    @property
+    def env_config(self) -> str:
+        """Names a config file. Unset: `<user config dir>/<name>/config.toml`."""
+        return f"{self.env_prefix}_CONFIG"
+
+    @property
+    def env_base_url(self) -> str:
+        """The OpenAI-compatible base URL to attach to (`base_url`), `/v1` included."""
+        return f"{self.env_prefix}_BASE_URL"
+
+    @property
+    def env_model(self) -> str:
+        """The model name the endpoint serves (`model`)."""
+        return f"{self.env_prefix}_MODEL"
+
+    @property
+    def env_api_key(self) -> str:
+        """The endpoint's API key: environment only, never a file or a flag."""
+        return f"{self.env_prefix}_API_KEY"
+
+
+#: The sovereign default engine (sub-doctrines 8.b, 8.d): this runner on GPT-OSS 20B.
+GPTOSSLOOP = RunnerIdentity(
+    name="gptossloop", env_prefix="GPTOSSLOOP", default_model=DEFAULT_ENDPOINT_MODEL
+)
+#: The same runner on a Qwen model, the engine its name promises; opt-in in vibey.
+QWENLOOP = RunnerIdentity(
+    name="qwenloop", env_prefix="QWENLOOP", default_model=DEFAULT_QWEN_ENDPOINT_MODEL
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +163,9 @@ class QwenConfig:
     startup_timeout_seconds: int = 180
     context_window: int = 32_768
     max_turns: int = 40
+    max_empty_reply_retries: int = DEFAULT_MAX_EMPTY_REPLY_RETRIES
+    max_recorded_argument_chars: int = DEFAULT_MAX_RECORDED_ARGUMENT_CHARS
+    empty_reply_reasoning_excerpt_chars: int = DEFAULT_EMPTY_REPLY_REASONING_EXCERPT_CHARS
     # The OpenAI-compatible base URL to attach to, `/v1` included. Empty means none is
     # configured, and `auto` selection then never picks the openai-compat backend.
     base_url: str = ""
@@ -31,6 +173,12 @@ class QwenConfig:
     model: str = DEFAULT_ENDPOINT_MODEL
     # How long doctor, health, and start wait for an endpoint's model list.
     endpoint_timeout_seconds: int = 5
+    turn_dispatch_mode: str = "auto"
+    hybrid_concurrency: int = 2
+    turn_queue_url: str = ""
+    turn_queue_name: str = "vibey.llm.turns"
+    # What one tool call may read or return: the config file's `[tools]` table.
+    tools: ToolLimits = ToolLimits()
 
     @property
     def endpoint_configured(self) -> bool:
@@ -55,11 +203,15 @@ class QwenConfigParser:
     silently leaving the endpoint unconfigured.
     """
 
+    def __init__(self, *, default_model: str = DEFAULT_ENDPOINT_MODEL) -> None:
+        # The model a mapping that names none is given: each engine's own (ADR-0064).
+        self._default_model = default_model
+
     def parse(self, data: Mapping[str, Any]) -> QwenConfig:
         unknown = sorted(set(data) - _KEYS)
         if unknown:
             raise ValueError(f"unknown qwenloop config key(s): {', '.join(unknown)}")
-        defaults = QwenConfig()
+        defaults = QwenConfig(model=self._default_model)
         config = QwenConfig(
             backend=Backend(str(data.get("backend", defaults.backend.value))),
             portable_profile=str(data.get("portable_profile", defaults.portable_profile)),
@@ -72,11 +224,27 @@ class QwenConfigParser:
             ),
             context_window=int(data.get("context_window", defaults.context_window)),
             max_turns=int(data.get("max_turns", defaults.max_turns)),
+            max_empty_reply_retries=self._bound(
+                data, "max_empty_reply_retries", defaults.max_empty_reply_retries
+            ),
+            max_recorded_argument_chars=self._bound(
+                data, "max_recorded_argument_chars", defaults.max_recorded_argument_chars
+            ),
+            empty_reply_reasoning_excerpt_chars=self._bound(
+                data,
+                "empty_reply_reasoning_excerpt_chars",
+                defaults.empty_reply_reasoning_excerpt_chars,
+            ),
             base_url=self._base_url(str(data.get("base_url", defaults.base_url))),
             model=str(data.get("model", defaults.model)).strip(),
             endpoint_timeout_seconds=int(
                 data.get("endpoint_timeout_seconds", defaults.endpoint_timeout_seconds)
             ),
+            turn_dispatch_mode=str(data.get("turn_dispatch_mode", defaults.turn_dispatch_mode)),
+            hybrid_concurrency=int(data.get("hybrid_concurrency", defaults.hybrid_concurrency)),
+            turn_queue_url=str(data.get("turn_queue_url", defaults.turn_queue_url)),
+            turn_queue_name=str(data.get("turn_queue_name", defaults.turn_queue_name)),
+            tools=self._tool_limits(data.get("tools", {})),
         )
         if config.idle_timeout_seconds < 0:
             raise ValueError("idle_timeout_seconds must be non-negative")
@@ -89,7 +257,62 @@ class QwenConfigParser:
             raise ValueError("timeouts, context_window, and max_turns must be positive")
         if not config.model:
             raise ValueError("model must name the model the endpoint serves")
+        if config.turn_dispatch_mode not in {"auto", "direct", "hybrid", "rabbitmq"}:
+            raise ValueError("turn_dispatch_mode must be 'auto', 'direct', 'hybrid', or 'rabbitmq'")
+        if config.hybrid_concurrency <= 0:
+            raise ValueError("hybrid_concurrency must be positive")
+        if config.turn_dispatch_mode == "rabbitmq" and not config.turn_queue_url.strip():
+            raise ValueError("turn_queue_url is required when turn_dispatch_mode is 'rabbitmq'")
+        if not config.turn_queue_name.strip():
+            raise ValueError("turn_queue_name must not be empty")
         return config
+
+    @staticmethod
+    def _tool_limits(data: object) -> ToolLimits:
+        """The `[tools]` table: every bound a positive integer, `skip_dirs` a list of names.
+        An unknown key is refused for the same reason as at the top level."""
+        if not isinstance(data, Mapping):
+            raise ValueError("tools must be a table of tool limits")
+        unknown = sorted(set(data) - _TOOL_LIMIT_KEYS)
+        if unknown:
+            raise ValueError(f"unknown qwenloop tools key(s): {', '.join(unknown)}")
+        defaults = ToolLimits()
+        bounds = {
+            item.name: int(data.get(item.name, getattr(defaults, item.name)))
+            for item in fields(ToolLimits)
+            if item.name not in {"skip_dirs", "search_timeout_seconds"}
+        }
+        for name, value in bounds.items():
+            if value <= 0:
+                raise ValueError(f"tools.{name} must be positive")
+        skip_dirs = data.get("skip_dirs", defaults.skip_dirs)
+        if not isinstance(skip_dirs, list | tuple) or not all(
+            isinstance(item, str) and item for item in skip_dirs
+        ):
+            raise ValueError("tools.skip_dirs must be a list of directory names")
+        timeout = data.get("search_timeout_seconds", defaults.search_timeout_seconds)
+        try:
+            seconds = float(timeout)
+        except (TypeError, ValueError):
+            seconds = math.nan
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError(
+                "tools.search_timeout_seconds must be a positive, finite number of seconds"
+            )
+        return ToolLimits(**bounds, search_timeout_seconds=seconds, skip_dirs=tuple(skip_dirs))
+
+    @staticmethod
+    def _bound(data: Mapping[str, Any], key: str, default: int) -> int:
+        """A count or cap: a finite, non-negative integer, or ValueError naming the key.
+
+        Strict on purpose. TOML can spell `inf`, `nan` and `1.5`, and `int()` would turn the
+        first into an OverflowError and quietly floor the last; `true` is an int to Python.
+        None of those is a bound anybody meant to set.
+        """
+        value = data.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{key} must be a non-negative integer, got {value!r}")
+        return value
 
     @staticmethod
     def _base_url(value: str) -> str:

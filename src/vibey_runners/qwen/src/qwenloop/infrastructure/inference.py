@@ -24,7 +24,30 @@ from urllib.parse import urlsplit
 
 from platformdirs import user_cache_path
 
-from qwenloop.domain.model import Backend, ChatChunk, ChatMessage, ModelProfile, ServerInfo
+from qwenloop.domain.model import (
+    Backend,
+    ChatChunk,
+    ChatMessage,
+    ModelProfile,
+    ServerInfo,
+    ToolCallParseError,
+)
+
+#: How Ollama words a model reply it could not parse as a tool call (#386).
+_TOOL_CALL_PARSE_FAILURE = re.compile(r"error parsing tool call", re.IGNORECASE)
+
+#: Where OpenAI-compatible servers put a reasoning model's separate reasoning text.
+_REASONING_KEYS = ("reasoning", "reasoning_content", "thinking")
+
+#: The llama-server `timings` keys a run records per turn (#382).
+_SERVER_TIMING_KEYS = (
+    "prompt_n",
+    "cache_n",
+    "prompt_ms",
+    "predicted_n",
+    "predicted_ms",
+    "predicted_per_second",
+)
 
 
 def _message_payload(message: ChatMessage) -> dict[str, object]:
@@ -40,6 +63,9 @@ def _message_payload(message: ChatMessage) -> dict[str, object]:
 class OpenAIServer:
     binary: str
     backend: Backend
+    #: How long one model request may take, in seconds; None waits indefinitely. The
+    #: CLI sets it from `idle_timeout_seconds` (#345); 900 matches that key's default.
+    request_timeout_seconds: float | None = 900
 
     def __init__(self, cache_dir: Path | None = None) -> None:
         self.cache_dir = cache_dir or user_cache_path("qwenloop")
@@ -59,6 +85,8 @@ class OpenAIServer:
                 pid=int(data["pid"]),
                 token=str(data.get("token", "")),
                 model=str(data.get("model", "")),
+                argv=tuple(str(item) for item in data.get("argv", ())),
+                log_path=str(data.get("log_path", "")),
             )
         except (OSError, ValueError, KeyError, json.JSONDecodeError):
             return None
@@ -78,12 +106,18 @@ class OpenAIServer:
             port = _free_port()
             token = os.urandom(24).hex()
             argv = self._argv(profile, port, token)
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            # The server's own load, memory and slot messages are evidence for tuning it
+            # (#382); they go to a log beside its state instead of to /dev/null. The child
+            # keeps its own descriptor, so ours closes as soon as it has started.
+            log_path = self.cache_dir / "servers" / profile.name / "server.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            with log_path.open("ab") as log:
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=log,
+                    stderr=log,
+                    start_new_session=True,
+                )
             info = ServerInfo(
                 backend=self.backend,
                 profile=profile.name,
@@ -93,6 +127,8 @@ class OpenAIServer:
                 pid=process.pid,
                 token=token,
                 model=profile.name,
+                argv=self._redacted(argv, token),
+                log_path=str(log_path),
             )
             state = self.cache_dir / "servers" / f"{profile.name}.json"
             state.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -130,11 +166,19 @@ class OpenAIServer:
             headers={"Content-Type": "application/json", **self._auth(info.token)},
         )
         try:
-            response = await asyncio.to_thread(urllib.request.urlopen, request, timeout=300)
+            response = await asyncio.to_thread(
+                urllib.request.urlopen, request, timeout=self.request_timeout_seconds
+            )
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(_http_error_detail(exc)) from exc
+            detail = _http_error_detail(exc)
+            # A reply the server could not parse as a tool call is one bad turn, which the
+            # runner retries (#386); every other HTTP error ends the run as before.
+            if exc.code == 500 and _TOOL_CALL_PARSE_FAILURE.search(detail):
+                raise ToolCallParseError(detail) from exc
+            raise RuntimeError(detail) from exc
         data = json.loads(response.read())
-        message = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        message = choice["message"]
         calls = message.get("tool_calls", [])
         content = message.get("content") or ""
         if not calls:
@@ -160,6 +204,9 @@ class OpenAIServer:
             text=content,
             input_tokens=int(usage.get("prompt_tokens", 0)),
             output_tokens=int(usage.get("completion_tokens", 0)),
+            timings=self._server_timings(data.get("timings")),
+            finish_reason=self._finish_reason(choice.get("finish_reason")),
+            reasoning=self._reasoning(message),
         )
 
     async def stop(self, info: ServerInfo) -> None:
@@ -186,6 +233,48 @@ class OpenAIServer:
 
     def _argv(self, profile: ModelProfile, port: int, token: str) -> tuple[str, ...]:
         raise NotImplementedError
+
+    @staticmethod
+    def _redacted(argv: Sequence[str], token: str) -> tuple[str, ...]:
+        """The argv as it may be recorded: the per-launch API key never leaves the process."""
+        return tuple("<redacted>" if token and item == token else item for item in argv)
+
+    @staticmethod
+    def _server_timings(timings: object) -> dict[str, float] | None:
+        """llama-server's own timings for one request, exactly as it reported them.
+
+        Only the keys a run is tuned by pass through, and a key the server did not send is
+        left out rather than invented. Anything that is not a mapping of numbers is no
+        timing at all.
+        """
+        if not isinstance(timings, dict):
+            return None
+        kept = {
+            key: float(timings[key])
+            for key in _SERVER_TIMING_KEYS
+            if isinstance(timings.get(key), int | float) and not isinstance(timings[key], bool)
+        }
+        return kept or None
+
+    @staticmethod
+    def _finish_reason(value: object) -> str | None:
+        """Why the model stopped, as the server said it; nothing when it said nothing."""
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _reasoning(message: dict[str, object]) -> str | None:
+        """The reply's separate reasoning text, or None when it carried none.
+
+        Reasoning models answer with it beside `content`: Ollama's OpenAI API names it
+        `reasoning`, vLLM and DeepSeek-style servers `reasoning_content`, Ollama's native
+        API `thinking`. It is passed on untouched; how much of it a run records is the
+        runner's declared cap, and it never re-enters the transcript.
+        """
+        for key in _REASONING_KEYS:
+            value = message.get(key)
+            if isinstance(value, str):
+                return value
+        return None
 
     @staticmethod
     def _auth(token: str) -> dict[str, str]:
@@ -438,16 +527,47 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-_CODING_TOOLS = [
+# read_file and open_file take the same arguments: open_file is the name gpt-oss reaches
+# for (its trained `repo_browser.open_file`), read_file the one qwenloop always had.
+_READ_PARAMETERS: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string"},
+        "line_start": {"type": "integer", "description": "First line to return, from 1."},
+        "line_end": {"type": "integer", "description": "Last line to return, inclusive."},
+    },
+    "required": ["path"],
+    "additionalProperties": False,
+}
+
+_CODING_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a UTF-8 text file inside the assigned worktree.",
+            "description": (
+                "Read a UTF-8 text file inside the assigned worktree: the whole file, or only "
+                "lines line_start..line_end (1-based, inclusive) when either is given."
+            ),
+            "parameters": _READ_PARAMETERS,
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": (
+                "Create a file, or REPLACE an existing file's entire content, inside the "
+                "assigned worktree. To change part of an existing file, use edit_file."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                    "allow_shrink": {"type": "boolean"},
+                },
+                "required": ["path", "content"],
                 "additionalProperties": False,
             },
         },
@@ -455,15 +575,20 @@ _CODING_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "write_file",
-            "description": "Write UTF-8 text to a file inside the assigned worktree.",
+            "name": "edit_file",
+            "description": (
+                "Replace exactly one occurrence of old_string with new_string in an existing "
+                "file inside the assigned worktree. Use this for every change to an existing "
+                "file; copy old_string exactly from read_file output."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "content": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
                 },
-                "required": ["path", "content"],
+                "required": ["path", "old_string", "new_string"],
                 "additionalProperties": False,
             },
         },
@@ -481,6 +606,68 @@ _CODING_TOOLS = [
                 "required": ["argv"],
                 "additionalProperties": False,
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search",
+            "description": (
+                "Search file contents inside the assigned worktree and return matching lines "
+                "as path:line: text. The query is literal text unless regex is true. Use this "
+                "to locate a symbol or string before reading or editing a file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Text (or regex) to find."},
+                    "path": {
+                        "type": "string",
+                        "description": "File or directory to search; default the worktree.",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": "Only files whose name or path matches, e.g. *.py.",
+                    },
+                    "regex": {"type": "boolean"},
+                    "ignore_case": {"type": "boolean"},
+                    "max_results": {"type": "integer"},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find",
+            "description": (
+                "Find files by name inside the assigned worktree. The pattern is a glob "
+                "(e.g. *.py, src/*/test_*.py) or else a case-insensitive part of the path; "
+                "an empty pattern lists every file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to look under; default the worktree.",
+                    },
+                    "max_results": {"type": "integer"},
+                },
+                "required": ["pattern"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_file",
+            "description": "Another name for read_file, with the same optional line range.",
+            "parameters": _READ_PARAMETERS,
         },
     },
 ]

@@ -1,5 +1,12 @@
 # Made with ❤️ by [Vibey](https://the-vibey-project.github.io/vibey/), Developed by [Adam Matthew Steinberger](https://vibewithadam.matthewsteinberger.com/) ([@adammatthewsteinberger](https://github.com/adammatthewsteinberger/)).
-"""qwenloop command line interface."""
+"""The command line of this runner package's two engines (ADR-0064).
+
+`gptossloop` and `qwenloop` are the same commands over the same runner. They differ in who
+they are -- the name they print, the settings they read (`GPTOSSLOOP_*` or `QWENLOOP_*`, and
+a config file of their own) and the model an endpoint is asked for when nothing names one
+(`gpt-oss:20b` or `qwen3:14b`). Run records, the done marker and the verdict fence are the
+runner's own protocol and are shared: both write `.qwenloop/runs/`.
+"""
 
 import asyncio
 import json
@@ -18,10 +25,22 @@ from platformdirs import user_cache_path
 
 from qwenloop import __version__
 from qwenloop.application.backend_selection import BackendSelector, Hardware
-from qwenloop.application.interfaces import InferenceServer
+from qwenloop.application.interfaces import InferenceServer, OllamaProbeInterface
 from qwenloop.application.runner import AutonomousRunner
 from qwenloop.application.storm import build_item_plans
-from qwenloop.domain.config import QwenConfig
+from qwenloop.domain.config import (
+    DEFAULT_EMPTY_REPLY_REASONING_EXCERPT_CHARS,
+    DEFAULT_ENDPOINT_MODEL,
+    DEFAULT_MAX_EMPTY_REPLY_RETRIES,
+    DEFAULT_MAX_RECORDED_ARGUMENT_CHARS,
+    DEFAULT_QWEN_ENDPOINT_MODEL,
+    GPTOSSLOOP,
+    QWENLOOP,
+    Effort,
+    QwenConfig,
+    RunnerIdentity,
+    ToolLimits,
+)
 from qwenloop.domain.model import (
     EXIT_CODE_WIND_DOWN,
     Backend,
@@ -31,7 +50,9 @@ from qwenloop.domain.model import (
     RunStatus,
     ServerInfo,
 )
+from qwenloop.infrastructure.clock import SystemClock
 from qwenloop.infrastructure.desktop_notifications import DesktopNotifier
+from qwenloop.infrastructure.dispatch_benchmark import DispatchBenchmark
 from qwenloop.infrastructure.github import (
     list_open_issues,
     list_open_pull_requests,
@@ -39,10 +60,17 @@ from qwenloop.infrastructure.github import (
 )
 from qwenloop.infrastructure.inference import LlamaCppServer, OpenAICompatServer, VllmServer
 from qwenloop.infrastructure.model_cache import ModelCache
+from qwenloop.infrastructure.ollama_probe import OllamaProbe
 from qwenloop.infrastructure.profiles import NVIDIA_BF16, PORTABLE, PROFILES
 from qwenloop.infrastructure.run_store import FileRunStore
 from qwenloop.infrastructure.settings import SettingsLoader
 from qwenloop.infrastructure.tools import SandboxTools
+from qwenloop.infrastructure.turn_dispatch import (
+    DirectTurnDispatcher,
+    HybridTurnMultiplexer,
+    RabbitMqTurnDispatcher,
+    RabbitMqTurnWorker,
+)
 
 _DEFAULT_STORM_OWNER = "adammatthewsteinberger"
 _DEFAULT_STORM_AUTHOR = "Adam Matthew Steinberger"
@@ -64,19 +92,26 @@ BaseUrlOption = Annotated[
     typer.Option(
         "--base-url",
         help="OpenAI-compatible base URL to attach to, /v1 included (e.g. Ollama's "
-        "http://127.0.0.1:11434/v1). Unset: $QWENLOOP_BASE_URL, else config `base_url`.",
+        "http://127.0.0.1:11434/v1). Unset: $GPTOSSLOOP_BASE_URL (gptossloop) or "
+        "$QWENLOOP_BASE_URL (qwenloop), else config `base_url`.",
     ),
 ]
 ModelOption = Annotated[
     str | None,
     typer.Option(
         "--model",
-        help="Model name the endpoint serves. Unset: $QWENLOOP_MODEL, else config `model`, "
-        "else qwen2.5-coder:14b.",
+        help="Model name the endpoint serves. Unset: $GPTOSSLOOP_MODEL or $QWENLOOP_MODEL, "
+        f"else config `model`, else {DEFAULT_ENDPOINT_MODEL} (gptossloop) or "
+        f"{DEFAULT_QWEN_ENDPOINT_MODEL} (qwenloop).",
     ),
 ]
 
 app = typer.Typer(name="qwenloop", no_args_is_help=True, add_completion=False)
+
+#: Which engine this process is. `main` leaves it qwenloop, the package's own name;
+#: `gptoss_main` makes it gptossloop before any command runs. Module-level for the reason
+#: `_ollama_probe` is: typer commands are plain functions and cannot be handed it.
+_identity: RunnerIdentity = QWENLOOP
 model_app = typer.Typer(no_args_is_help=True)
 server_app = typer.Typer(no_args_is_help=True)
 tool_app = typer.Typer(no_args_is_help=True)
@@ -87,7 +122,7 @@ app.add_typer(tool_app, name="tool")
 
 def _version(value: bool) -> None:
     if value:
-        typer.echo(f"qwenloop {__version__}")
+        typer.echo(f"{_identity.name} {__version__}")
         raise typer.Exit()
 
 
@@ -121,7 +156,7 @@ def run(
     storm: bool = typer.Option(
         False,
         "--storm",
-        help="Sweep every repo's open backlog through qwenloop instead of running PLAN.",
+        help="Sweep every repo's open backlog through this runner instead of running PLAN.",
     ),
     owner: str = typer.Option(
         _DEFAULT_STORM_OWNER, "--owner", help="GitHub owner --storm discovers repos under."
@@ -141,11 +176,14 @@ def run(
         help="Send lifecycle desktop alerts; macOS alerts use the Ping sound.",
     ),
 ) -> None:
-    del preset, effort
+    del preset
+    selected_effort = Effort.parse(effort)
     if storm:
         if plan is not None:
             raise typer.BadParameter("pass either PLAN or --storm, not both")
         config = _load_config(backend=backend, max_turns=max_turns, base_url=base_url, model=model)
+        if max_turns is None and selected_effort is not Effort.STANDARD:
+            config = replace(config, max_turns=selected_effort.default_max_turns)
         _run_storm(
             owner=owner,
             repos_root=repos_root,
@@ -159,6 +197,8 @@ def run(
     if plan is None:
         raise typer.BadParameter("PLAN is required unless --storm is set")
     config = _load_config(backend=backend, max_turns=max_turns, base_url=base_url, model=model)
+    if max_turns is None and selected_effort is not Effort.STANDARD and config.max_turns == 40:
+        config = replace(config, max_turns=selected_effort.default_max_turns)
     _run_single(plan, run_id, cwd, config, desktop_notifications=desktop_notifications)
 
 
@@ -169,18 +209,33 @@ def _load_config(**overrides: object) -> QwenConfig:
     functions, and this is the step they share. A bad file or value exits 2 naming it.
     """
     try:
-        return SettingsLoader(os.environ).load(overrides)
+        return SettingsLoader(os.environ, identity=_identity).load(overrides)
     except (OSError, ValueError) as exc:
-        raise typer.BadParameter(f"qwenloop configuration: {exc}") from exc
+        raise typer.BadParameter(f"{_identity.name} configuration: {exc}") from exc
+
+
+#: The one probe `_select` asks whether a local Ollama is running (#388). The tests replace
+#: it with an in-memory fake (tests/conftest.py), so no test ever reaches a real Ollama.
+_ollama_probe: OllamaProbeInterface = OllamaProbe()
 
 
 def _select(config: QwenConfig) -> BackendChoice:
-    """The backend `config` resolves to on this machine (see `BackendSelector`)."""
+    """The backend `config` resolves to on this machine (see `BackendSelector`).
+
+    Only an unconfigured AUTO asks whether a local Ollama is running: an explicit backend
+    or a configured endpoint already decides, and never pays the probe's round trip.
+    """
+    ollama_available = (
+        config.backend is Backend.AUTO
+        and not config.endpoint_configured
+        and _ollama_probe.available()
+    )
     return BackendSelector().select(
         config.backend,
         Hardware(platform.system(), _nvidia_vram()),
         vllm_installed=shutil.which("vllm") is not None,
         endpoint_configured=config.endpoint_configured,
+        ollama_available=ollama_available,
     )
 
 
@@ -189,22 +244,36 @@ def _attach(config: QwenConfig) -> OpenAICompatServer:
     return OpenAICompatServer(
         config.endpoint_url,
         config.model,
-        api_key=SettingsLoader(os.environ).api_key,
+        api_key=SettingsLoader(os.environ, identity=_identity).api_key,
         timeout_seconds=config.endpoint_timeout_seconds,
         context_window=config.context_window,
     )
+
+
+def _request_timeout(config: QwenConfig) -> float | None:
+    """`idle_timeout_seconds` as a request timeout: 0 means wait indefinitely (#345).
+
+    Module-level for the reason every helper here is: the typer commands share it.
+    """
+    return None if config.idle_timeout_seconds == 0 else float(config.idle_timeout_seconds)
 
 
 def _server_for(config: QwenConfig) -> tuple[InferenceServer, ModelProfile]:
     """The server and profile a run uses. The composition step `run`, `--storm`, and
     `server start` share, so an endpoint reaches all three through one abstraction."""
     selected = _select(config).backend
+    timeout = _request_timeout(config)
     if selected is Backend.OPENAI_COMPAT:
         attached = _attach(config)
+        attached.request_timeout_seconds = timeout
         return attached, attached.profile
     if selected is Backend.VLLM:
-        return VllmServer(), replace(NVIDIA_BF16, context_window=config.context_window)
-    return LlamaCppServer(), replace(PORTABLE, context_window=config.context_window)
+        vllm = VllmServer()
+        vllm.request_timeout_seconds = timeout
+        return vllm, replace(NVIDIA_BF16, context_window=config.context_window)
+    llama = LlamaCppServer()
+    llama.request_timeout_seconds = timeout
+    return llama, replace(PORTABLE, context_window=config.context_window)
 
 
 def _public(info: ServerInfo) -> dict[str, object]:
@@ -237,10 +306,15 @@ def _run_single(
                 config.max_turns,
                 startup_timeout_seconds=config.startup_timeout_seconds,
                 desktop_notifications=desktop_notifications,
+                tool_limits=config.tools,
+                max_empty_reply_retries=config.max_empty_reply_retries,
+                max_recorded_argument_chars=config.max_recorded_argument_chars,
+                empty_reply_reasoning_excerpt_chars=config.empty_reply_reasoning_excerpt_chars,
+                dispatcher=_dispatcher_for(config),
             )
         )
     except (OSError, RuntimeError) as exc:
-        typer.echo(f"qwenloop unavailable: {exc}", err=True)
+        typer.echo(f"{_identity.name} unavailable: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     if state.status is RunStatus.WINDING_DOWN:
         raise typer.Exit(code=EXIT_CODE_WIND_DOWN)
@@ -258,6 +332,11 @@ async def _run_plan(
     *,
     startup_timeout_seconds: int,
     desktop_notifications: bool = True,
+    tool_limits: ToolLimits | None = None,
+    max_empty_reply_retries: int = DEFAULT_MAX_EMPTY_REPLY_RETRIES,
+    max_recorded_argument_chars: int = DEFAULT_MAX_RECORDED_ARGUMENT_CHARS,
+    empty_reply_reasoning_excerpt_chars: int = DEFAULT_EMPTY_REPLY_REASONING_EXCERPT_CHARS,
+    dispatcher: object | None = None,
 ) -> RunState:
     """Start (or, for an attached endpoint, check) the server if it is not healthy, then
     drive one AutonomousRunner run to a verdict."""
@@ -268,8 +347,10 @@ async def _run_plan(
     runner = AutonomousRunner(
         server,
         FileRunStore(cwd),
-        SandboxTools(cwd),
+        SandboxTools(cwd, limits=tool_limits),
         DesktopNotifier(enabled=desktop_notifications),
+        clock=SystemClock(),
+        dispatcher=dispatcher,  # type: ignore[arg-type]
     )
     return await runner.run(
         run_id=run_id,
@@ -278,7 +359,23 @@ async def _run_plan(
         profile=profile,
         server_info=info,
         max_turns=max_turns,
+        max_empty_reply_retries=max_empty_reply_retries,
+        max_recorded_argument_chars=max_recorded_argument_chars,
+        empty_reply_reasoning_excerpt_chars=empty_reply_reasoning_excerpt_chars,
     )
+
+
+def _dispatcher_for(config: QwenConfig) -> object:
+    """Compose the declared turn-sharing mode; direct remains the safe default."""
+    mode = config.turn_dispatch_mode
+    if mode == "auto":
+        winner = DispatchBenchmark.load(user_cache_path(_identity.name) / "dispatch-benchmark.json")
+        mode = winner or "direct"
+    if mode == "rabbitmq":
+        return RabbitMqTurnDispatcher(config.turn_queue_url, request_queue=config.turn_queue_name)
+    if mode == "hybrid":
+        return HybridTurnMultiplexer(concurrency=config.hybrid_concurrency)
+    return DirectTurnDispatcher()
 
 
 def _discover_storm_repos(owner: str, repos_root: Path) -> list[str]:
@@ -401,6 +498,12 @@ def _run_storm(
                             config.max_turns,
                             startup_timeout_seconds=config.startup_timeout_seconds,
                             desktop_notifications=desktop_notifications,
+                            tool_limits=config.tools,
+                            max_empty_reply_retries=config.max_empty_reply_retries,
+                            max_recorded_argument_chars=config.max_recorded_argument_chars,
+                            empty_reply_reasoning_excerpt_chars=(
+                                config.empty_reply_reasoning_excerpt_chars
+                            ),
                         )
                     )
                 except (OSError, RuntimeError) as exc:
@@ -505,7 +608,9 @@ def doctor(
     nvidia = shutil.which("vllm") is not None
     typer.echo(f"llama-server: {'ok' if portable else 'missing'}")
     typer.echo(f"vllm: {'ok' if nvidia else 'missing'}")
-    typer.echo("Models are never downloaded by doctor; run qwenloop model install explicitly.")
+    typer.echo(
+        f"Models are never downloaded by doctor; run {_identity.name} model install explicitly."
+    )
     if not portable and not nvidia:
         raise typer.Exit(code=1)
 
@@ -518,7 +623,7 @@ def _doctor_endpoint(server: OpenAICompatServer, choice: BackendChoice) -> None:
         served = asyncio.run(server.check())
     except RuntimeError as exc:
         typer.echo(f"model: {server.model} unavailable")
-        typer.echo(f"qwenloop doctor: {exc}", err=True)
+        typer.echo(f"{_identity.name} doctor: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"model: {served} ok")
     typer.echo("Models are never downloaded by doctor; the endpoint serves its own.")
@@ -539,35 +644,38 @@ def usage(cwd: Path = Path(".")) -> None:
     )
 
 
-def _control(run_id: str, kind: str, cwd: Path) -> None:
+def _control(run_id: str, payload: dict[str, object], cwd: Path) -> None:
+    # A module-level helper because each typer command below is one: it writes one control
+    # file, named by the time it was sent and then a random part, so the runner reads the
+    # inbox in the order things were sent (`FileRunStore.take_prompts` sorts by name).
     inbox = cwd / ".qwenloop" / "runs" / run_id / "control" / "inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    target = inbox / f"{uuid.uuid4()}.json"
-    target.write_text(json.dumps({"type": kind}) + "\n", encoding="utf-8")
+    target = inbox / f"{time.time_ns():020d}-{uuid.uuid4().hex}.json"
+    target.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
 @app.command()
 def stop(run_id: str, cwd: Path = Path(".")) -> None:
-    _control(run_id, "stop", cwd)
+    _control(run_id, {"type": "stop"}, cwd)
 
 
 @app.command("wind-down")
 def wind_down(run_id: str, cwd: Path = Path(".")) -> None:
-    _control(run_id, "wind_down", cwd)
+    _control(run_id, {"type": "wind_down"}, cwd)
 
 
 @app.command()
 def prompt(run_id: str, text: str, cwd: Path = Path(".")) -> None:
-    inbox = cwd / ".qwenloop" / "runs" / run_id / "control" / "inbox"
-    inbox.mkdir(parents=True, exist_ok=True)
-    (inbox / f"{uuid.uuid4()}.json").write_text(
-        json.dumps({"type": "prompt", "text": text}) + "\n", encoding="utf-8"
-    )
+    """Send the running run a follow-up; the model reads it at the start of its next turn."""
+    _control(run_id, {"type": "prompt", "text": text}, cwd)
 
 
 def _local_equivalent(name: str):  # type: ignore[no-untyped-def]
     def command() -> None:
-        typer.echo(f"{name}: local qwenloop equivalent; see qwenloop status and run artifacts")
+        typer.echo(
+            f"{name}: local {_identity.name} equivalent; see {_identity.name} status and run "
+            "artifacts"
+        )
 
     command.__name__ = name.replace("-", "_")
     return command
@@ -655,7 +763,79 @@ def server_start(
     try:
         asyncio.run(execute())
     except (OSError, RuntimeError, TimeoutError) as exc:
-        typer.echo(f"qwenloop server unavailable: {exc}", err=True)
+        typer.echo(f"{_identity.name} server unavailable: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@server_app.command("turn-worker")
+def server_turn_worker(
+    backend: BackendOption = None,
+    base_url: BaseUrlOption = None,
+    model: ModelOption = None,
+) -> None:
+    """Host the configured model behind the explicit RabbitMQ shared-turn mode."""
+    config = _load_config(backend=backend, base_url=base_url, model=model)
+    if config.turn_dispatch_mode != "rabbitmq":
+        typer.echo(
+            "turn-worker requires turn_dispatch_mode = 'rabbitmq' and turn_queue_url",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    server, profile = _server_for(config)
+
+    async def execute() -> None:
+        info = server.inspect(profile)
+        if info is None or not await server.health(info):
+            info = await server.start(profile)
+            info = await _wait_until_ready(
+                server, info, timeout_seconds=config.startup_timeout_seconds
+            )
+        await RabbitMqTurnWorker(config.turn_queue_url, request_queue=config.turn_queue_name).serve(
+            server, info
+        )
+
+    try:
+        asyncio.run(execute())
+    except (OSError, RuntimeError, TimeoutError) as exc:
+        typer.echo(f"{_identity.name} turn worker unavailable: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+
+@server_app.command("benchmark")
+def server_benchmark(
+    samples: Annotated[int, typer.Option("--samples", min=1)] = 3,
+    concurrency: Annotated[int, typer.Option("--concurrency", min=1)] = 2,
+    backend: BackendOption = None,
+    base_url: BaseUrlOption = None,
+    model: ModelOption = None,
+) -> None:
+    """Measure direct versus hybrid dispatch and persist the faster local mode."""
+    config = _load_config(backend=backend, base_url=base_url, model=model)
+    server, profile = _server_for(config)
+
+    async def execute() -> None:
+        info = server.inspect(profile)
+        if info is None or not await server.health(info):
+            info = await server.start(profile)
+            info = await _wait_until_ready(
+                server, info, timeout_seconds=config.startup_timeout_seconds
+            )
+        rabbitmq = (
+            RabbitMqTurnDispatcher(config.turn_queue_url, request_queue=config.turn_queue_name)
+            if config.turn_queue_url.strip()
+            else None
+        )
+        result = await DispatchBenchmark().run(
+            server, info, samples=samples, concurrency=concurrency, rabbitmq=rabbitmq
+        )
+        path = user_cache_path(_identity.name) / "dispatch-benchmark.json"
+        DispatchBenchmark.save(result, path)
+        typer.echo(json.dumps({**asdict(result), "path": str(path)}))
+
+    try:
+        asyncio.run(execute())
+    except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        typer.echo(f"{_identity.name} benchmark unavailable: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
 
@@ -726,4 +906,18 @@ async def _wait_until_ready(
 
 
 def main() -> None:
-    app()
+    """`qwenloop`: this runner on a Qwen model (ADR-0064)."""
+    _run_as(QWENLOOP)
+
+
+def gptoss_main() -> None:
+    """`gptossloop`: this runner on GPT-OSS, the sovereign default engine (ADR-0064)."""
+    _run_as(GPTOSSLOOP)
+
+
+def _run_as(identity: RunnerIdentity) -> None:
+    """Run the command line as `identity`. Module-level because the two console scripts
+    are module-level entry points, and this is the one step they share."""
+    global _identity
+    _identity = identity
+    app(prog_name=identity.name)

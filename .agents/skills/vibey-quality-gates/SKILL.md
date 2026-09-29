@@ -121,6 +121,14 @@ The seven gates are split across git hook stages so commits stay fast
 
 **Commit-msg stage**: Conventional Commits enforcement.
 
+**Pushing**: push through the push gate, never with a bare `git push`. Run
+`python3 <storm>/tools/push_gate.py run -- git push origin HEAD:<branch>`, or from a
+checkout with no storm, set `VIBEY_PUSH_LOCK=<dir>` and run the tracked
+`docs/plans/qwenstorm-3.0.0/tools/push_gate.py`. It lets one pre-push run happen at a time
+across every lane on the machine. Exit 124 (`reaped: hang`) means the reaper stopped a hung
+gate run; it is not a test failure. CONTRIBUTING.md, "Pushing in this repository", has the
+rest.
+
 Install all three hook types once, then the provenance hooks. The order matters,
 because `pre-commit install` refuses to run while `core.hooksPath` is set:
 
@@ -147,7 +155,7 @@ push went ahead but none of that stage's gates ran. Run them by hand before you 
 | `tools` | Each absorbed tenant's own suite on its own Python floors, plus, on its floor row, its own static gates from the row's `static` key: its mypy, `lint-imports` and bandit. agyloop, codexloop and vibey-skills also run their own strict docs builds (the `docs` key) (ADR-0022). |
 | `tools-lint` | vibey-gh's own linters and its managed-automation drift check. |
 | `image` | Builds `deploy/docker/Dockerfile` for amd64 and arm64 and asserts each `Image contract - …` step: the entrypoint runs, it runs as non-root uid 10001, it has no compiler/uv/pip, migrations ship in the image, and every console script is on PATH. |
-| `chart` | Render-only: `deploy/helm/golden/render.sh` runs `helm lint --strict` and `helm template` for each profile (defaults, `ollama.enabled`, the GPU + qwenloop wiring, and the KEDA query unbound and bound to a project) and diffs each render against its committed golden under `deploy/helm/golden/`, with helm pinned. After an intended chart change, regenerate with `deploy/helm/golden/render.sh --update`. |
+| `chart` | Render-only: `deploy/helm/golden/render.sh` runs `helm lint --strict` and `helm template` for each profile (defaults, `ollama.enabled`, the GPU + gptossloop wiring with qwenloop switched on beside it, and the KEDA query unbound and bound to a project) and diffs each render against its committed golden under `deploy/helm/golden/`, with helm pinned. After an intended chart change, regenerate with `deploy/helm/golden/render.sh --update`. |
 | `cluster-smoke` | Helm install of `deploy/helm/vibey` on minikube and four cluster contracts: a projectless worker parks instead of crash-looping, the worker picks up a project created in-cluster, the KEDA ScaledObject reconciles against real Postgres, and a worker drains promptly on SIGTERM (ADR-0025, ADR-0026). |
 
 Other workflows also gate a merge: `provenance.yml` (runs on every push and PR),
@@ -246,6 +254,29 @@ addopts carry a coverage floor. The other four deliberately leave `--cov=` and
 in there would widen the explicitly-scoped per-layer runs back out to the whole package
 -- so for them a bare `pytest` runs the tests but enforces no floor. Use the commands
 above, which are their own.
+
+## Where work lives, and how often it is saved
+
+Keep every clone and worktree on storage a reboot keeps (sub-doctrine 10.h, ADR-0057). Never
+use `/tmp`, `/private/tmp`, `/var/tmp`, `/var/folders`, `/dev/shm`, `/run/user` or `$TMPDIR`:
+the OS empties them. On 2026-09-24 a reboot emptied `/private/tmp` mid-storm and took every
+uncommitted worktree, measurement and draft with it. Worktrees go in the storm home:
+`VIBEY_STORM_HOME`, else `~/git/vibey-storm` on macOS, `$XDG_DATA_HOME/vibey/storm` (else
+`~/.local/share/vibey/storm`) on Linux.
+
+```bash
+python3 docs/plans/qwenstorm-3.0.0/tools/storm_durability.py status   # durable or not
+git worktree add "$(python3 docs/plans/qwenstorm-3.0.0/tools/storm_durability.py worktree fix-x)" \
+  -b fix/x origin/develop
+```
+
+- Commit as soon as a change is coherent, not when it is finished.
+- Push work in progress to a draft PR (`gh pr create --draft`) at least every 30–45 minutes;
+  the merge train never merges a draft, and the pre-push gates still run.
+- A long measurement writes each step as it finishes and resumes (`StepJournal` in
+  `docs/plans/qwenstorm-3.0.0/tools/storm_checkpoint.py`).
+- The storm tools refuse volatile storage with exit 78 and name the key to change.
+  CONTRIBUTING.md, "Where your work lives", has the rest.
 
 ## What each gate catches
 

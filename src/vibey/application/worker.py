@@ -30,9 +30,11 @@ from vibey.application.interfaces import (
     TelemetrySpan,
     TelemetryTracer,
 )
+from vibey.application.interfaces.sabbath import SabbathGateInterface
 from vibey.application.observability import StandardLibraryLogger
 from vibey.application.ports import HumanGateRepository, JobRepository
-from vibey.domain.job import FailureClass
+from vibey.domain.errors import ClassifiedFailure
+from vibey.domain.job import ATTEMPTS_EXHAUSTED_GATE_KIND, FailureClass
 from vibey.domain.phase import Phase
 
 # The grant key every attempt bound in the tree reads and writes. It is the
@@ -40,14 +42,21 @@ from vibey.domain.phase import Phase
 # purpose: one answer widens both the queue's attempt bound and the effort
 # ladder's, so a human never has to know there are two.
 ATTEMPTS_GRANT_KEY = "max_attempts"
-EXHAUSTED_GATE_KIND = "attempts_exhausted"
+EXHAUSTED_GATE_KIND = ATTEMPTS_EXHAUSTED_GATE_KIND
 
 
 class CapacityDeferred(Exception):
-    def __init__(self, retry_at: datetime, detail: str) -> None:
+    def __init__(
+        self,
+        retry_at: datetime,
+        detail: str,
+        *,
+        capacity_state: str | None = None,
+    ) -> None:
         super().__init__(detail)
         self.retry_at = retry_at
         self.detail = detail
+        self.capacity_state = capacity_state
 
 
 class WorkerLoop:
@@ -67,7 +76,14 @@ class WorkerLoop:
         tracer: TelemetryTracer | None = None,
         metrics: TelemetryMetrics | None = None,
         telemetry_enabled: bool = True,
+        sabbath: SabbathGateInterface | None = None,
     ) -> None:
+        # Sub-doctrine 8.i: from sundown Friday to sundown Saturday this worker claims
+        # nothing. Jobs wait exactly where the queue put them -- paused, not failed (10.f)
+        # -- and the first poll after the window claims again. None keeps no Sabbath, which
+        # only a caller with no host to read (a test harness) may choose.
+        self._sabbath = sabbath
+        self._resting_until: datetime | None = None
         self._jobs = jobs
         self._gates = gates
         self._handler = handler
@@ -86,6 +102,27 @@ class WorkerLoop:
         self._log: Logger = (
             logger if logger is not None else StandardLibraryLogger(__name__, owner=owner)
         )
+
+    def _resting(self) -> bool:
+        """Whether 8.i holds now. Logs the rest once when it begins and once when it ends,
+        not on every poll, so a rested worker is visible without flooding the log."""
+        held = self._sabbath.hold() if self._sabbath is not None else None
+        if held is not None:
+            if self._resting_until != held.resumes:
+                self._resting_until = held.resumes
+                self._log.info(
+                    "sabbath.resting",
+                    owner=self._owner,
+                    resumes=held.resumes.isoformat(),
+                    basis=held.basis,
+                )
+            return True
+        if self._resting_until is not None:
+            self._log.info(
+                "sabbath.ended", owner=self._owner, rested_until=self._resting_until.isoformat()
+            )
+            self._resting_until = None
+        return False
 
     @staticmethod
     def _notification_failure(
@@ -123,6 +160,8 @@ class WorkerLoop:
     async def run_once(self, project_id: UUID) -> bool:
         """Claims and executes at most one job. Returns False if there was
         nothing claimable."""
+        if self._resting():
+            return False
         job = await self._jobs.claim(project_id, owner=self._owner, lease=self._lease)
         if job is None:
             return False
@@ -150,7 +189,17 @@ class WorkerLoop:
                 try:
                     outcome = await self._handler.handle(job)
                 except CapacityDeferred as exc:
-                    outcome = Defer(exc.retry_at, exc.detail, capacity=True)
+                    outcome = Defer(
+                        exc.retry_at,
+                        exc.detail,
+                        capacity=True,
+                        capacity_state=exc.capacity_state,
+                    )
+                except ClassifiedFailure as exc:
+                    # A failure that knows its cause is recorded as that cause: an
+                    # exhausted model output budget is CAPACITY and a malformed model
+                    # answer is ENGINE, and the exhausted-attempts gate says which.
+                    outcome = Failure(exc.failure_class, str(exc))
                 except Exception as exc:  # noqa: BLE001 - any handler bug becomes a VIBEY-class nack
                     outcome = Failure(FailureClass.VIBEY, str(exc))
             finally:
@@ -226,7 +275,7 @@ class WorkerLoop:
             self._landed(nacked, event="job.nack_rejected", job=job)
             return
 
-        gate = await self._gates.latest_for_job(job.id)
+        gate = await self._gates.latest_for_job(job.id, include_queue_gates=True)
         granted = self._granted_attempts(gate)
         if granted is not None and granted > job.attempts:
             # `granted > attempts >= max_attempts`, and only a lease-guarded
@@ -291,7 +340,7 @@ class WorkerLoop:
         # deliberately not notified again.
         gate = created_gate
         if gate is None:
-            existing = await self._gates.latest_for_job(job.id)
+            existing = await self._gates.latest_for_job(job.id, include_queue_gates=True)
             if existing is None or existing.answer is not None:
                 gate = await self._gates.raise_gate(job.project_id, job.id, request)
         if gate is not None:
@@ -304,12 +353,19 @@ class WorkerLoop:
             return
         kind = "budget_exceeded" if request.kind == "budget_exhausted" else "human_gate_raised"
         title = "Budget Exceeded" if kind == "budget_exceeded" else "Human Gate Raised"
+        # Gate prompts can contain model/tool output and are displayed in the gate UI.
+        # Desktop toasts are deliberately a short privacy-safe cue, never prompt text.
+        message = (
+            "A budget decision is needed to continue."
+            if kind == "budget_exceeded"
+            else "Your response is needed to continue."
+        )
         try:
             result = await self._notifications.notify(
                 project_id=job.project_id,
                 kind=kind,
                 title=title,
-                message=request.prompt,
+                message=message,
                 payload={
                     "gate_id": str(gate_id),
                     "gate_kind": request.kind,
