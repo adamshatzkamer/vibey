@@ -1136,6 +1136,7 @@
     "938": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #828; closed against it",
       "probes": [
         {
@@ -1146,6 +1147,7 @@
     "939": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #829; closed against it",
       "probes": [
         {
@@ -1156,6 +1158,7 @@
     "940": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #830; closed against it",
       "probes": [
         {
@@ -1166,6 +1169,7 @@
     "941": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #831; closed against it",
       "probes": [
         {
@@ -1176,6 +1180,7 @@
     "942": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #832; closed against it",
       "probes": [
         {
@@ -1186,6 +1191,7 @@
     "943": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #833; closed against it",
       "probes": [
         {
@@ -1196,6 +1202,7 @@
     "944": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #834; closed against it",
       "probes": [
         {
@@ -1206,6 +1213,7 @@
     "945": {
       "close_when_done": true,
       "kind": "duplicate",
+      "last_verdict": "DONE",
       "next": "exact copy of #835; closed against it",
       "probes": [
         {
