@@ -40,6 +40,8 @@ try:
         PageRendererInterface,
         PatchGuardInterface,
         PatchPathsInterface,
+        PatchShrinkRuleInterface,
+        PatchStatsInterface,
         PatchTestRuleInterface,
         ReferenceProbeInterface,
         ReplyDefuserInterface,
@@ -52,6 +54,8 @@ except ImportError:  # run as `python scripts/continuation_prompts.py`
         PageRendererInterface,
         PatchGuardInterface,
         PatchPathsInterface,
+        PatchShrinkRuleInterface,
+        PatchStatsInterface,
         PatchTestRuleInterface,
         ReferenceProbeInterface,
         ReplyDefuserInterface,
@@ -99,6 +103,8 @@ class Settings:
     chat: Mapping[str, Any]
     require_test_prompts: tuple[str, ...] = ()
     test_paths: tuple[str, ...] = ()
+    max_removed_lines: int = 0
+    max_removed_total: int = 0
 
     @classmethod
     def load(cls, root: Path, relative: str = DEFAULT_CONFIG) -> Settings:
@@ -131,6 +137,8 @@ class Settings:
                 raw.get("authority", {}).get("require_test", {}).get("prompts", ())
             ),
             test_paths=tuple(raw.get("authority", {}).get("require_test", {}).get("paths", ())),
+            max_removed_lines=int(raw.get("authority", {}).get("max_removed_lines", 0)),
+            max_removed_total=int(raw.get("authority", {}).get("max_removed_total", 0)),
         )
 
     def models(self) -> list[str]:
@@ -396,6 +404,83 @@ class GitPatchPaths(PatchPathsInterface):
                 out = run.stdout
         fields = out.split("\0")
         return [(fields[i], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
+
+
+class GitPatchStats(PatchStatsInterface):
+    """Lines added and removed per path, as `git apply --numstat` counts them."""
+
+    UNMEASURABLE = -1
+
+    def __init__(self, root: Path) -> None:
+        self._root = root
+
+    def stats(self, patch: Path) -> list[tuple[str, int, int]] | None:
+        try:
+            run = subprocess.run(
+                ["git", "apply", "--numstat", "-z", str(patch)],
+                cwd=self._root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return None
+        if run.returncode:
+            return None
+        found: list[tuple[str, int, int]] = []
+        for record in filter(None, run.stdout.split("\0")):
+            added, _, rest = record.partition("\t")
+            removed, _, path = rest.partition("\t")
+            # git prints "-" for a binary file: its lines cannot be counted, so it is reported
+            # as UNMEASURABLE (-1) and the rule refuses it rather than counting it as nothing.
+            found.append(
+                (
+                    path,
+                    int(added) if added.isdigit() else 0,
+                    int(removed) if removed.isdigit() else self.UNMEASURABLE,
+                )
+            )
+        return found
+
+
+class PatchShrinkRule(PatchShrinkRuleInterface):
+    """Refuses a patch that removes more than a declared number of lines from any one file.
+
+    The direct-delete policy an agent runs under is not a boundary the patch respects: on
+    2026-10-09 a 4b-class model emptied the 331-line paper and a 53-line site definition with
+    `write_file(content="", allow_shrink=True)` after a delete was denied, and called it
+    consolidation. A deleted file and an emptied file are the same patch to this rule. Zero
+    (or no key) disables it, so a repository that declares none keeps the old behaviour.
+    """
+
+    def __init__(
+        self, limit: int, reader: PatchStatsInterface | None = None, total: int = 0
+    ) -> None:
+        self._limit = limit
+        self._total = total
+        self._reader: PatchStatsInterface = reader or GitPatchStats(Path.cwd())
+
+    def shrunk(self, patch: Path) -> Sequence[str]:
+        if self._limit <= 0:
+            return []
+        stats = self._reader.stats(patch)
+        if stats is None:
+            return [PatchGuard.UNREADABLE]
+        found = [
+            f"{path} (a binary file: its lines cannot be counted)"
+            for path, _, removed in stats
+            if removed == GitPatchStats.UNMEASURABLE
+        ]
+        found += [
+            f"{path} (removes {removed} lines; the limit is {self._limit})"
+            for path, _, removed in stats
+            if removed > self._limit
+        ]
+        # Forty lines from each of forty files is the same patch as forty from one.
+        gone = sum(max(removed, 0) for _, _, removed in stats)
+        if self._total > 0 and gone > self._total:
+            found.append(f"(the patch removes {gone} lines in all; the limit is {self._total})")
+        return sorted(found)
 
 
 class PatchGuard(PatchGuardInterface):
@@ -901,6 +986,11 @@ class ContinuationCli:
             )
             for path in refused:
                 print(f"::error::an automated run may not change {path}")
+            shrunk = PatchShrinkRule(
+                settings.max_removed_lines, GitPatchStats(self._root), settings.max_removed_total
+            ).shrunk(Path(argv[1]))
+            for line in shrunk:
+                print(f"::error::an automated run may not gut a file: {line}")
             untested: Sequence[str] = []
             if len(argv) == 4:
                 untested = PatchTestRule(
@@ -908,7 +998,7 @@ class ContinuationCli:
                 ).missing(Path(argv[1]), argv[3])
             for line in untested:
                 print(f"::error::the {argv[3]} prompt promises a tested change: {line}")
-            return 1 if refused or untested else 0
+            return 1 if refused or untested or shrunk else 0
         if command in {"transcript", "receipt"}:
             if len(argv) != 2:
                 print(f"{SCRIPT}: {command} DIRECTORY", file=sys.stderr)
